@@ -1,0 +1,30 @@
+global:
+    # Only the NAMES of the environment variables are stored here; the values are
+    # resolved from the environment (or a .env file) at load time.
+    endpoint_env: OPENROUTER_ENDPOINT
+    api_key_env: OPENROUTER_API_KEY
+    zotero_library_id_env: ZOTERO_LIBRARY_ID
+    zotero_api_key_env: ZOTERO_API_KEY
+    zotero_library_type: user
+    defaults:
+        llm_model: openai/gpt-4o-mini
+        embedding_model: openai/text-embedding-3-small
+        vector_db: chroma
+        reranker: null
+
+index:
+    # Pinned by the first `index` run; null in a freshly initialized folder.
+    collection_path: null
+    collection_key: null
+    collection_name: null
+    recursive: true
+
+    chunk_size: 1000 # characters
+    chunk_overlap: 200 # characters
+    top_k: 5
+    temperature: 0.0
+
+    # null => inherit from global.defaults
+    llm_model: null
+    embedding_model: null
+    vector_db: null
