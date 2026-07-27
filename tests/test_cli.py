@@ -56,11 +56,52 @@ def test_list_collections_without_credentials_fails_cleanly() -> None:
     assert result.exception is None or isinstance(result.exception, SystemExit)
 
 
-def test_unimplemented_commands_say_so_and_exit_nonzero() -> None:
-    for command in ("index", "query"):
-        result = runner.invoke(cli.app, [command])
-        assert result.exit_code == 1, command
-        assert "not implemented" in result.output, command
+def test_query_is_still_a_stub() -> None:
+    result = runner.invoke(cli.app, ["query"])
+    assert result.exit_code == 1
+    assert "not implemented" in result.output
+
+
+def test_index_requires_openrouter_before_doing_any_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real run needs an embedding key; say so before downloading anything."""
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(cli.app, ["init", "."])
+    result = runner.invoke(cli.app, ["index"])
+    assert result.exit_code == 1
+    assert "OPENROUTER_API_KEY" in result.output
+
+
+def test_dry_run_does_not_require_openrouter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dry run makes no embedding calls, so it must not demand that key."""
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(cli.app, ["init", "."])
+    result = runner.invoke(cli.app, ["index", "--dry-run"])
+    assert result.exit_code == 1
+    # It gets past the OpenRouter check and stops at the Zotero credentials.
+    assert "ZOTERO" in result.output
+    assert "OPENROUTER" not in result.output
+
+
+def test_index_rejects_both_collection_selectors() -> None:
+    result = runner.invoke(
+        cli.app, ["index", "--dry-run", "--collection", "A", "--collection-key", "K"]
+    )
+    assert result.exit_code == 1
+    assert "not both" in result.output
+
+
+def test_index_outside_an_index_folder_points_at_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Must fail on the missing config.yaml, before any network call."""
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["index", "--dry-run"])
+    assert result.exit_code == 1
+    assert "zotero-rag init" in result.output
 
 
 def test_init_works_offline_without_any_credentials(tmp_path: Path) -> None:

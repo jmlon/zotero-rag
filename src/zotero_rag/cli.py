@@ -4,24 +4,44 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.table import Table
 from rich.tree import Tree
 
 from zotero_rag import __version__
-from zotero_rag.config import Config, load_config, load_env, packaged_defaults
-from zotero_rag.errors import ZoteroRagError
+from zotero_rag.config import (
+    CONFIG_FILENAME,
+    Config,
+    load_config,
+    load_env,
+    packaged_defaults,
+    pin_collection,
+)
+from zotero_rag.download import CACHE_DIRNAME, ensure_cached
+from zotero_rag.embedding import build_embeddings
+from zotero_rag.errors import CollectionMismatchError, NotAnIndexFolderError, ZoteroRagError
+from zotero_rag.indexer import IndexStats, index_plan
+from zotero_rag.planning import IndexPlan, PlannedAttachment, build_plan
 from zotero_rag.scaffold import ENV_FILENAME, init_index_folder
+from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
     CollectionNode,
     build_client,
     build_collection_tree,
+    collection_scope,
     count_collections,
+    fetch_collection_items,
     fetch_collections,
+    fetch_username,
+    find_collection_by_key,
+    library_scope,
+    resolve_collection_path,
 )
 
 console = Console()
@@ -170,13 +190,242 @@ def init(
     )
 
 
-@app.command()
-def index() -> None:
-    """Index the pinned Zotero collection. Not yet implemented."""
+def _is_verbose() -> bool:
+    """Verbosity is carried by the package logger level, set in the callback."""
+    return logging.getLogger("zotero_rag").isEnabledFor(logging.INFO)
+
+
+def _resolve_target(
+    config: Config,
+    roots: list[CollectionNode],
+    collection: str | None,
+    collection_key: str | None,
+    assume_yes: bool,
+) -> tuple[list[CollectionNode], str, CollectionNode | None]:
+    """Decide which collections are in scope, honouring any pinned collection.
+
+    Returns the collections to walk, a human-readable target description, and the
+    single collection to pin (`None` for the whole library). Raises when the
+    request contradicts what the index is already pinned to.
+    """
+    pinned = config.index.collection_key
+    if pinned:
+        requested_key = collection_key
+        if collection is not None:
+            requested_key = resolve_collection_path(roots, collection).key
+        if requested_key is not None and requested_key != pinned:
+            raise CollectionMismatchError(
+                f"This index is pinned to collection {config.index.collection_name!r} "
+                f"({pinned}), but {requested_key} was requested. An index folder serves "
+                "one collection; use a different folder."
+            )
+        node = find_collection_by_key(roots, pinned)
+        return collection_scope(node, config.index.recursive), f"{node.name} ({node.key})", node
+
+    if collection_key is not None:
+        node = find_collection_by_key(roots, collection_key)
+        return collection_scope(node, config.index.recursive), f"{node.name} ({node.key})", node
+
+    if collection is not None:
+        node = resolve_collection_path(roots, collection)
+        return collection_scope(node, config.index.recursive), f"{node.name} ({node.key})", node
+
+    # No target given: the whole library root.
+    scope = library_scope(roots)
     err_console.print(
-        "[yellow]`index` is not implemented yet[/yellow] — planned for a later milestone."
+        f"[yellow]Warning:[/yellow] no collection given, so the whole library would be "
+        f"indexed — {_plural(len(scope), 'collection')}. Items that belong to no "
+        f"collection are not included."
     )
-    raise typer.Exit(code=1)
+    if not assume_yes and not typer.confirm("Index the entire library?", default=False):
+        raise typer.Abort()
+    return scope, "the whole library", None
+
+
+def _run_index(
+    plan: IndexPlan,
+    config: Config,
+    store: VectorStore,
+    zot: Any,
+    embeddings: Any,
+    cache_dir: Path,
+) -> IndexStats:
+    """Run the indexing pass with a progress bar over the planned attachments."""
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Indexing...", total=len(plan.attachments))
+
+        def on_start(attachment: PlannedAttachment) -> None:
+            progress.update(task, advance=1, description=escape(attachment.title[:50]))
+
+        return index_plan(
+            plan,
+            store=store,
+            download=lambda key: ensure_cached(zot, key, cache_dir),
+            embed=embeddings.embed_documents,
+            chunk_size=config.index.chunk_size,
+            chunk_overlap=config.index.chunk_overlap,
+            on_start=on_start,
+        )
+
+
+def _print_index_summary(
+    plan: IndexPlan, stats: IndexStats, store: VectorStore, verbose: bool
+) -> None:
+    """Report what the run did, including everything it chose not to do."""
+    console.print(
+        f"\n[bold green]Indexed {_plural(stats.indexed, 'PDF')}[/bold green] "
+        f"({_plural(stats.chunks, 'chunk')} from {_plural(stats.pages, 'page')})."
+    )
+
+    if stats.already_indexed:
+        console.print(f"  [dim]{stats.already_indexed:>4}[/dim]  already indexed, skipped")
+    if stats.no_text:
+        console.print(f"  [dim]{stats.no_text:>4}[/dim]  no extractable text (scanned PDF?)")
+    for reason, count in plan.skip_counts.items():
+        console.print(f"  [dim]{count:>4}[/dim]  {reason.value}")
+
+    if stats.failures:
+        console.print(f"\n[yellow]{_plural(stats.failed, 'failure')}:[/yellow]")
+        for failure in stats.failures:
+            console.print(f"  [yellow]•[/yellow] {escape(failure.title)}: {escape(failure.error)}")
+
+    console.print(f"\nThe store now holds {_plural(store.count(), 'chunk')}.")
+    if verbose:
+        console.print(
+            f"[dim]{stats.embedding_tokens} embedding tokens, {stats.elapsed_s:.1f}s elapsed.[/dim]"
+        )
+
+
+def _print_plan(plan: IndexPlan, target: str) -> None:
+    """Render the dry-run plan: what would be indexed, and what would not."""
+    console.print(
+        f"\nTarget: [bold]{escape(target)}[/bold] "
+        f"({_plural(len(plan.collections), 'collection')}, "
+        f"{_plural(plan.items_seen, 'item')})\n"
+    )
+
+    if plan.attachments:
+        table = Table(title="PDFs that would be indexed", title_justify="left")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Title", overflow="ellipsis", max_width=54)
+        table.add_column("Authors", overflow="ellipsis", max_width=28)
+        table.add_column("Year", justify="right")
+        table.add_column("Collection", overflow="ellipsis", max_width=20)
+        table.add_column("Attachment", style="dim")
+        for number, attachment in enumerate(plan.attachments, start=1):
+            table.add_row(
+                str(number),
+                escape(attachment.title),
+                escape(attachment.authors) or "[dim]—[/dim]",
+                attachment.year or "[dim]—[/dim]",
+                escape(attachment.collection_name),
+                attachment.attachment_key,
+            )
+        console.print(table)
+    else:
+        console.print("[yellow]Nothing to index: no PDF attachments found.[/yellow]")
+
+    console.print(
+        f"\n[bold]{_plural(len(plan.attachments), 'PDF')}[/bold] from "
+        f"{_plural(plan.item_count, 'item')} would be indexed."
+    )
+    if plan.skipped:
+        console.print("Skipped:")
+        for reason, count in plan.skip_counts.items():
+            console.print(f"  [dim]{count:>4}[/dim]  {reason.value}")
+    console.print("\n[dim]Dry run: nothing was downloaded, embedded, or written.[/dim]")
+
+
+@app.command()
+def index(
+    collection: Annotated[
+        str | None,
+        typer.Option("--collection", help="Zotero collection path, e.g. 'Research/Legal'."),
+    ] = None,
+    collection_key: Annotated[
+        str | None,
+        typer.Option("--collection-key", help="Zotero collection key (unambiguous)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List what would be indexed; make no changes."),
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the whole-library confirmation prompt.")
+    ] = False,
+) -> None:
+    """Index the pinned Zotero collection (currently `--dry-run` only).
+
+    The first run pins its collection into config.yaml; later runs reuse it.
+    Must be run from an index folder.
+    """
+    if collection is not None and collection_key is not None:
+        err_console.print(
+            "[bold red]Error:[/bold red] give either --collection or --collection-key, not both."
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        config = load_config()
+        if config.source_dir is None:
+            raise NotAnIndexFolderError(
+                f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
+                "or change to an index folder."
+            )
+        index_dir = config.source_dir
+
+        # Fail on a missing OpenRouter key before downloading anything.
+        if not dry_run:
+            config.global_.require_openrouter()
+
+        zot = build_client(config)
+        roots = build_collection_tree(fetch_collections(zot))
+        scope, target, node = _resolve_target(config, roots, collection, collection_key, assume_yes)
+
+        # The citation URL needs the library owner's username; a dry run skips it.
+        username = "" if dry_run else fetch_username(zot)
+
+        items: list[tuple[str, list[dict[str, object]]]] = []
+        with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
+            for collection_node in scope:
+                status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
+                items.append(
+                    (collection_node.name, fetch_collection_items(zot, collection_node.key))
+                )
+
+        plan = build_plan(items, username)
+
+        if dry_run:
+            _print_plan(plan, target)
+            return
+
+        # Pin before doing any work, so an interrupted run resumes on the same
+        # collection rather than silently accepting a different one.
+        if node is not None and not config.index.is_pinned:
+            pin_collection(
+                index_dir,
+                collection_key=node.key,
+                collection_name=node.name,
+                collection_path=collection,
+            )
+            console.print(f"Pinned collection [bold]{escape(node.name)}[/bold] ({node.key})")
+
+        store = VectorStore(index_dir / CHROMA_DIRNAME)
+        embeddings = build_embeddings(config)
+        cache_dir = index_dir / CACHE_DIRNAME
+        stats = _run_index(plan, config, store, zot, embeddings, cache_dir)
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    _print_index_summary(plan, stats, store, verbose=_is_verbose())
 
 
 @app.command()

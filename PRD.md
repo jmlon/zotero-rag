@@ -1,6 +1,8 @@
 # RAG CLI interface for Zotero
 
-**Status:** Draft — Proof of Concept (PoC) scope
+**Status:** PoC in progress — `list-collections`, `init`, and `index` are built
+and verified against the live library; `query` is the only command left.
+See **§14 Implementation status** for where to pick up.
 **Version:** 0.1.0
 
 ## 1. Goal
@@ -86,11 +88,16 @@ zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes] 
   collection. Passing a `--collection`/`--collection-key` that disagrees with the
   pinned one is an error (changing it will require the future `--force`).
 - If neither option is given on the first run, the target is the **whole library
-  root**. This prints a warning and requires interactive confirmation; `--yes`
-  skips the prompt for scripted runs.
+  root**, meaning every collection recursively. Items belonging to *no* collection
+  are not included. This prints a warning and requires interactive confirmation;
+  `--yes` skips the prompt for scripted runs.
 - Subcollections are indexed **recursively** (`recursive: true` in config).
 - `--dry-run` lists the items and attachments that would be indexed, with counts,
-  and makes no embedding calls and no writes.
+  and makes no embedding calls and no writes. It also **does not pin** the
+  collection — pinning is a write, and a dry run performs none.
+- Collection path matching is case-insensitive, and leading/trailing slashes are
+  ignored, so `/DataManagement/Data Trust` and `datamanagement/data trust` both
+  resolve.
 
 ### 3.4 `query`
 
@@ -194,6 +201,12 @@ For the pinned collection, recursively:
 1. Fetch collection items via `pyzotero`.
 2. Separate parent items from `attachment` items; cache parents by key so each
    attachment can resolve its bibliographic metadata.
+2b. Some files in Zotero storage are served with their **multipart upload
+   envelope** still wrapped around the PDF bytes (`--boundary`, form-data
+   headers, then `%PDF`), even though the API reports `Content-Type:
+   application/pdf`. The envelope is stripped before anything is written to the
+   cache, so the cache always holds valid PDFs. Files that already start with
+   `%PDF` pass through untouched.
 3. For each attachment with `contentType == application/pdf`: if the file is not
    already in `cache/`, download it with `zot.dump()`.
 4. Extract text **page by page** with `pypdf`, then split each page's text with
@@ -311,37 +324,44 @@ streaming output · metadata filters at query time (year, author, tag).
 
 ## 12. Acceptance criteria
 
-Test collection: **`Writting`**, key **`TGXVGXGP`**, 6 items (small, chosen for
-fast iteration).
+Test collection: **`Writing`**, key **`TGXVGXGP`**, 6 items of which **4 have PDF
+attachments** (small, chosen for fast iteration).
 
-1. `zotero-rag list-collections` prints the collection tree and shows `Writting`
+1. `zotero-rag list-collections` prints the collection tree and shows `Writing`
    with key `TGXVGXGP` and its item count. ✅ *verified — 85 collections listed.*
 2. `zotero-rag init .` in an empty directory creates `config.yaml`, a `.env`
    template, and a `.gitignore`, and contacts nothing.
    ✅ *verified — also refuses to re-init, and never overwrites an existing `.env`.*
 3. Running `index` or `query` outside an index folder exits with a clear error.
+   ✅ *verified for `index` — fails on the missing config.yaml before any network call.*
 4. `zotero-rag index --collection-key TGXVGXGP --dry-run` lists the PDFs that
    would be indexed and makes no embedding API calls.
+   ✅ *verified — 4 PDFs planned, 2 items warned as having no PDF; `--collection Writing`
+   resolves identically.*
 5. `zotero-rag index --collection-key TGXVGXGP` downloads the PDFs into `cache/`,
    populates `chroma/`, pins the collection into `config.yaml`, and prints a
    summary. Items without a PDF attachment produce warnings, not failures.
+   ✅ *verified — 4 PDFs, 22 pages, 146 chunks, 30,863 embedding tokens in ~7s;
+   the 2 item-less entries warn and the run still exits 0.*
 6. A second `index` run indexes nothing new and reports all attachments skipped
    as already indexed.
+   ✅ *verified — 0 indexed, 4 skipped, store still holds 146 chunks. Requesting a
+   different collection in a pinned folder is refused.*
 7. `zotero-rag query "<question>"` returns an answer grounded in the collection
    with **at least one correct Zotero citation** (title/author/year resolving to
-   a real item in `Writting`), plus a working `zotero_url`.
+   a real item in `Writing`), plus a working `zotero_url`.
 8. A question with no support in the collection is answered with an explicit
    "I don't know" rather than a fabricated answer.
 
 ### 12.1 Sample questions
 
-The `Writting` collection covers academic writing and the paper-publication
+The `Writing` collection covers academic writing and the paper-publication
 process. Questions are asked in **Spanish**, which also exercises the
 multilingual concern in §5.3: if retrieval underperforms on these, the fix is to
 override `embedding_model` with a multilingual OpenRouter slug.
 
 A correct answer must cover most of the expected points **and** cite at least one
-item that really exists in `Writting`.
+item that really exists in `Writing`.
 
 1. **¿Qué TIPs hay para escritores?**
    Expected points: uno es tan bueno como su último paper (el éxito previo no
@@ -375,3 +395,92 @@ Example code that may be reused:
 - @/home/jmlon/GIT/AWS/RagEvaluator/ragbench/llm.py — OpenRouter-backed `ChatOpenAI` / `OpenAIEmbeddings` factories
 - @/home/jmlon/GIT/AWS/RagEvaluator/ragbench/config.py — pydantic config models, env-var indirection for secrets
 - @/home/jmlon/GIT/AWS/UPB/Python/langchain/zotero/rag_agent.py — prompt and chain shape (note: uses a reranker, out of PoC scope)
+
+## 14. Implementation status
+
+Last updated: 2026-07-27. **153 tests passing; `ruff` and `mypy` clean.**
+
+### 14.1 Done
+
+| Milestone | Scope | State |
+|---|---|---|
+| 0 | Package skeleton, config layer, `list-collections` | ✅ verified live |
+| 1 | `init` (offline scaffolding) | ✅ verified live |
+| 2a | Collection resolution + `index --dry-run` | ✅ verified live |
+| 2b | Download, extract, chunk, embed, store, pin | ✅ verified live |
+
+Acceptance criteria 1–6 (§12) are verified against the real library. **7 and 8
+remain**, and both need `query`.
+
+### 14.2 Remaining work — `query` (§3.4, §8)
+
+The only command left. Everything it depends on already exists:
+
+- `VectorStore.query(embedding, top_k)` returns `list[StoredChunk]` with text,
+  metadata, and distance — already written and type-checked, but **not yet
+  exercised by any caller or test**.
+- `build_embeddings(config)` produces the same client used at index time; embed
+  the question with `embed_query`.
+- Citation metadata (`title`, `authors`, `year`, `page`, `zotero_url`) is already
+  stored on every chunk.
+
+Still to write: an LLM client factory (`ChatOpenAI` against OpenRouter, mirroring
+`build_embeddings`), the prompt from §8.1, the answer/source rendering, and the
+`--top-k` / `--show-sources` / `--json` flags. `query` must fail cleanly when the
+folder has never been indexed (`VectorStore.exists()` is there for this).
+
+### 14.3 Module map
+
+```
+src/zotero_rag/
+  cli.py           typer app: list-collections, init, index, query(stub)
+  config.py        pydantic models, layered loading, pin_collection()
+  scaffold.py      init: config.yaml + .env + .gitignore
+  zotero_api.py    client, collection tree, path/key resolution, item fetch
+  planning.py      build_plan(): §7.1 selection rules, chunk_metadata()
+  metadata.py      authors_str(), parse_year(), zotero_url()
+  download.py      cache + multipart-envelope repair
+  extraction.py    pypdf, page by page
+  chunking.py      RecursiveCharacterTextSplitter per page
+  embedding.py     OpenRouter embeddings + tiktoken counting
+  vectorstore.py   chromadb wrapper, StoredChunk
+  indexer.py       orchestration, IndexStats, failure isolation
+  data/config.yaml packaged defaults (copied by init)
+```
+
+Tests mirror these; `tests/conftest.py` builds real PDFs with `pdf_factory`
+(no reportlab — hand-assembled, honouring the no-heavy-deps rule).
+
+### 14.4 Reproducing the verified state
+
+```bash
+uv sync --all-groups
+uv run pytest -q && uv run ruff check . && uv run mypy
+
+cp .env.example .env      # fill ZOTERO_LIBRARY_ID + ZOTERO_API_KEY (+ OPENROUTER_API_KEY)
+uv run zotero-rag list-collections
+mkdir /tmp/idx && cp .env /tmp/idx/ && cd /tmp/idx
+uv run zotero-rag init .
+uv run zotero-rag -v index --collection-key TGXVGXGP
+```
+
+Expected: 4 PDFs, 22 pages, 146 chunks, ~30,900 embedding tokens, ~7s. A second
+`index` reports 0 indexed / 4 skipped.
+
+### 14.5 Findings and open items
+
+- **Corrupt files in Zotero storage.** All 4 PDFs in `Writing` are served with
+  their multipart upload envelope wrapped around the PDF bytes, despite a
+  `Content-Type: application/pdf` header. Confirmed with a raw `requests` call,
+  so it is neither our bug nor pyzotero's — something uploaded them that way and
+  it may affect other collections. `download.py` strips the envelope (verified
+  lossless: identical page and character counts). Worth checking whether Zotero's
+  own reader opens them.
+- **API drift from the reference code:** pyzotero renamed `ResourceNotFound` to
+  `ResourceNotFoundError`; the code uses `zot.file()` rather than `zot.dump()` so
+  bytes can be sanitised before reaching disk.
+- **Decisions recorded rather than asked:** `--dry-run` does not pin (pinning is
+  a write); whole-library root means every collection recursively and excludes
+  items in no collection; `init` also writes a `.gitignore` (§3.2).
+- **Untested at runtime:** `VectorStore.query()` and `fetch_username()`'s use in
+  a real citation URL — both first exercised by the `query` milestone.

@@ -10,7 +10,7 @@ from pyzotero import zotero
 from pyzotero.zotero_errors import PyZoteroError
 
 from zotero_rag.config import Config
-from zotero_rag.errors import ZoteroApiError
+from zotero_rag.errors import AmbiguousCollectionError, CollectionNotFoundError, ZoteroApiError
 
 logger = logging.getLogger(__name__)
 
@@ -120,3 +120,76 @@ def _sort_recursive(nodes: list[CollectionNode]) -> None:
 def count_collections(nodes: list[CollectionNode]) -> int:
     """Total number of collections in a forest."""
     return sum(len(node.walk()) for node in nodes)
+
+
+def fetch_collection_items(zot: zotero.Zotero, collection_key: str) -> list[dict[str, Any]]:
+    """Every item in one collection, including child attachments and notes."""
+    try:
+        return list(zot.everything(zot.collection_items(collection_key)))
+    except PyZoteroError as exc:
+        raise ZoteroApiError(
+            f"Could not fetch items for collection {collection_key}: {exc}"
+        ) from exc
+
+
+def split_collection_path(path: str) -> list[str]:
+    """Split a hierarchy path into segments, tolerating leading/trailing slashes."""
+    return [segment.strip() for segment in path.split("/") if segment.strip()]
+
+
+def resolve_collection_path(roots: list[CollectionNode], path: str) -> CollectionNode:
+    """Walk a `Parent/Child/Grandchild` path through the hierarchy.
+
+    Matching is case-insensitive. A segment matching more than one collection at
+    its level is an error naming the candidate keys, so the user can retry with
+    `--collection-key`.
+    """
+    segments = split_collection_path(path)
+    if not segments:
+        raise CollectionNotFoundError(f"{path!r} is not a valid collection path")
+
+    level = roots
+    trail: list[str] = []
+    node: CollectionNode | None = None
+
+    for segment in segments:
+        matches = [child for child in level if child.name.casefold() == segment.casefold()]
+        location = "/".join(trail) if trail else "the top level"
+        if not matches:
+            available = ", ".join(sorted(child.name for child in level)) or "(none)"
+            raise CollectionNotFoundError(
+                f"No collection named {segment!r} under {location}. Available: {available}"
+            )
+        if len(matches) > 1:
+            candidates = ", ".join(f"{m.name} ({m.key})" for m in matches)
+            raise AmbiguousCollectionError(
+                f"{segment!r} is ambiguous under {location}: {candidates}. "
+                "Disambiguate with --collection-key."
+            )
+        node = matches[0]
+        trail.append(node.name)
+        level = node.children
+
+    assert node is not None  # guaranteed: segments is non-empty
+    return node
+
+
+def find_collection_by_key(roots: list[CollectionNode], key: str) -> CollectionNode:
+    """Locate a collection anywhere in the hierarchy by its key."""
+    for root in roots:
+        for node, _depth in root.walk():
+            if node.key == key:
+                return node
+    raise CollectionNotFoundError(f"No collection with key {key!r} in this library")
+
+
+def collection_scope(node: CollectionNode, recursive: bool) -> list[CollectionNode]:
+    """The collections to index: just `node`, or it and all its descendants."""
+    if not recursive:
+        return [node]
+    return [descendant for descendant, _depth in node.walk()]
+
+
+def library_scope(roots: list[CollectionNode]) -> list[CollectionNode]:
+    """Every collection in the library, for the whole-library root target."""
+    return [node for root in roots for node, _depth in root.walk()]

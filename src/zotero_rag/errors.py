@@ -34,3 +34,15 @@ class NotAnIndexFolderError(ZoteroRagError):
 
 class ZoteroApiError(ZoteroRagError):
     """The Zotero Web API call failed."""
+
+
+class CollectionNotFoundError(ZoteroRagError):
+    """No collection matches the given path or key."""
+
+
+class AmbiguousCollectionError(ZoteroRagError):
+    """A path segment matches more than one collection at the same level."""
+
+
+class CollectionMismatchError(ZoteroRagError):
+    """The requested collection differs from the one pinned in config.yaml."""

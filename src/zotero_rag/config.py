@@ -13,8 +13,10 @@ Layering (lowest precedence first):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import re
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal
@@ -202,6 +204,93 @@ def read_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ConfigError(f"{path} must contain a mapping at the top level")
     return data
+
+
+_PIN_KEYS = ("collection_path", "collection_key", "collection_name")
+_DEFAULT_INDENT = "    "
+
+
+def _yaml_scalar(value: str | None) -> str:
+    """Render a value as a YAML scalar. JSON strings are valid YAML."""
+    return "null" if value is None else json.dumps(value)
+
+
+def _index_block_bounds(lines: list[str]) -> tuple[int, int] | None:
+    """Line range (start_of_body, end_exclusive) of the top-level `index:` block."""
+    for position, line in enumerate(lines):
+        if re.match(r"^index\s*:\s*(#.*)?$", line):
+            end = len(lines)
+            for offset in range(position + 1, len(lines)):
+                candidate = lines[offset]
+                if not candidate.strip() or candidate.lstrip().startswith("#"):
+                    continue
+                if not candidate[:1].isspace():
+                    end = offset
+                    break
+            return position + 1, end
+    return None
+
+
+def pin_collection(
+    directory: Path, *, collection_key: str, collection_name: str, collection_path: str | None
+) -> None:
+    """Record the indexed collection in the folder's config.yaml.
+
+    Edits the affected lines in place instead of re-serialising the document, so
+    the comments `init` wrote survive. Missing keys are inserted, and the whole
+    file is replaced atomically.
+    """
+    config_path = directory / CONFIG_FILENAME
+    if not config_path.is_file():
+        raise ConfigError(f"Cannot pin the collection: no {CONFIG_FILENAME} in {directory}")
+
+    values = {
+        "collection_path": collection_path,
+        "collection_key": collection_key,
+        "collection_name": collection_name,
+    }
+    lines = config_path.read_text(encoding="utf-8").splitlines()
+    bounds = _index_block_bounds(lines)
+
+    if bounds is None:
+        lines.append("")
+        lines.append("index:")
+        lines.extend(f"{_DEFAULT_INDENT}{key}: {_yaml_scalar(values[key])}" for key in _PIN_KEYS)
+    else:
+        start, end = bounds
+        indent = _DEFAULT_INDENT
+        for line in lines[start:end]:
+            stripped = line.lstrip()
+            if stripped and not stripped.startswith("#"):
+                indent = line[: len(line) - len(stripped)]
+                break
+
+        remaining = set(_PIN_KEYS)
+        for position in range(start, end):
+            match = re.match(r"^(\s*)([A-Za-z_][\w-]*)\s*:", lines[position])
+            if match and match.group(2) in remaining:
+                key = match.group(2)
+                lines[position] = f"{match.group(1)}{key}: {_yaml_scalar(values[key])}"
+                remaining.discard(key)
+
+        # Keys the user deleted from their config are re-added at the top of the block.
+        for key in reversed(_PIN_KEYS):
+            if key in remaining:
+                lines.insert(start, f"{indent}{key}: {_yaml_scalar(values[key])}")
+
+    _write_atomic(config_path, "\n".join(lines) + "\n")
+    logger.info("pinned collection %s (%s) in %s", collection_name, collection_key, config_path)
+
+
+def _write_atomic(path: Path, content: str) -> None:
+    """Write via a temporary file in the same directory, then rename over."""
+    temporary = path.with_name(path.name + ".tmp")
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise ConfigError(f"Cannot write {path}: {exc}") from exc
 
 
 def load_config(directory: Path | None = None) -> Config:
