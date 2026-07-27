@@ -32,6 +32,10 @@ class NotAnIndexFolderError(ZoteroRagError):
     """The command must be run from an index folder (one containing config.yaml)."""
 
 
+class NotIndexedError(ZoteroRagError):
+    """The index folder has no vector store yet, so there is nothing to query."""
+
+
 class ZoteroApiError(ZoteroRagError):
     """The Zotero Web API call failed."""
 

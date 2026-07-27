@@ -12,12 +12,16 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from zotero_rag.config import CONFIG_FILENAME, GlobalConfig, packaged_defaults_text
+from zotero_rag.config import (
+    CONFIG_FILENAME,
+    ENV_FILENAME,
+    GlobalConfig,
+    packaged_defaults_text,
+)
 from zotero_rag.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
 
-ENV_FILENAME = ".env"
 GITIGNORE_FILENAME = ".gitignore"
 
 GITIGNORE_CONTENT = """\

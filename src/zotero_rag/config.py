@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from dotenv import find_dotenv, load_dotenv
+from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from zotero_rag.errors import ConfigError, MissingCredentialError
@@ -30,6 +30,7 @@ from zotero_rag.errors import ConfigError, MissingCredentialError
 logger = logging.getLogger(__name__)
 
 CONFIG_FILENAME = "config.yaml"
+ENV_FILENAME = ".env"
 
 
 class Defaults(BaseModel):
@@ -143,16 +144,45 @@ class Config(BaseModel):
         return self.index.vector_db or self.global_.defaults.vector_db
 
 
+def env_file_candidates(directory: Path | None = None) -> list[Path]:
+    """Every `.env` path consulted, nearest first: `directory`, its ancestors, home."""
+    start = Path.cwd() if directory is None else directory
+    candidates = [parent / ENV_FILENAME for parent in (start, *start.parents)]
+    home_env = Path.home() / ENV_FILENAME
+    if home_env not in candidates:
+        candidates.append(home_env)
+    return candidates
+
+
+def existing_env_files(directory: Path | None = None) -> list[Path]:
+    """The `.env` files that actually exist, nearest first."""
+    return [path for path in env_file_candidates(directory) if path.is_file()]
+
+
 def load_env() -> None:
-    """Load `.env` following python-dotenv's search: cwd, upwards, then home."""
-    found = find_dotenv(usecwd=True)
-    if found:
-        load_dotenv(found, override=False)
-        logger.debug("loaded environment from %s", found)
-    home_env = Path.home() / ".env"
-    if home_env.is_file():
-        load_dotenv(home_env, override=False)
-        logger.debug("loaded environment from %s", home_env)
+    """Load credentials from every `.env` from the current folder upward, then home.
+
+    Unlike python-dotenv's own search, this does not stop at the nearest file, and
+    it ignores entries with an empty value. Both matter because `init` writes a
+    `.env` *template* into the index folder: with a first-match-wins search, that
+    empty template would shadow the real keys a user keeps in the parent folder or
+    at `~/.env`, and the run would fail with "missing credentials" while pointing
+    at a file that looks correctly filled in.
+
+    A variable already set in the real environment always wins, and among the
+    files the nearest non-empty value wins.
+    """
+    for path in existing_env_files():
+        applied: list[str] = []
+        for name, value in dotenv_values(path).items():
+            # An empty entry means "not filled in yet", so it must not shadow a
+            # value that a file further up does provide.
+            if value and not os.environ.get(name):
+                os.environ[name] = value
+                applied.append(name)
+        if applied:
+            # Names only — never log a credential's value.
+            logger.info("loaded %s from %s", ", ".join(applied), path)
 
 
 def packaged_defaults() -> dict[str, Any]:

@@ -1,8 +1,8 @@
 # RAG CLI interface for Zotero
 
-**Status:** PoC in progress — `list-collections`, `init`, and `index` are built
-and verified against the live library; `query` is the only command left.
-See **§14 Implementation status** for where to pick up.
+**Status:** PoC complete — `list-collections`, `init`, `index`, and `query` are
+all built and verified against the live library; every acceptance criterion in
+§12 passes. See **§14 Implementation status**.
 **Version:** 0.1.0
 
 ## 1. Goal
@@ -70,6 +70,13 @@ zotero-rag init [PATH]
   setting yields a matching template.
 - Writes a `.gitignore` covering `.env`, `chroma/`, and `cache/` — an index
   folder holds a secrets file and is often created inside a repository.
+- Closes with numbered next steps, beginning with the **`cd` into the folder**
+  (omitted when the target already is the current directory), because `index` and
+  `query` only run from inside an index folder. The `index` step shows **both**
+  ways to name a collection — `--collection "NAME"` and `--collection-key KEY` —
+  and notes that names match case-insensitively and that the key is what
+  disambiguates a repeated name. When a `.env` exists further up, it also says
+  that file will cover any variable left blank locally.
 - Does **not** contact Zotero, does **not** pin a collection, and does **not**
   create the vector database.
 - Refuses to run if `config.yaml` already exists. An existing `.env` or
@@ -124,8 +131,13 @@ zotero-rag query "QUESTION" [--top-k N] [--show-sources] [--json] [-v]
 
 ### 5.1 Precedence
 
-CLI flag → environment variable → index folder `./config.yaml` → packaged default
-`config.yaml`.
+CLI flag → index folder `./config.yaml` → packaged default `config.yaml`.
+
+The environment carries **credentials only** (§5.2), never ordinary settings: a
+value like `top_k` or `llm_model` comes from a CLI flag, the index folder's
+`config.yaml`, or the packaged defaults it inherits from. Keeping the environment
+out of that chain means there is exactly one file to look at when a setting is
+not what you expected.
 
 The default `config.yaml` ships as **package data** and is read via
 `importlib.resources`, so `init` works when the tool is installed globally
@@ -135,8 +147,19 @@ The default `config.yaml` ships as **package data** and is read via
 
 Secrets are **never** stored in `config.yaml` — only the *names* of the
 environment variables that hold them, resolved at load time (following the
-`ragbench.config.GlobalConfig.resolve_env()` pattern). `.env` is discovered by
-`python-dotenv`'s normal search (current folder, then upward / home).
+`ragbench.config.GlobalConfig.resolve_env()` pattern).
+
+`.env` files are **layered**, nearest first: the current folder, then each parent
+folder, then `~/.env`. A variable exported in the real environment wins over every
+file, and among files the nearest **non-empty** value wins.
+
+Entries with an empty value are ignored rather than treated as set. This is not a
+detail: `init` writes a `.env` *template* whose values are blank, so under
+python-dotenv's own first-match-wins search that template shadowed the real keys a
+user kept in the parent folder, and `index` failed with "missing credentials"
+while pointing at a file that looked correctly filled in. Layering plus the
+empty-value rule is what makes the common setup — one `.env` beside several index
+folders — work.
 
 Required variables: `OPENROUTER_ENDPOINT`, `OPENROUTER_API_KEY`,
 `ZOTERO_LIBRARY_ID`, `ZOTERO_API_KEY`.
@@ -277,7 +300,22 @@ The system prompt instructs the model to:
 - Be concise.
 
 The prompt is fixed in the PoC; loading a custom prompt from a file is a future
-option.
+option. It also asks the model to answer **in the language of the question**,
+which is what lets the Spanish questions of §12.1 be answered from English
+passages.
+
+### 8.2 Which sources are listed
+
+Retrieval always returns `top_k` passages, but an "I don't know" answer cites
+none of them. The printed source list therefore contains only the sources the
+answer actually marked inline (`[1]`, `[2, 3]`); when it cites nothing, the CLI
+says so and names the number of passages retrieved instead of listing them.
+`--show-sources` overrides this and shows every retrieved passage, cited or not,
+dimming the uncited ones. `--json` always carries all retrieved sources, each
+with a `cited` boolean.
+
+Chunks retrieved from the **same page of the same attachment** collapse into one
+numbered source, so a page is never listed twice.
 
 ## 9. Dependencies
 
@@ -305,7 +343,9 @@ vector DB is `chromadb`); keep `pinecone` as a planned future milestone.
   usage (embedding tokens for `index`, prompt/completion tokens for `query`).
   Cost estimation is out of scope.
 - **Type safety:** pydantic models for config and for the item/chunk/result
-  structures; `ruff` and `mypy` (default strictness) in CI.
+  structures; `ruff` and `mypy` (default strictness) must pass, run locally
+  (`uv run ruff check . && uv run mypy`). Wiring them into CI is a future
+  milestone (§11) — there is no CI pipeline in the PoC.
 - **Python:** ≥ 3.12, `src` layout, package `zotero_rag`, entry point
   `zotero-rag = "zotero_rag.cli:app"`.
 - **Tests:** no `pyzotero` mocks. Unit tests cover config loading and precedence,
@@ -320,7 +360,8 @@ BM25 retrieval · windowed and hierarchical retrieval · agentic RAG · `--force
 clean-slate reindex · version-aware incremental indexing · deletion sync · OCR ·
 HTML / EPUB / notes ingestion · custom system prompt from file · cost
 estimation · batched and concurrent embedding · interactive REPL with history ·
-streaming output · metadata filters at query time (year, author, tag).
+streaming output · metadata filters at query time (year, author, tag) · CI
+running the test suite, `ruff`, and `mypy`.
 
 ## 12. Acceptance criteria
 
@@ -350,8 +391,14 @@ attachments** (small, chosen for fast iteration).
 7. `zotero-rag query "<question>"` returns an answer grounded in the collection
    with **at least one correct Zotero citation** (title/author/year resolving to
    a real item in `Writing`), plus a working `zotero_url`.
+   ✅ *verified — "¿Qué TIPs hay para escritores?" answered in Spanish from
+   English passages, citing Driscoll & Aquilina (2011) p. 5, Elserag (2012) p. 1,
+   and Powell (2010) p. 2, covering most of the expected points in §12.1.
+   5 chunks, 1,287 prompt + 181 completion tokens, ~3s.*
 8. A question with no support in the collection is answered with an explicit
    "I don't know" rather than a fabricated answer.
+   ✅ *verified — a question about the boiling point of mercury answers "No sé."
+   and lists no sources (§8.2).*
 
 ### 12.1 Sample questions
 
@@ -380,7 +427,9 @@ item that really exists in `Writing`.
    del editor; revisión del *galley proof* (contenido, tablas, organización,
    tipografía).
 
-Source of truth for the expected points: `sample-questions.txt`.
+The three questions and their expected points above are the source of truth; the
+`Writing` collection is small enough that they are maintained here rather than in
+a separate file.
 
 ## 13. Reference material
 
@@ -398,7 +447,7 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-27. **153 tests passing; `ruff` and `mypy` clean.**
+Last updated: 2026-07-27. **182 tests passing; `ruff` and `mypy` clean.**
 
 ### 14.1 Done
 
@@ -408,32 +457,37 @@ Last updated: 2026-07-27. **153 tests passing; `ruff` and `mypy` clean.**
 | 1 | `init` (offline scaffolding) | ✅ verified live |
 | 2a | Collection resolution + `index --dry-run` | ✅ verified live |
 | 2b | Download, extract, chunk, embed, store, pin | ✅ verified live |
+| 3 | `query`: retrieve, prompt, answer, cite | ✅ verified live |
 
-Acceptance criteria 1–6 (§12) are verified against the real library. **7 and 8
-remain**, and both need `query`.
+**All eight acceptance criteria (§12) are verified against the real library.**
+Everything still open is a §11 future milestone, not PoC scope.
 
-### 14.2 Remaining work — `query` (§3.4, §8)
+### 14.2 `query` as built (§3.4, §8)
 
-The only command left. Everything it depends on already exists:
-
-- `VectorStore.query(embedding, top_k)` returns `list[StoredChunk]` with text,
-  metadata, and distance — already written and type-checked, but **not yet
-  exercised by any caller or test**.
-- `build_embeddings(config)` produces the same client used at index time; embed
-  the question with `embed_query`.
-- Citation metadata (`title`, `authors`, `year`, `page`, `zotero_url`) is already
-  stored on every chunk.
-
-Still to write: an LLM client factory (`ChatOpenAI` against OpenRouter, mirroring
-`build_embeddings`), the prompt from §8.1, the answer/source rendering, and the
-`--top-k` / `--show-sources` / `--json` flags. `query` must fail cleanly when the
-folder has never been indexed (`VectorStore.exists()` is there for this).
+- `llm.py` — `build_chat(config)` (`ChatOpenAI` against OpenRouter, `temperature`
+  from config), plus `usage_from_message()` and `message_text()`, which flattens
+  the block-style `content` some providers return.
+- `querying.py` — `answer_question()`: embed the question, retrieve, number the
+  sources, build the prompt, call the model. Both network seams (embedding, chat)
+  are injected callables, as in `indexer.py`, so the pipeline is tested against a
+  real on-disk Chroma store with no API access.
+  - `collect_sources()` groups chunks into cited sources (§8.2) and tolerates
+    chunks missing metadata fields.
+  - `cited_numbers()` parses the inline `[n]` markers back out of the answer, so
+    the CLI can list only what was really used.
+  - An empty retrieval short-circuits to `NO_CONTEXT_ANSWER` with **no LLM call**.
+  - Any exception from the chat client becomes an `LLMError`, printed as a
+    one-line user-facing error.
+- `cli.py` — `_open_index()` rejects a non-index folder (`NotAnIndexFolderError`)
+  and one that was never indexed or holds zero chunks (`NotIndexedError`), both
+  before any credential is needed. `--json` writes to stdout with the progress
+  spinner diverted to stderr, so the payload is never contaminated.
 
 ### 14.3 Module map
 
 ```
 src/zotero_rag/
-  cli.py           typer app: list-collections, init, index, query(stub)
+  cli.py           typer app: list-collections, init, index, query
   config.py        pydantic models, layered loading, pin_collection()
   scaffold.py      init: config.yaml + .env + .gitignore
   zotero_api.py    client, collection tree, path/key resolution, item fetch
@@ -445,6 +499,8 @@ src/zotero_rag/
   embedding.py     OpenRouter embeddings + tiktoken counting
   vectorstore.py   chromadb wrapper, StoredChunk
   indexer.py       orchestration, IndexStats, failure isolation
+  llm.py           OpenRouter ChatOpenAI + usage extraction
+  querying.py      retrieval, citation numbering, prompt, QueryResult
   data/config.yaml packaged defaults (copied by init)
 ```
 
@@ -462,10 +518,20 @@ uv run zotero-rag list-collections
 mkdir /tmp/idx && cp .env /tmp/idx/ && cd /tmp/idx
 uv run zotero-rag init .
 uv run zotero-rag -v index --collection-key TGXVGXGP
+uv run zotero-rag -v query "¿Qué TIPs hay para escritores?"
 ```
 
 Expected: 4 PDFs, 22 pages, 146 chunks, ~30,900 embedding tokens, ~7s. A second
-`index` reports 0 indexed / 4 skipped.
+`index` reports 0 indexed / 4 skipped. The query answers in Spanish in ~3s,
+citing 2–3 real `Writing` items with working `zotero.org` URLs.
+
+**Second collection, verified from a global `uv tool install`:** `Networking`
+(`SHWKWYDD`), which is a *tree* rather than a single collection — 8 collections, 18
+items — indexed 13 PDFs into 1,150 chunks from 182 pages, skipping 10 attachments
+of unsupported content type, 5 items with no PDF, and 1 linked URL. A query about
+fog networks answered from two pages of the same survey, each its own numbered
+source per §8.2. This is the run that exercises recursion, the §7.1 skip
+categories, and a store an order of magnitude larger than `Writing`.
 
 ### 14.5 Findings and open items
 
@@ -481,6 +547,24 @@ Expected: 4 PDFs, 22 pages, 146 chunks, ~30,900 embedding tokens, ~7s. A second
   bytes can be sanitised before reaching disk.
 - **Decisions recorded rather than asked:** `--dry-run` does not pin (pinning is
   a write); whole-library root means every collection recursively and excludes
-  items in no collection; `init` also writes a `.gitignore` (§3.2).
-- **Untested at runtime:** `VectorStore.query()` and `fetch_username()`'s use in
-  a real citation URL — both first exercised by the `query` milestone.
+  items in no collection; `init` also writes a `.gitignore` (§3.2); the source
+  list shows only cited sources (§8.2); chunks sharing a page collapse into one
+  source; the prompt asks for an answer in the question's language.
+- **Corrections made to this PRD after the audit that closed milestone 3:** §5.1
+  claimed an environment-variable layer for ordinary settings that was never
+  built and is not wanted — the environment now carries credentials only. §10's
+  "in CI" became "run locally", with CI moved to §11. §12.1's reference to a
+  `sample-questions.txt` that never existed was dropped in favour of the
+  questions listed there. Two real drifts were fixed in code instead: `-v` is now
+  accepted on `index` and `query` themselves (it previously had to precede the
+  subcommand, contradicting §3.3/§3.4), and the index summary now reports items
+  seen, which §10 requires.
+- **`VectorStore.query()` and `fetch_username()` are now exercised live:** the
+  citation URLs the `query` command printed
+  (`zotero.org/jmlondono/collections/TGXVGXGP/items/…/collection`) resolve to the
+  real items.
+- **Retrieval quality with the default embedding model is adequate for Spanish
+  questions over English text** — no multilingual override was needed (§5.3). The
+  answers do lean on whichever 5 chunks come back, so a question whose expected
+  points are spread across four papers is answered from two or three of them; a
+  reranker or a larger `top_k` is the §11 lever if that matters.

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, cast
 
 import typer
+from langchain_core.messages import AIMessage, BaseMessage
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
@@ -17,7 +19,9 @@ from rich.tree import Tree
 from zotero_rag import __version__
 from zotero_rag.config import (
     CONFIG_FILENAME,
+    ENV_FILENAME,
     Config,
+    existing_env_files,
     load_config,
     load_env,
     packaged_defaults,
@@ -25,10 +29,17 @@ from zotero_rag.config import (
 )
 from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
-from zotero_rag.errors import CollectionMismatchError, NotAnIndexFolderError, ZoteroRagError
+from zotero_rag.errors import (
+    CollectionMismatchError,
+    NotAnIndexFolderError,
+    NotIndexedError,
+    ZoteroRagError,
+)
 from zotero_rag.indexer import IndexStats, index_plan
+from zotero_rag.llm import build_chat
 from zotero_rag.planning import IndexPlan, PlannedAttachment, build_plan
-from zotero_rag.scaffold import ENV_FILENAME, init_index_folder
+from zotero_rag.querying import QueryResult, answer_question
+from zotero_rag.scaffold import init_index_folder
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
     CollectionNode,
@@ -62,6 +73,19 @@ def _setup_logging(verbose: bool) -> None:
         handlers=[RichHandler(console=err_console, show_time=False, show_path=False)],
     )
     logging.getLogger("zotero_rag").setLevel(logging.INFO if verbose else logging.WARNING)
+
+
+# `-v` is accepted both before the subcommand (as a global flag) and on `index`
+# and `query` themselves, because that is where a user reaches for it.
+VerboseOption = Annotated[
+    bool, typer.Option("--verbose", "-v", help="Show progress and diagnostic output.")
+]
+
+
+def _enable_verbose(verbose: bool) -> None:
+    """Raise this package to INFO when a subcommand was given its own `-v`."""
+    if verbose:
+        logging.getLogger("zotero_rag").setLevel(logging.INFO)
 
 
 def _version_callback(value: bool) -> None:
@@ -150,8 +174,9 @@ def list_collections(
     console.print(_render_tree(nodes, depth))
     total = count_collections(nodes)
     console.print(
-        f"\n[dim]{_plural(total, 'collection')}. Use the path or key with "
-        f"[/dim]zotero-rag index --collection-key KEY[dim].[/dim]"
+        f"\n[dim]{_plural(total, 'collection')}. Index one by name — [/dim]"
+        f'zotero-rag index --collection "NAME"[dim] — or, when a name is not '
+        f"unique, by key — [/dim]zotero-rag index --collection-key KEY[dim].[/dim]"
     )
 
 
@@ -182,12 +207,32 @@ def init(
     for name in result.skipped:
         console.print(f"  [yellow]kept[/yellow]     {name} [dim](already existed)[/dim]")
 
+    # `index` and `query` must run *inside* the folder, so spell out the `cd`.
+    steps: list[str] = []
+    if result.directory.resolve() != Path.cwd():
+        steps.append(f"cd {result.directory}")
+    steps.append(f"add your credentials to {ENV_FILENAME}")
+    steps.append('zotero-rag index --collection "NAME"   (or --collection-key KEY)')
+
+    console.print("\n[bold]Next:[/bold]")
+    for number, step in enumerate(steps, start=1):
+        console.print(f"  {number}. [bold]{escape(step)}[/bold]")
+
     console.print(
-        f"\nNext: add your Zotero credentials to "
-        f"[bold]{result.directory / ENV_FILENAME}[/bold], then run "
-        f"[bold]zotero-rag index --collection-key KEY[/bold] from that folder "
-        f"to pin and index a collection."
+        "\n[dim]A collection NAME is matched case-insensitively and may be a path such as\n"
+        '"Research/Data Trust/Legal". Use the key when a name is not unique.[/dim]'
     )
+
+    # A .env further up (or at ~/.env) is used too, so say so rather than let the
+    # empty template look like the only place credentials can go.
+    # Resolved, so the hint cannot print a bare `.env` that reads as the local one.
+    index_dir = result.directory.resolve()
+    inherited = [path for path in existing_env_files(index_dir) if path.parent != index_dir]
+    if inherited:
+        console.print(
+            f"\n[dim]Credentials already in {inherited[0]} will be used for any "
+            f"variable you leave blank.[/dim]"
+        )
 
 
 def _is_verbose() -> bool:
@@ -281,7 +326,9 @@ def _print_index_summary(
     """Report what the run did, including everything it chose not to do."""
     console.print(
         f"\n[bold green]Indexed {_plural(stats.indexed, 'PDF')}[/bold green] "
-        f"({_plural(stats.chunks, 'chunk')} from {_plural(stats.pages, 'page')})."
+        f"({_plural(stats.chunks, 'chunk')} from {_plural(stats.pages, 'page')}) "
+        f"out of {_plural(plan.items_seen, 'item')} seen in "
+        f"{_plural(len(plan.collections), 'collection')}."
     )
 
     if stats.already_indexed:
@@ -360,12 +407,15 @@ def index(
     assume_yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Skip the whole-library confirmation prompt.")
     ] = False,
+    verbose: VerboseOption = False,
 ) -> None:
-    """Index the pinned Zotero collection (currently `--dry-run` only).
+    """Index the PDF attachments of the pinned Zotero collection.
 
     The first run pins its collection into config.yaml; later runs reuse it.
     Must be run from an index folder.
     """
+    _enable_verbose(verbose)
+
     if collection is not None and collection_key is not None:
         err_console.print(
             "[bold red]Error:[/bold red] give either --collection or --collection-key, not both."
@@ -428,13 +478,129 @@ def index(
     _print_index_summary(plan, stats, store, verbose=_is_verbose())
 
 
+def _open_index() -> tuple[Config, VectorStore]:
+    """Load the index config and open its store, or explain what is missing."""
+    config = load_config()
+    if config.source_dir is None:
+        raise NotAnIndexFolderError(
+            f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
+            "or change to an index folder."
+        )
+    chroma_dir = config.source_dir / CHROMA_DIRNAME
+    if not VectorStore.exists(chroma_dir):
+        raise NotIndexedError(
+            f"This index folder has no vector store yet ({chroma_dir} is empty). "
+            'Run `zotero-rag index --collection "NAME"` (or `--collection-key KEY`) first.'
+        )
+    store = VectorStore(chroma_dir)
+    if store.count() == 0:
+        raise NotIndexedError(
+            "The vector store holds no chunks. Run `zotero-rag index` to populate it."
+        )
+    return config, store
+
+
+def _print_answer(result: QueryResult, show_sources: bool, verbose: bool) -> None:
+    """Print the answer, then the numbered source list it cites."""
+    console.print()
+    console.print(escape(result.answer))
+
+    # Only what the answer actually cited, so an "I don't know" does not appear
+    # to rest on the passages it declined to use. `--show-sources` shows them all.
+    listed = [source for source in result.sources if source.cited or show_sources]
+    if listed:
+        console.print("\n[bold]Sources[/bold]")
+        for source in listed:
+            marker = "[cyan]" if source.cited else "[dim]"
+            console.print(f"  {marker}\\[{source.number}][/] {escape(source.label)}")
+            if source.zotero_url:
+                console.print(f"       [dim]{source.zotero_url}[/dim]")
+            if show_sources:
+                for excerpt in source.excerpts:
+                    console.print(f"       [dim]{escape(excerpt.strip())}[/dim]\n")
+    elif result.sources:
+        console.print(
+            f"\n[dim]The answer cites no sources; "
+            f"{_plural(result.chunks_retrieved, 'passage')} were retrieved "
+            f"(see --show-sources).[/dim]"
+        )
+
+    if verbose:
+        usage = result.usage
+        console.print(
+            f"\n[dim]{_plural(result.chunks_retrieved, 'chunk')} retrieved; "
+            f"{usage.prompt_tokens} prompt + {usage.completion_tokens} completion tokens "
+            f"({usage.embedding_tokens} to embed the question), "
+            f"{usage.elapsed_s:.1f}s elapsed.[/dim]"
+        )
+
+
+def _answer_as_json(result: QueryResult, show_sources: bool) -> str:
+    """The machine-readable form: answer, sources, usage (PRD §3.4)."""
+    payload = {
+        "answer": result.answer,
+        "sources": [
+            source.model_dump(exclude={"excerpts"} if not show_sources else set())
+            for source in result.sources
+        ],
+        "usage": {
+            **result.usage.model_dump(),
+            "total_tokens": result.usage.total_tokens,
+        },
+    }
+    return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
 @app.command()
-def query() -> None:
-    """Answer a question from the index. Not yet implemented."""
-    err_console.print(
-        "[yellow]`query` is not implemented yet[/yellow] — planned for a later milestone."
-    )
-    raise typer.Exit(code=1)
+def query(
+    question: Annotated[str, typer.Argument(help="The question to answer, in any language.")],
+    top_k: Annotated[
+        int | None,
+        typer.Option("--top-k", help="Chunks to retrieve; overrides the configured top_k.", min=1),
+    ] = None,
+    show_sources: Annotated[
+        bool,
+        typer.Option("--show-sources", help="Also print the full text of each retrieved chunk."),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit a JSON object instead of formatted output.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Answer a question from the index, with citations back to Zotero items.
+
+    Must be run from an index folder that has been indexed at least once.
+    """
+    _enable_verbose(verbose)
+
+    try:
+        config, store = _open_index()
+        embeddings = build_embeddings(config)
+        chat = build_chat(config)
+
+        def ask(messages: list[BaseMessage]) -> AIMessage:
+            # `invoke` is typed as returning any BaseMessage; a chat model returns
+            # an AIMessage, which is what carries `usage_metadata`.
+            return cast(AIMessage, chat.invoke(messages))
+
+        # Status goes to stderr so it never contaminates `--json` on stdout.
+        with err_console.status("[dim]Retrieving and answering...[/dim]"):
+            result = answer_question(
+                question,
+                store=store,
+                embed_query=embeddings.embed_query,
+                answer=ask,
+                top_k=top_k if top_k is not None else config.index.top_k,
+            )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    if as_json:
+        # Plain print: rich would wrap and highlight the JSON.
+        print(_answer_as_json(result, show_sources))  # noqa: T201
+        return
+    _print_answer(result, show_sources, verbose=_is_verbose())
 
 
 if __name__ == "__main__":  # pragma: no cover
