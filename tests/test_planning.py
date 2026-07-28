@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from zotero_rag.documents import DocumentFormat
 from zotero_rag.planning import SkipReason, build_plan
 
 
@@ -82,32 +83,40 @@ def test_linked_url_attachment_is_skipped() -> None:
     reasons = {entry.reason for entry in plan.skipped}
     assert SkipReason.LINKED_URL in reasons
     # The parent is also reported as having no usable PDF.
-    assert SkipReason.NO_PDF in reasons
+    assert SkipReason.NO_CONTENT in reasons
 
 
-def test_non_pdf_attachment_is_skipped() -> None:
+def test_a_snapshot_is_indexed_when_it_is_all_the_item_has() -> None:
+    """The M5 payoff: 105 items in the target library have only a snapshot."""
     plan = build_plan([("C", [item("ITEM1"), attachment("ATT1", content_type="text/html")])])
+    assert [a.document_format for a in plan.attachments] == [DocumentFormat.HTML]
+    assert plan.skipped == []
+
+
+def test_a_genuinely_unreadable_type_is_still_skipped_with_its_type() -> None:
+    plan = build_plan([("C", [item("ITEM1"), attachment("ATT1", content_type="image/png")])])
     assert plan.attachments == []
-    assert SkipReason.UNSUPPORTED_TYPE in {entry.reason for entry in plan.skipped}
+    unsupported = plan.skipped_for(SkipReason.UNSUPPORTED_TYPE)
+    assert [e.content_type for e in unsupported] == ["image/png"]
+    assert plan.content_types_for(SkipReason.UNSUPPORTED_TYPE) == {"image/png": 1}
 
 
-def test_epub_is_skipped_in_the_poc() -> None:
+def test_epub_is_indexed() -> None:
     plan = build_plan(
         [("C", [item("ITEM1"), attachment("ATT1", content_type="application/epub+zip")])]
     )
-    assert plan.attachments == []
-    assert SkipReason.UNSUPPORTED_TYPE in {entry.reason for entry in plan.skipped}
+    assert [a.document_format for a in plan.attachments] == [DocumentFormat.EPUB]
 
 
 def test_item_without_any_attachment_is_reported() -> None:
     plan = build_plan([("C", [item("ITEM1", "Lonely Item")])])
     assert plan.attachments == []
     assert len(plan.skipped) == 1
-    assert plan.skipped[0].reason == SkipReason.NO_PDF
+    assert plan.skipped[0].reason == SkipReason.NO_CONTENT
     assert plan.skipped[0].title == "Lonely Item"
 
 
-def test_notes_are_skipped() -> None:
+def test_notes_are_indexed_alongside_their_item() -> None:
     note = {
         "key": "NOTE1",
         "data": {
@@ -118,12 +127,35 @@ def test_notes_are_skipped() -> None:
         },
     }
     plan = build_plan([("C", [item("ITEM1"), attachment("ATT1"), note])])
-    assert len(plan.attachments) == 1
-    skipped = [entry for entry in plan.skipped if entry.reason == SkipReason.NOTE]
-    assert len(skipped) == 1
-    assert skipped[0].title == "Remember to cite this"
+
+    # The note is indexed *as well as* the PDF: it complements the paper.
+    formats = [a.document_format for a in plan.attachments]
+    assert formats == [DocumentFormat.PDF, DocumentFormat.NOTE]
+    indexed_note = plan.attachments[1]
+    assert indexed_note.note_html.startswith("Remember to cite this")
+    assert indexed_note.needs_download is False
+    # It inherits the parent's citation metadata.
+    assert indexed_note.item_key == "ITEM1"
     # A note must not make its parent look item-less.
     assert plan.items_seen == 1
+
+
+def test_notes_can_be_turned_off() -> None:
+    note = {
+        "key": "NOTE1",
+        "data": {"key": "NOTE1", "itemType": "note", "note": "A remark", "parentItem": "ITEM1"},
+    }
+    plan = build_plan([("C", [item("ITEM1"), attachment("ATT1"), note])], index_notes=False)
+    assert [a.document_format for a in plan.attachments] == [DocumentFormat.PDF]
+    assert [e.reason for e in plan.skipped] == [SkipReason.NOTE]
+
+
+def test_a_standalone_note_is_skipped() -> None:
+    """With no parent item there is no bibliographic metadata to cite."""
+    note = {"key": "NOTE1", "data": {"key": "NOTE1", "itemType": "note", "note": "Loose thought"}}
+    plan = build_plan([("C", [note])])
+    assert plan.attachments == []
+    assert [e.reason for e in plan.skipped] == [SkipReason.NOTE]
 
 
 def test_attachment_without_a_parent_is_skipped() -> None:
@@ -176,10 +208,11 @@ def test_plan_summarises_collections_and_skip_counts() -> None:
     )
     assert plan.collections == ["C"]
     assert plan.items_seen == 3
-    assert len(plan.attachments) == 1
+    # ITEM1 offers a PDF and a snapshot; the PDF wins and the snapshot is recorded.
+    assert [a.document_format for a in plan.attachments] == [DocumentFormat.PDF]
     counts = plan.skip_counts
-    assert counts[SkipReason.NO_PDF] == 2
-    assert counts[SkipReason.UNSUPPORTED_TYPE] == 1
+    assert counts[SkipReason.NO_CONTENT] == 2
+    assert counts[SkipReason.NOT_PREFERRED] == 1
 
 
 def test_entries_without_keys_are_ignored() -> None:

@@ -1,7 +1,12 @@
-"""PDF text extraction.
+"""Text extraction, one **segment** at a time.
 
-Text is extracted **page by page** so the page number recorded in each chunk's
-metadata is exact, which is what makes citations point somewhere useful.
+A segment is the smallest unit a citation can point at: a PDF page, an HTML or
+Word section, an EPUB chapter, a note. Splitting per segment before chunking is
+what keeps the recorded locator exact — the same reason the PoC extracted PDFs
+page by page (PRD §7).
+
+Every extractor returns segments in document order; a document that yields no text
+returns an empty list, which the caller reports as skipped rather than failed.
 """
 
 from __future__ import annotations
@@ -13,29 +18,55 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
+from zotero_rag import html_text, office
+from zotero_rag.documents import DocumentFormat, LocatorKind, locator_kind_for
 from zotero_rag.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
 
 
 class ExtractionError(ZoteroRagError):
-    """The PDF could not be read at all."""
+    """The document could not be read at all."""
 
 
-class Page(BaseModel):
-    """One page's extracted text. `number` is 1-based, as printed in citations."""
+class Segment(BaseModel):
+    """One locatable piece of a document's text.
+
+    `number` is 1-based and counts whatever `kind` says: pages for a PDF, sections
+    for a snapshot. `label` carries a heading when the format has one, so a citation
+    can read `§ Methods` instead of `§ 3`.
+    """
 
     number: int
     text: str
+    kind: LocatorKind = LocatorKind.PAGE
+    label: str = ""
 
 
-def extract_pages(pdf_path: Path) -> list[Page]:
+def extract_segments(path: Path, document_format: DocumentFormat) -> list[Segment]:
+    """Extract text from a cached attachment according to its format."""
+    if document_format is DocumentFormat.PDF:
+        return extract_pdf(path)
+    if document_format is DocumentFormat.HTML:
+        return extract_html(path)
+    if document_format is DocumentFormat.TEXT:
+        return extract_text(path)
+    if document_format is DocumentFormat.DOCX:
+        return _from_sections(office.docx_sections, path, document_format)
+    if document_format is DocumentFormat.ODT:
+        return _from_sections(office.odt_sections, path, document_format)
+    if document_format is DocumentFormat.EPUB:
+        return _from_sections(office.epub_sections, path, document_format)
+    raise ExtractionError(f"No extractor for {document_format} ({path.name})")
+
+
+def extract_pdf(pdf_path: Path) -> list[Segment]:
     """Extract non-empty pages from a PDF.
 
     A page whose text extraction fails is logged and skipped rather than aborting
     the document: one bad page should not cost the whole paper. A document that
-    yields no text at all (typically a scan) returns an empty list, which the
-    caller reports as skipped — there is no OCR in the PoC.
+    yields no text at all (typically a scan) returns an empty list — there is no
+    OCR yet, so the caller reports it as skipped.
     """
     try:
         reader = PdfReader(str(pdf_path))
@@ -51,7 +82,7 @@ def extract_pages(pdf_path: Path) -> list[Page]:
                 f"{pdf_path.name} is encrypted and cannot be read: {exc}"
             ) from exc
 
-    pages: list[Page] = []
+    pages: list[Segment] = []
     for number, page in enumerate(reader.pages, start=1):
         try:
             text = page.extract_text() or ""
@@ -59,8 +90,89 @@ def extract_pages(pdf_path: Path) -> list[Page]:
             logger.warning("Page %d of %s could not be extracted: %s", number, pdf_path.name, exc)
             continue
         if text.strip():
-            pages.append(Page(number=number, text=text))
+            pages.append(Segment(number=number, text=text, kind=LocatorKind.PAGE))
 
     if not pages:
         logger.warning("No extractable text in %s (a scanned PDF?)", pdf_path.name)
     return pages
+
+
+def extract_html(path: Path) -> list[Segment]:
+    """Sections of an HTML snapshot, split on its headings."""
+    sections, title = html_text.parse_sections(_read_text(path))
+    segments = _to_segments(sections, LocatorKind.SECTION)
+    # A page with no headings gets its <title> as the one section's label, which is
+    # the only human-meaningful locator such a document has.
+    if len(segments) == 1 and not segments[0].label and title:
+        segments[0].label = title
+    if not segments:
+        logger.warning("No extractable text in %s", path.name)
+    return segments
+
+
+def extract_text(path: Path) -> list[Segment]:
+    """Plain text, Markdown or CSV.
+
+    Markdown headings give real locators, so they are honoured when present;
+    otherwise the whole file is one section.
+    """
+    content = _read_text(path)
+    sections = _markdown_sections(content)
+    segments = _to_segments(sections, LocatorKind.SECTION)
+    if not segments:
+        logger.warning("No extractable text in %s", path.name)
+    return segments
+
+
+def extract_note(note_html: str) -> list[Segment]:
+    """A Zotero note, whose body is HTML held in the item payload itself.
+
+    Notes need no download, so this takes the markup rather than a path.
+    """
+    text = html_text.to_text(note_html)
+    if not text:
+        return []
+    return [Segment(number=1, text=text, kind=LocatorKind.NOTE)]
+
+
+def _markdown_sections(content: str) -> list[html_text.Section]:
+    """Split on ATX headings (`# Title`), keeping the heading with its body."""
+    sections = [html_text.Section()]
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") and stripped.lstrip("#").strip():
+            sections.append(html_text.Section(title=stripped.lstrip("#").strip()))
+        sections[-1].parts.append(line + "\n")
+    return [section for section in sections if section.text]
+
+
+def _to_segments(sections: list[html_text.Section], kind: LocatorKind) -> list[Segment]:
+    return [
+        Segment(number=number, text=section.text, kind=kind, label=section.title)
+        for number, section in enumerate(sections, start=1)
+        if section.text
+    ]
+
+
+def _from_sections(reader: object, path: Path, document_format: DocumentFormat) -> list[Segment]:
+    """Run one of the `office` readers and label the result for its format."""
+    try:
+        sections = reader(path)  # type: ignore[operator]
+    except office.OfficeError as exc:
+        raise ExtractionError(str(exc)) from exc
+    segments = _to_segments(sections, locator_kind_for(document_format))
+    if not segments:
+        logger.warning("No extractable text in %s", path.name)
+    return segments
+
+
+def _read_text(path: Path) -> str:
+    """Read a text-ish file, tolerating whatever encoding it was saved with.
+
+    Snapshots come from the open web and are routinely mislabelled, so decoding
+    replaces bad bytes instead of failing an otherwise readable document.
+    """
+    try:
+        return path.read_bytes().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise ExtractionError(f"Cannot read {path.name}: {exc}") from exc

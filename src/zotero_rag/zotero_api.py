@@ -5,12 +5,19 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import httpx
 from pydantic import BaseModel, Field
 from pyzotero import zotero
 from pyzotero.zotero_errors import PyZoteroError
 
 from zotero_rag.config import Config
 from zotero_rag.errors import AmbiguousCollectionError, CollectionNotFoundError, ZoteroApiError
+
+# pyzotero raises PyZoteroError for API-level problems, but it speaks HTTP through
+# httpx, so a timeout or a DNS failure arrives as an httpx error instead. Both are
+# expected conditions for a network tool (PRD §10), so both must reach the user as
+# a one-line message rather than a traceback.
+NETWORK_ERRORS = (PyZoteroError, httpx.HTTPError, OSError)
 
 logger = logging.getLogger(__name__)
 
@@ -50,7 +57,7 @@ def fetch_collections(zot: zotero.Zotero) -> list[dict[str, Any]]:
     """Fetch every collection in the library, following pagination."""
     try:
         return list(zot.everything(zot.collections()))
-    except PyZoteroError as exc:
+    except NETWORK_ERRORS as exc:
         raise ZoteroApiError(f"Could not fetch collections from Zotero: {exc}") from exc
 
 
@@ -58,7 +65,7 @@ def fetch_username(zot: zotero.Zotero) -> str:
     """The library owner's username, used to build zotero.org item URLs."""
     try:
         info = zot.key_info()
-    except PyZoteroError as exc:
+    except NETWORK_ERRORS as exc:
         raise ZoteroApiError(f"Could not verify the Zotero API key: {exc}") from exc
     username = info.get("username", "")
     return str(username)
@@ -126,7 +133,7 @@ def fetch_collection_items(zot: zotero.Zotero, collection_key: str) -> list[dict
     """Every item in one collection, including child attachments and notes."""
     try:
         return list(zot.everything(zot.collection_items(collection_key)))
-    except PyZoteroError as exc:
+    except NETWORK_ERRORS as exc:
         raise ZoteroApiError(
             f"Could not fetch items for collection {collection_key}: {exc}"
         ) from exc

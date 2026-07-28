@@ -16,10 +16,10 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from zotero_rag.chunking import chunk_pages
+from zotero_rag.chunking import chunk_segments
 from zotero_rag.embedding import count_tokens
 from zotero_rag.errors import ZoteroRagError
-from zotero_rag.extraction import extract_pages
+from zotero_rag.extraction import extract_note, extract_segments
 from zotero_rag.planning import IndexPlan, PlannedAttachment
 from zotero_rag.vectorstore import VectorStore
 
@@ -48,7 +48,7 @@ class IndexStats(BaseModel):
     already_indexed: int = 0
     no_text: int = 0
     failed: int = 0
-    pages: int = 0
+    pages: int = 0  # segments extracted: pages, sections, or chapters
     chunks: int = 0
     embedding_tokens: int = 0
     elapsed_s: float = 0.0
@@ -73,9 +73,13 @@ def _timed(stats: IndexStats) -> Iterator[None]:
         stats.elapsed_s = time.perf_counter() - start
 
 
-def chunk_id(attachment_key: str, page: int, chunk_index: int) -> str:
-    """Stable id for a chunk, unique within the store."""
-    return f"{attachment_key}:{page}:{chunk_index}"
+def chunk_id(attachment_key: str, locator: int, chunk_index: int) -> str:
+    """Stable id for a chunk, unique within the store.
+
+    The middle component is the locator ordinal — a page for a PDF, a section for
+    a snapshot — so ids stay stable and unique across every format.
+    """
+    return f"{attachment_key}:{locator}:{chunk_index}"
 
 
 def needs_reindex(store: VectorStore, attachment: PlannedAttachment) -> bool:
@@ -179,14 +183,20 @@ def _index_attachment(
     embedding_model: str,
     stats: IndexStats,
 ) -> None:
-    pdf_path = download(attachment.attachment_key)
-    pages = extract_pages(pdf_path)
-    if not pages:
-        # No OCR in the PoC: a scan yields nothing to embed.
+    if attachment.needs_download:
+        path = download(attachment.attachment_key)
+        segments = extract_segments(path, attachment.document_format)
+    else:
+        # A note's body travels in the item payload, so there is nothing to fetch.
+        segments = extract_note(attachment.note_html)
+
+    if not segments:
+        # No OCR yet: a scanned PDF yields nothing to embed, and an empty snapshot
+        # is indistinguishable from one.
         stats.no_text += 1
         return
 
-    chunks = chunk_pages(pages, chunk_size, chunk_overlap)
+    chunks = chunk_segments(segments, chunk_size, chunk_overlap)
     if not chunks:
         stats.no_text += 1
         return
@@ -199,14 +209,17 @@ def _index_attachment(
         )
 
     store.add(
-        ids=[chunk_id(attachment.attachment_key, c.page, c.index) for c in chunks],
+        ids=[chunk_id(attachment.attachment_key, c.locator, c.index) for c in chunks],
         embeddings=embeddings,
         documents=texts,
-        metadatas=[attachment.chunk_metadata(c.page, c.index, embedding_model) for c in chunks],
+        metadatas=[
+            attachment.chunk_metadata(c.locator, c.index, embedding_model, c.kind, c.label)
+            for c in chunks
+        ],
     )
 
     stats.indexed += 1
-    stats.pages += len(pages)
+    stats.pages += len(segments)
     stats.chunks += len(chunks)
     stats.embedding_tokens += count_tokens(texts)
 

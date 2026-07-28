@@ -2,9 +2,10 @@
 
 A command line tool for asking questions about your own Zotero library.
 
-You pick one Zotero collection, `zotero-rag` downloads the PDF attachments of its
-items and indexes them into a local vector database, and then you ask questions in
-natural language. Answers come from an LLM that is only allowed to use the
+You pick one Zotero collection, `zotero-rag` reads its attachments — PDFs, saved web
+pages, Word and OpenDocument files, EPUBs, plain text, and your own Zotero notes —
+and indexes them into a local vector database. Then you ask questions in natural
+language. Answers come from an LLM that is only allowed to use the
 retrieved passages, and every claim is cited back to the Zotero item and page it
 came from — so you can click through and read the source.
 
@@ -133,7 +134,37 @@ zotero-rag index -v            # add timings and token counts
 ```
 
 Re-running `index` is cheap and safe: attachments already indexed and unchanged are
-skipped, and downloaded PDFs stay in `cache/`, so only new work costs anything.
+skipped, and downloaded files stay in `cache/`, so only new work costs anything.
+
+### What gets indexed
+
+| Zotero attachment | Read as | Cited as |
+|---|---|---|
+| PDF | pages | `p. 4` |
+| Saved web page (snapshot) | sections, split at headings | `§ Methods` |
+| Word (`.docx`), OpenDocument (`.odt`) | sections, split at headings | `§ Results` |
+| EPUB | chapters, in spine order | `§ Chapter Two` |
+| Plain text, Markdown, CSV | Markdown headings, else the whole file | `§ Title` |
+| Zotero note | the note | `note` |
+
+When an item has **several** readable attachments — very often a published PDF
+*and* a saved web page of the same article — only the most preferred one is
+indexed, so the same content is not embedded twice and the copies do not compete in
+retrieval. `attachment_preference` sets the order; `index_all_attachments: true`
+indexes everything. Two attachments of the *same* format (a paper and its
+supplement) are both indexed either way. Notes are always extra, never a
+replacement.
+
+Anything else — images, video, archives — is skipped, and the run summary names the
+content types it skipped so you can see what you are missing:
+
+```
+  formats: 13 pdf, 3 html
+     7  another attachment of this item is preferred
+         7  text/html
+     2  no readable attachment
+     1  linked URL (no file)
+```
 
 ### Keeping an index in step with Zotero
 
@@ -172,6 +203,9 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | setting | default | what it does |
 |---|---|---|
 | `top_k` | `5` | passages retrieved per question |
+| `attachment_preference` | `[pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several |
+| `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
+| `index_notes` | `true` | index your Zotero notes alongside each item's file |
 | `chunk_size` / `chunk_overlap` | `1000` / `200` | characters per chunk, and overlap between them |
 | `temperature` | `0.0` | answer randomness; leave at 0 for factual work |
 | `llm_model` | `openai/gpt-4o-mini` | any OpenRouter chat model slug |
@@ -211,9 +245,11 @@ One folder serves one collection. For a second collection, make a second folder.
 
 This is a proof of concept, and deliberately narrow:
 
-- **PDF attachments only.** Notes, HTML snapshots, EPUBs, and linked URLs are
-  skipped and counted in the run summary.
+- **Linked URLs are not fetched.** An attachment that is just a link to a web page
+  is skipped; only files Zotero actually stores are read.
 - **No OCR.** A scanned PDF with no extractable text is skipped with a warning.
+- **A saved web page is only as good as what was saved.** Snapshots of paywalled
+  articles are usually the abstract page, not the full text.
 - **Your own library only** — group libraries are not supported yet.
 - Retrieval is plain vector similarity — no reranking, no hybrid search, no
   metadata filters at query time.

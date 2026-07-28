@@ -28,6 +28,7 @@ from zotero_rag.config import (
     packaged_defaults,
     pin_collection,
 )
+from zotero_rag.documents import DocumentFormat
 from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
 from zotero_rag.errors import (
@@ -46,7 +47,7 @@ from zotero_rag.indexer import (
     repair_embeddings,
 )
 from zotero_rag.llm import build_chat
-from zotero_rag.planning import IndexPlan, PlannedAttachment, build_plan
+from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason, build_plan
 from zotero_rag.querying import QueryResult, answer_question
 from zotero_rag.scaffold import init_index_folder
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
@@ -349,6 +350,12 @@ def _run_index(
     cache_dir: Path,
 ) -> IndexStats:
     """Run the indexing pass with a progress bar over the planned attachments."""
+    # The cache suffix depends on the format, so the downloader needs to know which
+    # format each key is; the plan is the only place that knows.
+    formats = {
+        attachment.attachment_key: attachment.document_format for attachment in plan.attachments
+    }
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -365,7 +372,7 @@ def _run_index(
         return index_plan(
             plan,
             store=store,
-            download=lambda key: ensure_cached(zot, key, cache_dir),
+            download=lambda key: ensure_cached(zot, key, cache_dir, formats[key]),
             embed=embeddings.embed_documents,
             chunk_size=config.index.chunk_size,
             chunk_overlap=config.index.chunk_overlap,
@@ -379,18 +386,20 @@ def _print_index_summary(
 ) -> None:
     """Report what the run did, including everything it chose not to do."""
     console.print(
-        f"\n[bold green]Indexed {_plural(stats.indexed, 'PDF')}[/bold green] "
-        f"({_plural(stats.chunks, 'chunk')} from {_plural(stats.pages, 'page')}) "
+        f"\n[bold green]Indexed {_plural(stats.indexed, 'document')}[/bold green] "
+        f"({_plural(stats.chunks, 'chunk')} from {stats.pages} {_segment_noun(plan)}) "
         f"out of {_plural(plan.items_seen, 'item')} seen in "
         f"{_plural(len(plan.collections), 'collection')}."
     )
 
+    if stats.reindexed:
+        console.print(f"  [dim]{stats.reindexed:>4}[/dim]  re-indexed (changed in Zotero)")
     if stats.already_indexed:
         console.print(f"  [dim]{stats.already_indexed:>4}[/dim]  already indexed, skipped")
     if stats.no_text:
         console.print(f"  [dim]{stats.no_text:>4}[/dim]  no extractable text (scanned PDF?)")
-    for reason, count in plan.skip_counts.items():
-        console.print(f"  [dim]{count:>4}[/dim]  {reason.value}")
+    _print_formats(plan)
+    _print_skips(plan)
 
     if stats.failures:
         console.print(f"\n[yellow]{_plural(stats.failed, 'failure')}:[/yellow]")
@@ -404,6 +413,44 @@ def _print_index_summary(
         )
 
 
+def _segment_noun(plan: IndexPlan) -> str:
+    """What this run's segments are, so the summary never calls a snapshot a page."""
+    formats = set(plan.format_counts)
+    if formats == {DocumentFormat.PDF}:
+        return "pages"
+    if DocumentFormat.PDF in formats:
+        return "pages and sections"
+    return "sections"
+
+
+def _print_formats(plan: IndexPlan) -> None:
+    """Break the planned attachments down by format when it is not all PDFs."""
+    counts = plan.format_counts
+    if len(counts) < 2:
+        return
+    listed = ", ".join(f"{count} {name}" for name, count in counts.items())
+    console.print(f"  [dim]formats:[/dim] {listed}")
+
+
+def _print_skips(plan: IndexPlan) -> None:
+    """Report skips with the detail needed to act on them.
+
+    A bare `10  unsupported content type` tells the user nothing about what those
+    files were, which is the one thing that would let them decide whether the
+    format is worth supporting (PRD §11.2).
+    """
+    if not plan.skipped:
+        return
+    for reason, count in plan.skip_counts.items():
+        console.print(f"  [dim]{count:>4}[/dim]  {reason.value}")
+        if reason in _DETAILED_SKIPS:
+            for content_type, subcount in plan.content_types_for(reason).items():
+                console.print(f"       [dim]{subcount:>3}  {escape(content_type)}[/dim]")
+
+
+_DETAILED_SKIPS = frozenset({SkipReason.UNSUPPORTED_TYPE, SkipReason.NOT_PREFERRED})
+
+
 def _print_plan(plan: IndexPlan, target: str) -> None:
     """Render the dry-run plan: what would be indexed, and what would not."""
     console.print(
@@ -413,12 +460,13 @@ def _print_plan(plan: IndexPlan, target: str) -> None:
     )
 
     if plan.attachments:
-        table = Table(title="PDFs that would be indexed", title_justify="left")
+        table = Table(title="Documents that would be indexed", title_justify="left")
         table.add_column("#", justify="right", style="dim")
-        table.add_column("Title", overflow="ellipsis", max_width=54)
-        table.add_column("Authors", overflow="ellipsis", max_width=28)
+        table.add_column("Title", overflow="ellipsis", max_width=48)
+        table.add_column("Authors", overflow="ellipsis", max_width=26)
         table.add_column("Year", justify="right")
-        table.add_column("Collection", overflow="ellipsis", max_width=20)
+        table.add_column("Format")
+        table.add_column("Collection", overflow="ellipsis", max_width=18)
         table.add_column("Attachment", style="dim")
         for number, attachment in enumerate(plan.attachments, start=1):
             table.add_row(
@@ -426,21 +474,22 @@ def _print_plan(plan: IndexPlan, target: str) -> None:
                 escape(attachment.title),
                 escape(attachment.authors) or "[dim]—[/dim]",
                 attachment.year or "[dim]—[/dim]",
+                str(attachment.document_format),
                 escape(attachment.collection_name),
                 attachment.attachment_key,
             )
         console.print(table)
     else:
-        console.print("[yellow]Nothing to index: no PDF attachments found.[/yellow]")
+        console.print("[yellow]Nothing to index: no readable attachments found.[/yellow]")
 
     console.print(
-        f"\n[bold]{_plural(len(plan.attachments), 'PDF')}[/bold] from "
+        f"\n[bold]{_plural(len(plan.attachments), 'document')}[/bold] from "
         f"{_plural(plan.item_count, 'item')} would be indexed."
     )
+    _print_formats(plan)
     if plan.skipped:
         console.print("Skipped:")
-        for reason, count in plan.skip_counts.items():
-            console.print(f"  [dim]{count:>4}[/dim]  {reason.value}")
+        _print_skips(plan)
     console.print("\n[dim]Dry run: nothing was downloaded, embedded, or written.[/dim]")
 
 
@@ -527,7 +576,13 @@ def index(
                     (collection_node.name, fetch_collection_items(zot, collection_node.key))
                 )
 
-        plan = build_plan(items, username)
+        plan = build_plan(
+            items,
+            username,
+            preference=config.index.attachment_preference,
+            index_all_attachments=config.index.index_all_attachments,
+            index_notes=config.index.index_notes,
+        )
 
         if dry_run:
             _print_plan(plan, target)

@@ -15,6 +15,7 @@ from collections.abc import Callable
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
+from zotero_rag.documents import LocatorKind
 from zotero_rag.embedding import count_tokens
 from zotero_rag.llm import LLMError, message_text, usage_from_message
 from zotero_rag.vectorstore import StoredChunk, VectorStore
@@ -59,19 +60,39 @@ class Source(BaseModel):
     collection_name: str = ""
     zotero_url: str = ""
     page: int = 0
+    locator_kind: str = str(LocatorKind.PAGE)
+    locator_label: str = ""
     distance: float | None = None
     cited: bool = False
     excerpts: list[str] = Field(default_factory=list)
 
     @property
+    def locator(self) -> str:
+        """Where in the document this passage sits, phrased for its format.
+
+        Only a PDF has pages. A snapshot or a Word file has sections, and citing a
+        heading (`§ Methods`) is both honest and more useful than inventing a page
+        number. Chunks written before M5 carry no kind and are all pages.
+        """
+        if self.locator_kind == LocatorKind.NOTE:
+            return "note"
+        if self.locator_kind == LocatorKind.PAGE:
+            return f"p. {self.page}"
+        if self.locator_kind == LocatorKind.PARAGRAPH:
+            return f"¶ {self.page}"
+        if self.locator_kind == LocatorKind.SECTION:
+            return f"§ {self.locator_label}" if self.locator_label else f"§ {self.page}"
+        return f"chunk {self.page}"
+
+    @property
     def label(self) -> str:
-        """One-line citation: title, authors, year, page."""
+        """One-line citation: title, authors, year, locator."""
         head = self.title
         if self.authors:
             head = f"{head} — {self.authors}"
         if self.year:
             head = f"{head} ({self.year})"
-        return f"{head}, p. {self.page}"
+        return f"{head}, {self.locator}"
 
 
 class Usage(BaseModel):
@@ -154,6 +175,8 @@ def collect_sources(chunks: list[StoredChunk]) -> tuple[list[Source], list[int]]
                 collection_name=_text(metadata, "collection_name"),
                 zotero_url=_text(metadata, "zotero_url"),
                 page=page,
+                locator_kind=_text(metadata, "locator_kind", str(LocatorKind.PAGE)),
+                locator_label=_text(metadata, "locator_label"),
                 distance=chunk.distance,
             )
             sources.append(source)

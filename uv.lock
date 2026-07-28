@@ -3697,10 +3697,11 @@ wheels = [
 
 [[package]]
 name = "zotero-rag"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "chromadb" },
+    { name = "httpx" },
     { name = "langchain-core" },
     { name = "langchain-openai" },
     { name = "langchain-text-splitters" },
@@ -3728,6 +3729,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "chromadb", specifier = ">=1.5.9" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "langchain-core", specifier = ">=1.5.1" },
     { name = "langchain-openai", specifier = ">=1.4.1" },
     { name = "langchain-text-splitters", specifier = ">=1.1.2" },

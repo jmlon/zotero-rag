@@ -119,11 +119,11 @@ def test_envelope_is_stripped_to_a_valid_pdf() -> None:
 
 def test_stripped_pdf_still_extracts(tmp_path: Path) -> None:
     """The repaired bytes must be readable by the extraction stage."""
-    from zotero_rag.extraction import extract_pages
+    from zotero_rag.extraction import extract_pdf
 
     path = tmp_path / "repaired.pdf"
     path.write_bytes(strip_multipart_envelope(wrap_in_multipart(make_pdf_bytes(["Real text"]))))
-    pages = extract_pages(path)
+    pages = extract_pdf(path)
     assert len(pages) == 1
     assert "Real text" in pages[0].text
 

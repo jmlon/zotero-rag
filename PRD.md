@@ -4,7 +4,7 @@
 all built and verified against the live library; every acceptance criterion in
 §12 passes. See **§14 Implementation status** for what was built and
 **§11 Roadmap** for the sequenced milestones that follow.
-**Version:** 0.2.0
+**Version:** 0.3.0
 
 ## 1. Goal
 
@@ -22,8 +22,10 @@ future milestones (§11):
 - Group libraries (user library only).
 - Vector stores other than Chroma (Pinecone is a planned milestone).
 - Rerankers, hybrid / BM25 retrieval, windowed retrieval, agentic or multi-step RAG.
-- OCR of scanned PDFs.
+- OCR of scanned PDFs. *(Still open; see the deferral note in §11.2.)*
 - Ingestion of HTML snapshots, EPUBs, linked URLs, and Zotero notes.
+  *(Snapshots, EPUBs and notes delivered in M5, §11.2 — plus text/Markdown/CSV,
+  DOCX and ODT. Linked URLs remain deferred.)*
 - `--force` / clean-slate reindex. *(Delivered in M4, §11.1.)*
 - Detecting items updated or removed in Zotero after indexing.
   *(Delivered in M4, §11.1.)*
@@ -204,6 +206,11 @@ index:
   top_k: 5
   temperature: 0.0
 
+  # Which attachment wins when an item has several readable ones (§7.1).
+  attachment_preference: [pdf, docx, odt, epub, html, txt]
+  index_all_attachments: false
+  index_notes: true
+
   # null => inherit from global.defaults
   llm_model: null
   embedding_model: null
@@ -221,10 +228,11 @@ multilingual OpenRouter slug. No local embedding models (see §9).
   .env               # created by init as a template (never committed)
   .gitignore         # created by init: ignores .env, chroma/, cache/
   chroma/            # Chroma persistent store (created on first index)
-  cache/             # downloaded attachments, <attachment-key>.pdf
+  cache/             # downloaded attachments, <attachment-key>.<pdf|html|docx|…>
 ```
 
-The cache is retained so re-indexing does not re-download files. The Chroma
+The cache is retained so re-indexing does not re-download files. PDFs keep the
+`.pdf` suffix so caches written before M5 still hit. The Chroma
 collection name is fixed (`zotero_rag`).
 
 ## 7. Ingestion pipeline
@@ -240,25 +248,63 @@ For the pinned collection, recursively:
    application/pdf`. The envelope is stripped before anything is written to the
    cache, so the cache always holds valid PDFs. Files that already start with
    `%PDF` pass through untouched.
-3. For each attachment with `contentType == application/pdf`: if the file is not
-   already in `cache/`, download it with `zot.dump()`.
-4. Extract text **page by page** with `pypdf`, then split each page's text with
-   `RecursiveCharacterTextSplitter`. Splitting per page keeps the recorded page
-   number exact.
+3. Decide which attachment of each item to index (§7.1), then, if its file is not
+   already in `cache/<key><suffix>`, download it. Notes need no download: their
+   body travels in the item payload.
+4. Extract text **segment by segment** — pages for a PDF via `pypdf`, sections for
+   the other formats — then split each segment's text with
+   `RecursiveCharacterTextSplitter`. Splitting per segment keeps the recorded
+   locator exact (§7.1.1).
 5. Embed chunks (`langchain-openai` `OpenAIEmbeddings` against the OpenRouter
    endpoint, `check_embedding_ctx_length=False` — OpenRouter slugs are not in
    `tiktoken`'s registry) and upsert into Chroma.
 
 ### 7.1 Selection rules
 
-- **PDF attachments only.** `linked_url`, HTML snapshots, EPUBs, and notes are
-  skipped and counted in the run summary.
-- Items with **no PDF attachment** are not indexed; a warning names the item.
-- Items with **multiple PDF attachments**: all of them are indexed.
+*Extended by M5 (§11.2), which added every format below except PDF.*
+
+- **Readable formats:** PDF, HTML snapshots, plain text / Markdown / CSV, DOCX,
+  ODT, EPUB, and Zotero notes. `linked_url` attachments and anything else
+  (images, video, archives) are skipped and counted in the run summary **with
+  their content type**, so the count is actionable.
+- **One format per item.** When an item offers several readable attachments, the
+  first format in `attachment_preference` wins and the rest are recorded as
+  skipped. This exists because ~100 items in the target library hold both a PDF
+  and an HTML snapshot of the same article; indexing both would embed that
+  content twice and let the copies compete in retrieval.
+  `index_all_attachments: true` indexes every readable attachment instead.
+- Items with **several attachments of the winning format** — a paper and its
+  supplement, say — have **all of them** indexed. The choice is between formats,
+  not between files.
+- **Notes are indexed alongside** an item's file, never instead of it, and take no
+  part in the preference: a note is the reader's own commentary, so it complements
+  the paper. `index_notes: false` turns them off. A *standalone* note (no parent
+  item) is skipped, since it has no bibliographic metadata to cite.
+- Items with **no readable attachment** are not indexed; a warning names the item.
 - **Scanned / image-only PDFs** (extraction yields no text) are skipped with a
-  warning; no OCR.
+  warning; no OCR yet (§11.2).
 - An item reachable through two subcollections is embedded **once** —
   deduplicated by `attachment_key`.
+
+### 7.1.1 Locators
+
+Only a PDF has pages, so the page number generalises to a **locator**: an ordinal,
+a `kind`, and an optional label.
+
+| Format | Locator kind | Ordinal counts | Label |
+|---|---|---|---|
+| PDF | `page` | pages | — |
+| HTML, DOCX, ODT, EPUB, Markdown | `section` | heading-delimited sections | the heading (or the `<title>` for a page with none) |
+| Zotero note | `note` | the note | — |
+| plain text without headings | `section` | the whole file | — |
+
+Citations render each kind in its own terms — `p. 4`, `§ Architecture`, `note` —
+rather than pretending a snapshot has pages. Chunks written before M5 carry no
+kind and are read as pages, which is what they are.
+
+HTML extraction drops non-content elements outright (`script`, `style`, `nav`,
+`footer`, `aside`, forms) because a snapshot is a whole web page and most of its
+markup is furniture.
 
 ### 7.2 Chunk metadata
 
@@ -274,8 +320,11 @@ Stored per chunk, used for both citation and future filtering:
 | `doi` | item `DOI`, `""` if absent |
 | `zotero_url` | `https://www.zotero.org/<user>/collections/<col>/items/<key>/collection` |
 | `collection_name` | the (sub)collection the item was found in |
-| `page` | 1-based PDF page number |
-| `chunk_index` | index of the chunk within that page |
+| `page` | the locator ordinal: a 1-based page for a PDF, a section number otherwise. The key keeps its name so chunks written before M5 are not stranded |
+| `chunk_index` | index of the chunk within that segment |
+| `locator_kind` | `page` \| `section` \| `paragraph` \| `note` \| `chunk` (M5) |
+| `locator_label` | the section heading, when the format has one (M5) |
+| `document_format` | `pdf` \| `html` \| `txt` \| `docx` \| `odt` \| `epub` \| `note` (M5) |
 | `embedding_model` | the model that produced this vector (M4) |
 | `attachment_version` | the attachment's Zotero version when embedded (M4) |
 
@@ -350,7 +399,12 @@ PyTorch, no sentence-transformers. Embeddings are always remote via OpenRouter.
 
 Runtime: `pyzotero`, `chromadb`, `pypdf`, `langchain-core`, `langchain-openai`,
 `langchain-text-splitters`, `typer`, `rich`, `pydantic`, `pyyaml`,
-`python-dotenv`, `tiktoken` (token counts for `-v`).
+`python-dotenv`, `tiktoken` (token counts for `-v`), `httpx` (imported directly to
+catch the transport errors `pyzotero` lets through — see §14.7).
+
+HTML, DOCX, ODT and EPUB are read with the **standard library only**
+(`html.parser`, `zipfile`, `xml.etree`). No BeautifulSoup, `lxml`, or
+`python-docx`: §9's constraint held through M5.
 
 `chromadb` is used **directly** (no `langchain-chroma` wrapper). The `langchain`
 meta-package is not installed.
@@ -418,7 +472,7 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 | # | Milestone | Theme | Version | Size |
 |---|---|---|---|---|
 | 4 | Store integrity and true reindexing | correctness | 0.2.0 | ✅ **done** |
-| 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | M–L |
+| 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | ✅ **done** |
 | 6 | Measurement before tuning | evaluation | 0.4.0 | S–M |
 | 7 | Retrieval quality | tuning | 0.5.0 | M |
 | 8 | Scale and cost | performance | 0.6.0 | S–M |
@@ -531,7 +585,10 @@ The adoption path matters because the existing `Writing` and `Networking` stores
 have no fingerprint, and forcing a re-embed of 1,296 chunks to gain a guard would
 be a poor trade.
 
-### 11.2 Milestone 5 — Cover more of the library (0.3.0)
+### 11.2 Milestone 5 — Cover more of the library (0.3.0) — ✅ done
+
+**Status: implemented and verified live** (§14.7), except OCR and linked-URL
+fetching, both deliberately deferred — see the end of this section.
 
 **Goal:** index what is actually in the collections, not only the PDFs.
 
@@ -622,7 +679,24 @@ are.
 snapshot ingestion on a collection containing snapshot-only items makes them
 answerable and cites them with a section locator; an item holding both a PDF and a
 snapshot yields chunks from the PDF only under the default preference; the `Writing`
-regression (146 chunks, `p. N` citations) is unchanged.
+regression (146 chunks, `p. N` citations) is unchanged. **All verified — §14.7.**
+
+#### 11.2.1 Deferred from M5, and why
+
+- **OCR.** Not implemented. Neither `tesseract` nor `ocrmypdf` is present on the
+  development machine, so the invocation path could be written but not *verified*,
+  and shipping an unexercised subprocess call that runs over a user's whole library
+  is worse than shipping nothing. The design stands as written above — external
+  binary only, `ocr: auto|never|always` — and it needs a machine with the binary
+  installed to be finished honestly.
+- **Linked-URL fetching** (166 attachments). Not implemented. Everything else in
+  M5 reads bytes Zotero already stores; fetching arbitrary URLs is a different risk
+  class — it makes the tool a web client, with redirects, paywalls, dead links and
+  whatever a URL resolves to today. It stays behind the planned
+  `ingest_linked_urls: false` and wants its own milestone rather than a corner of
+  this one.
+
+Both remain listed in §11.9 rather than being quietly dropped.
 
 ### 11.3 Milestone 6 — Measurement before tuning (0.4.0)
 
@@ -732,8 +806,8 @@ From §1.1 and the original §11 list:
 | `--force` clean-slate reindex | M4 |
 | Version-aware incremental indexing | M4 |
 | Deletion sync | M4 |
-| OCR of scanned PDFs | M5 |
-| HTML snapshot / EPUB / notes ingestion | M5 |
+| OCR of scanned PDFs | M5 — **deferred**, §11.2.1 |
+| HTML snapshot / EPUB / notes ingestion | M5 ✅ |
 | Metadata filters at query time (year, author, tag) | M7 |
 | Rerankers | M7 |
 | Hybrid / BM25 retrieval | M7 |
@@ -754,11 +828,13 @@ Surfaced while building the PoC, not in the original list:
 |---|---|---|
 | Store fingerprint / model-change guard | M4 | a changed `embedding_model` currently corrupts retrieval silently |
 | `--prune` for items moved out of a collection | M4 | not a deletion, so `deleted()` never reports it |
-| Name the skipped content types | M5 | `10 unsupported content type` is not actionable |
-| Plain-text / Markdown / CSV ingestion | M5 | free: read and split, no parser |
-| DOCX and ODT ingestion | M5 | ZIP + XML, ~30 lines each with the stdlib |
-| Per-item attachment preference | M5 | ~100 items hold both a PDF and a snapshot; naive ingestion duplicates them |
-| `page` generalised to a locator | M5 | HTML, Markdown, DOCX and notes have no pages |
+| Name the skipped content types | M5 ✅ | `10 unsupported content type` is not actionable |
+| Plain-text / Markdown / CSV ingestion | M5 ✅ | free: read and split, no parser |
+| DOCX and ODT ingestion | M5 ✅ | ZIP + XML, ~30 lines each with the stdlib |
+| Per-item attachment preference | M5 ✅ | ~100 items hold both a PDF and a snapshot; naive ingestion duplicates them |
+| `page` generalised to a locator | M5 ✅ | HTML, Markdown, DOCX and notes have no pages |
+| Linked-URL ingestion | **deferred**, §11.2.1 | makes the tool a web client; wants its own milestone |
+| Wrap httpx transport errors | M5 ✅ | a Zotero timeout printed a traceback (§14.7) |
 | Per-chunk embedding-model tag, `index --repair` | M4 | repair the stale chunks instead of rebuilding the store |
 | Evaluation harness | M6 | §12.1 defines a golden set that nothing executes |
 | `status` command | M9 | no way to inspect a folder's index |
@@ -856,7 +932,7 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-27. **182 tests passing; `ruff` and `mypy` clean.**
+Last updated: 2026-07-27. **295 tests passing; `ruff`, `ruff format` and `mypy` clean.**
 
 ### 14.1 Done
 
@@ -868,10 +944,11 @@ Last updated: 2026-07-27. **182 tests passing; `ruff` and `mypy` clean.**
 | 2b | Download, extract, chunk, embed, store, pin | ✅ verified live |
 | 3 | `query`: retrieve, prompt, answer, cite | ✅ verified live |
 | 4 | Store fingerprint, version-aware reindexing, repair, prune | ✅ verified live |
+| 5 | HTML / text / DOCX / ODT / EPUB / notes, locators, preference | ✅ verified live |
 
 **All eight acceptance criteria (§12) are verified against the real library**, as
-is M4 (§14.6). Next up is **M5, coverage (§11.2)** — 105 items in the library hold
-nothing but an HTML snapshot and so remain invisible to `query`.
+are M4 (§14.6) and M5 (§14.7). Next up is **M6, measurement (§11.3)** — an
+evaluation harness, before any retrieval tuning.
 
 ### 14.2 `query` as built (§3.4, §8)
 
@@ -902,11 +979,14 @@ src/zotero_rag/
   config.py        pydantic models, layered loading, pin_collection()
   scaffold.py      init: config.yaml + .env + .gitignore
   zotero_api.py    client, collection tree, path/key resolution, item fetch
-  planning.py      build_plan(): §7.1 selection rules, chunk_metadata()
+  planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata()
+  documents.py     formats, content-type mapping, locator kinds
+  html_text.py     stdlib HTML → sections (snapshots and notes)
+  office.py        DOCX / ODT / EPUB via zipfile + xml.etree
   metadata.py      authors_str(), parse_year(), zotero_url()
   download.py      cache + multipart-envelope repair
-  extraction.py    pypdf, page by page
-  chunking.py      RecursiveCharacterTextSplitter per page
+  extraction.py    segment extraction, dispatched by format
+  chunking.py      RecursiveCharacterTextSplitter per segment
   embedding.py     OpenRouter embeddings + tiktoken counting
   vectorstore.py   chromadb wrapper, StoredChunk
   indexer.py       orchestration, IndexStats, failure isolation, repair, prune
@@ -1009,3 +1089,43 @@ vector against two copies of the same store, the top-5 ids and distances are
 bit-identical before and after the fingerprint is written. Worth stating because
 `collection.modify()` touching a collection's metadata is exactly the kind of call
 that could quietly rebuild an index.
+
+### 14.7 M5 as built and verified
+
+Verified live against the real `Networking` collection (8 collections, 18 items)
+and the `Writing` regression, from a global `uv tool install`:
+
+| Check | Result |
+|---|---|
+| Coverage on `Networking` | **16 documents from 16 items** (13 pdf + 3 html), up from 13 PDFs |
+| The three previously invisible items | exactly the ones the pre-M5 run warned about as having no PDF; now indexed as 36 chunks from 29 sections (2,912 tokens) |
+| Duplicate suppression | 7 snapshots recorded as `another attachment of this item is preferred`, all `text/html` — no double-embedding |
+| `no readable attachment` | fell from 5 items to 2 |
+| Skip reporting | each reason now lists its content types underneath |
+| Section citations | a snapshot-only item answers with `§ Abstract:` and a working Zotero URL |
+| HTML extraction end to end | a hand-built snapshot indexed to 3 sections labelled `Introduction`, `Why fog is needed`, `Fog versus edge computing`; `nav`, `script` and `footer` text absent; query answered with `§ Fog versus edge computing` |
+| PDF regression | `Writing` unchanged at 146 chunks, citations still `p. N`, summary still says `pages` |
+| Notes | indexed with no download at all (a test fails the run if a download is attempted) |
+| Regression | 295 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**Two things found by running it, not by planning it:**
+
+- **A Zotero timeout printed a full traceback.** pyzotero speaks HTTP through
+  `httpx`, so a `ConnectTimeout` is not a `PyZoteroError` and escaped every
+  `except` in `zotero_api.py`. The Zotero API was genuinely flaky during the M5
+  run, which is how this surfaced. Network failure is an *expected* condition for
+  this tool (§10), so `NETWORK_ERRORS` now covers `PyZoteroError`, `httpx.HTTPError`
+  and `OSError`, and `httpx` is declared as a direct dependency rather than used
+  as a transitive one. The same failure then read:
+  `Error: Could not fetch collections from Zotero: The read operation timed out`.
+- **The summary called snapshots "PDFs".** `Indexed 3 PDFs (36 chunks from 29
+  pages)` was wrong in both nouns. The wording now follows the formats actually
+  indexed: `documents`, and `pages` / `sections` / `pages and sections`.
+
+**A caveat about what snapshots contain.** The three newly indexed snapshots are
+publisher landing pages (IEEE Xplore and similar), so their sections are
+`Abstract:` and the article title — not full text. Coverage genuinely improved,
+and those items are now answerable, but a snapshot of a paywalled article is an
+abstract, not the paper. This is the §11.2 prediction confirmed: a snapshot of an
+article that also has a PDF is usually the abstract page plus furniture, which is
+exactly why the PDF wins by default.

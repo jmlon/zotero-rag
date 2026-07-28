@@ -1,7 +1,9 @@
 """Attachment file cache.
 
-Files are downloaded once into `<index>/cache/<attachment-key>.pdf` and reused,
-so re-indexing never re-fetches a PDF that is already on disk.
+Files are downloaded once into `<index>/cache/<attachment-key><suffix>` and
+reused, so re-indexing never re-fetches a file that is already on disk. The
+suffix comes from the attachment's format, and PDFs keep `.pdf` so caches
+written before M5 still hit.
 """
 
 from __future__ import annotations
@@ -10,9 +12,9 @@ import logging
 from pathlib import Path
 from typing import Protocol
 
-from pyzotero.zotero_errors import PyZoteroError
-
+from zotero_rag.documents import DocumentFormat, cache_suffix
 from zotero_rag.errors import ZoteroRagError
+from zotero_rag.zotero_api import NETWORK_ERRORS
 
 logger = logging.getLogger(__name__)
 
@@ -38,8 +40,12 @@ class AttachmentDownloadError(ZoteroRagError):
     """The attachment file could not be retrieved from Zotero."""
 
 
-def cache_path(cache_dir: Path, attachment_key: str) -> Path:
-    return cache_dir / f"{attachment_key}.pdf"
+def cache_path(
+    cache_dir: Path,
+    attachment_key: str,
+    document_format: DocumentFormat = DocumentFormat.PDF,
+) -> Path:
+    return cache_dir / f"{attachment_key}{cache_suffix(document_format)}"
 
 
 def strip_multipart_envelope(data: bytes) -> bytes:
@@ -71,18 +77,27 @@ def strip_multipart_envelope(data: bytes) -> bytes:
     return stripped
 
 
-def _write_clean(path: Path, data: bytes) -> None:
-    cleaned = strip_multipart_envelope(data)
+def _write_clean(path: Path, data: bytes, document_format: DocumentFormat) -> None:
+    """Write a downloaded file, unwrapping a stray upload envelope for PDFs."""
+    cleaned = strip_multipart_envelope(data) if document_format is DocumentFormat.PDF else data
     if not cleaned:
         raise AttachmentDownloadError(f"Downloaded file for {path.stem} is empty")
     path.write_bytes(cleaned)
 
 
-def ensure_cached(zot: AttachmentFetcher, attachment_key: str, cache_dir: Path) -> Path:
+def ensure_cached(
+    zot: AttachmentFetcher,
+    attachment_key: str,
+    cache_dir: Path,
+    document_format: DocumentFormat = DocumentFormat.PDF,
+) -> Path:
     """Return the local path for an attachment, downloading it if necessary."""
-    target = cache_path(cache_dir, attachment_key)
+    target = cache_path(cache_dir, attachment_key, document_format)
 
     if target.is_file() and target.stat().st_size > 0:
+        if document_format is not DocumentFormat.PDF:
+            logger.debug("cache hit for %s", attachment_key)
+            return target
         existing = target.read_bytes()
         if existing.startswith(PDF_MAGIC):
             logger.debug("cache hit for %s", attachment_key)
@@ -90,14 +105,14 @@ def ensure_cached(zot: AttachmentFetcher, attachment_key: str, cache_dir: Path) 
         # A file cached before envelope-stripping existed: repair it in place
         # rather than re-downloading bytes we already have.
         logger.info("repairing previously cached file for %s", attachment_key)
-        _write_clean(target, existing)
+        _write_clean(target, existing, document_format)
         return target
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     logger.info("downloading attachment %s", attachment_key)
     try:
         data = zot.file(attachment_key)
-    except PyZoteroError as exc:
+    except NETWORK_ERRORS as exc:
         raise AttachmentDownloadError(
             f"Could not download attachment {attachment_key}: {exc}"
         ) from exc
@@ -109,7 +124,7 @@ def ensure_cached(zot: AttachmentFetcher, attachment_key: str, cache_dir: Path) 
         )
 
     try:
-        _write_clean(target, data)
+        _write_clean(target, data, document_format)
     except OSError as exc:
         raise AttachmentDownloadError(f"Could not write {target}: {exc}") from exc
 

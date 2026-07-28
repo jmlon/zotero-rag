@@ -100,6 +100,16 @@ class IndexConfig(BaseModel):
     top_k: int = Field(default=5, gt=0)
     temperature: float = Field(default=0.0, ge=0.0)
 
+    # Which attachment to index when an item offers several readable ones. Roughly
+    # a hundred items in a real library hold both a PDF and an HTML snapshot of the
+    # same article, so indexing everything would embed that content twice (§11.2).
+    attachment_preference: list[str] = Field(
+        default_factory=lambda: ["pdf", "docx", "odt", "epub", "html", "txt"]
+    )
+    index_all_attachments: bool = False
+    # Notes complement an item's file rather than competing with it.
+    index_notes: bool = True
+
     # null => inherit from global.defaults
     llm_model: str | None = None
     embedding_model: str | None = None

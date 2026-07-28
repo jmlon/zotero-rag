@@ -19,7 +19,7 @@ from zotero_rag import __version__, cli
 from zotero_rag.config import Config
 from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.indexer import IndexStats
-from zotero_rag.planning import IndexPlan
+from zotero_rag.planning import IndexPlan, PlannedAttachment
 from zotero_rag.querying import QueryResult, Source, Usage
 from zotero_rag.vectorstore import VectorStore
 from zotero_rag.zotero_api import CollectionNode
@@ -78,14 +78,29 @@ def test_verbose_is_accepted_after_the_subcommand(
 
 def test_index_summary_reports_items_seen(tmp_path: Path) -> None:
     """PRD §10 lists items seen among the required summary fields."""
-    plan = IndexPlan(collections=["Writing"], items_seen=6)
+    plan = IndexPlan(
+        collections=["Writing"],
+        items_seen=6,
+        attachments=[
+            PlannedAttachment(
+                attachment_key=f"A{n}",
+                item_key=f"I{n}",
+                title="t",
+                authors="",
+                year="",
+                collection_name="Writing",
+            )
+            for n in range(4)
+        ],
+    )
     stats = IndexStats(indexed=4, chunks=146, pages=22)
     out = StringIO()
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cli, "console", Console(file=out, width=200, no_color=True))
         cli._print_index_summary(plan, stats, VectorStore(tmp_path / "chroma"), verbose=False)
     text = out.getvalue()
-    assert "Indexed 4 PDFs" in text
+    assert "Indexed 4 documents" in text
+    assert "146 chunks from 22 pages" in text  # all PDFs, so "pages" is right
     assert "6 items seen in 1 collection" in text
 
 
