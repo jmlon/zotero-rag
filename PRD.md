@@ -385,10 +385,11 @@ measurement before any retrieval experiment:
    loudly (`Collection expecting embedding with dimension of 3, got 1536`), which
    is the same bug getting lucky. A confidently cited wrong answer is the worst
    failure this tool has.
-2. **Coverage next (M5).** On the real `Networking` collection, 13 of 18 items
-   yielded a PDF; 10 attachments were skipped as unsupported and 1 as a linked
-   URL. Better retrieval over a corpus that excludes a third of the library is
-   worth less than indexing the rest of it.
+2. **Coverage next (M5).** A survey of the live library found **1,022 attachments,
+   of which only 670 are PDFs**: 205 are HTML snapshots and 105 items have *nothing
+   but* a snapshot, so they are invisible to `query` today (§11.2 has the full
+   breakdown). Better retrieval over a corpus that excludes those items is worth
+   less than indexing them.
 3. **Then measurement (M6), then tuning (M7).** Rerankers, hybrid search, and
    `top_k` changes are all *hypotheses*. Without a scored golden set we would be
    choosing them by how good one answer looked, which is how retrieval
@@ -399,7 +400,7 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 | # | Milestone | Theme | Version | Size |
 |---|---|---|---|---|
 | 4 | Store integrity and true reindexing | correctness | 0.2.0 | M |
-| 5 | Cover more of the library | coverage | 0.3.0 | M–L |
+| 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | M–L |
 | 6 | Measurement before tuning | evaluation | 0.4.0 | S–M |
 | 7 | Retrieval quality | tuning | 0.5.0 | M |
 | 8 | Scale and cost | performance | 0.6.0 | S–M |
@@ -419,15 +420,9 @@ change. Today the attachment key is the only incremental criterion (§7.3), so a
 replaced PDF is never re-read, a deleted item is never removed, and a changed
 embedding model is not noticed.
 
-- **Store fingerprint.** Record `embedding_model`, its vector dimension,
-  `chunk_size`, `chunk_overlap`, and a metadata schema version alongside the
-  store. `index` and `query` refuse to run on a mismatch, naming the setting that
-  changed and pointing at `--force` or a fresh folder. **This is the single
-  highest-value item in the roadmap per hour of work** — it converts a silent
-  wrong-answer mode into a clear error. Note that `chunk_size` and
-  `chunk_overlap` changes are *not* corrupting, only inconsistent: old chunks stay
-  as they were (README already says to rebuild). They belong in the fingerprint so
-  the mixture is visible, but they should warn where a model change refuses.
+- **Store fingerprint** — see §11.1.1 for where it lives and why. **The single
+  highest-value item in the roadmap per hour of work:** it converts a silent
+  wrong-answer mode into a clear error.
 - **`index --force`.** Drop the collection and re-embed from `cache/`, with no
   re-download. `--force --refetch` also clears the cache.
 - **Version-aware incremental indexing.** Record the library version from
@@ -446,31 +441,153 @@ message naming that setting; replacing one `Writing` PDF in Zotero re-embeds
 exactly that attachment; deleting an item removes its chunks and it stops being
 cited; `--force` on `Writing` reproduces 146 chunks with zero downloads.
 
+#### 11.1.1 Where the embedding-model record must live
+
+`config.yaml` cannot be the record. It states what the user **wants**, is meant to
+be edited, and is the very thing that changes when this bug bites. The store must
+carry what was actually **used**, so the check becomes *intent vs. fact* rather
+than config vs. itself.
+
+Three layers, each verified against `chromadb` 1.5.9:
+
+1. **Chroma collection metadata — the authoritative record.** Set at
+   `get_or_create_collection(name, metadata={...})`, readable as
+   `collection.metadata`, **persisted across a client reopen**, and updatable later
+   via `collection.modify(metadata=...)` (needed for the migration below). Values
+   must be scalars — a nested dict raises `ValueError` — so use flat dotted keys
+   (`zotero_rag.embedding_model`, `zotero_rag.embedding_dim`,
+   `zotero_rag.endpoint_host`, `zotero_rag.chunk_size`, `zotero_rag.chunk_overlap`,
+   `zotero_rag.schema`) or one JSON string. This record lives inside `chroma/`,
+   travels with the store if it is copied, and is not a file anyone hand-edits.
+2. **Per-chunk `embedding_model` in the chunk metadata — detects a *mixed* store
+   and enables repair instead of rebuild.** A single global fingerprint only tells
+   you the store is suspect; a per-chunk field tells you *which* vectors are stale.
+   Verified: `get(where={"embedding_model": {"$ne": current}})` returns exactly the
+   stale chunk ids, and the distinct models present can be enumerated. That is what
+   makes `index --repair` (re-embed only the stale chunks, from `cache/`, no
+   re-download) possible — far better than forcing a full rebuild after an
+   accidental edit. Cost is one short string per chunk.
+3. **The vector dimension, derived rather than recorded.** `collection.get(limit=1,
+   include=["embeddings"])` yields a real vector, so its length is a *fact* that
+   cannot drift from the data or be forged by editing a file. Use it to cross-check
+   layer 1, and to reconstruct a fingerprint for stores written before this
+   milestone.
+
+**Optional fourth layer — a canary probe, for drift a model name cannot express.**
+An OpenRouter slug is not a version: the same `openai/text-embedding-3-small` may
+be served by a different provider or revision over time, and no recorded string
+would notice. Embedding one fixed canary sentence at index time and storing that
+vector (as a reserved id, or in the collection metadata) allows a later
+`--verify` to re-embed it and compare — cosine similarity, not equality, since
+embeddings are not bit-stable across providers; below ~0.999 means the endpoint is
+no longer producing the vectors this store was built with. Cost is one embedding
+call, so make it opt-in rather than part of every query.
+
+**Behaviour on mismatch**, distinguishing corruption from mere inconsistency:
+
+| Change | Response |
+|---|---|
+| `embedding_model` or dimension differs | **Refuse** both `index` and `query`, name the setting, offer `--repair` or `--force` |
+| `chunk_size` / `chunk_overlap` differ | **Warn and continue** — the store is inconsistent, not wrong |
+| Endpoint host differs | Warn; suggest `--verify` |
+| No fingerprint at all (pre-M4 store) | Adopt: derive the dimension from a stored vector, record the config's current model as fact, warn once that an `embedding_model` edited since indexing cannot be detected retroactively |
+
+The adoption path matters because the existing `Writing` and `Networking` stores
+have no fingerprint, and forcing a re-embed of 1,296 chunks to gain a guard would
+be a poor trade.
+
 ### 11.2 Milestone 5 — Cover more of the library (0.3.0)
 
 **Goal:** index what is actually in the collections, not only the PDFs.
 
-- **Say what was skipped.** The dry run and the run summary should name content
-  types and titles per skip reason. `10  unsupported content type` currently gives
-  the user nothing to act on. (S — do this first; it also tells us which of the
-  formats below is worth the effort.)
-- **HTML snapshots** (`text/html`): extract text from the stored snapshot with a
-  stdlib `html.parser`-based extractor, so no dependency is added. The page number
-  becomes a section or offset index.
-- **Zotero notes** (`note` items): index the note body with the parent item's
-  metadata; the page field records "note" rather than a number.
-- **EPUB**: `zipfile` plus the same HTML extractor, with chapters as the page
-  analogue.
-- **`linked_url` attachments**: opt-in only (`ingest_linked_urls: false` by
-  default). Fetching arbitrary URLs is a different risk class from reading files
-  Zotero already stores, so it must be a deliberate choice.
-- **OCR, optional and external.** Only via an external binary (`ocrmypdf` /
-  `tesseract`) detected on `PATH`, controlled by `ocr: auto|never|always`. A
-  Python ML OCR stack would violate §9, and that constraint stands.
+**Measured, not guessed.** A survey of the whole live library — 1,022 attachments
+across 801 items with at least one attachment — says which parsers pay off:
 
-**Acceptance:** on `Networking`, the summary names each skipped content type;
-enabling snapshot ingestion raises the indexed-item count, and a question
-answerable only from a snapshot is answered with a citation to it.
+| Content type | Attachments | Status today |
+|---|---|---|
+| `application/pdf` | 670 | indexed |
+| `text/html` (snapshots) | 205 | **skipped** |
+| *(none)* — almost all `linked_url` | 132 | skipped |
+| `text/plain` | 10 | **skipped** |
+| `application/vnd.oasis.opendocument.text` (ODT) | 1 | skipped |
+| `…wordprocessingml.document` (DOCX) | 1 | skipped |
+| `image/png`, `image/jpeg` | 2 | skipped (OCR territory) |
+| `text/csv` | 1 | skipped |
+
+Link modes: 468 `imported_url`, 388 `imported_file`, 166 `linked_url`.
+
+Per *item*, which is what actually determines coverage:
+
+| Item has | Items | Consequence |
+|---|---|---|
+| PDF only | 555 | already covered |
+| **HTML snapshot only** | **105** | **completely invisible to `query` today** |
+| PDF **and** HTML snapshot | 100 | snapshot would *duplicate* the PDF |
+| no PDF and no snapshot (`(none)`) | 35 | linked URLs |
+| `text/plain` only | 5 | invisible |
+| ODT only | 1 | invisible |
+
+**The decisive finding: of the 205 snapshots, ~100 sit on items that already have
+a PDF.** Ingesting snapshots naively would add roughly a hundred near-duplicate
+copies of documents already indexed — they would compete with the PDF chunks in
+retrieval and could yield two citations for one source. So format support needs a
+**per-item preference order** rather than "index everything readable":
+
+```yaml
+  # First format found for an item wins; the rest are recorded as skipped.
+  attachment_preference: [pdf, docx, odt, html, txt]
+  index_all_attachments: false   # true = index every readable attachment
+```
+
+With that in place the payoff is **+105 items (+13% of items with attachments)**
+newly searchable and no duplication, versus +205 attachments and ~100 redundant
+ones without it.
+
+Scope, ordered by measured payoff:
+
+- **Say what was skipped (S).** The dry run and the run summary should name content
+  types and titles per skip reason. `10  unsupported content type` gives the user
+  nothing to act on — and this survey is exactly what a user cannot currently
+  produce for themselves.
+- **HTML snapshots — 205 attachments, 105 otherwise-invisible items.** The single
+  biggest coverage win in the project. A stdlib `html.parser` extractor (drop
+  `script`/`style`/`nav`, collapse whitespace, keep heading structure for the
+  locator) adds no dependency.
+- **Plain text and Markdown — 10 attachments, and free.** `text/plain`,
+  `text/markdown`, and `text/csv` are all read-then-split with no parser at all;
+  they share one code path with the extractor above.
+- **DOCX and ODT — 1 each here, but cheap and symmetric.** Both are ZIP + XML:
+  DOCX is `word/document.xml` (`w:p` → `w:t` nodes), ODT is `content.xml`
+  (`text:p`). Roughly thirty lines each with `zipfile` + `xml.etree`, no dependency
+  — `python-docx` would pull in `lxml` for one document in this library. Worth
+  doing as a pair for other people's libraries; honestly not worth doing *first*
+  for this one.
+- **Zotero notes** (`note` items): index the note body with the parent item's
+  metadata.
+- **EPUB**: `zipfile` plus the same HTML extractor, chapters as the locator. None
+  present in this library, so lowest priority of the file formats.
+- **`linked_url` attachments — 166, opt-in only** (`ingest_linked_urls: false`).
+  Fetching arbitrary URLs is a different risk class from reading files Zotero
+  already stores, and these are the least reliable sources in the library.
+- **OCR, optional and external.** Only via an external binary (`ocrmypdf` /
+  `tesseract`) detected on `PATH`, controlled by `ocr: auto|never|always`. A Python
+  ML OCR stack would violate §9, and that constraint stands. Two images in the
+  whole library, so this is about scanned PDFs, not about the `image/*` rows above.
+
+**The one hard design consequence: `page` must become a locator.** §7.2 stores a
+1-based PDF page, and §8.2 renders it as `p. 4`. HTML, Markdown, DOCX, and notes
+have no pages, so the chunk gains a `locator_kind` (`page` | `section` |
+`paragraph` | `chunk`) beside the value, and citations render accordingly — `p. 4`,
+`§ Introduction`, `¶ 12`, `chunk 3`. Retrofitting this after several formats exist
+would be worse than doing it once, up front, so it belongs at the start of M5 and
+not at the end. Existing chunks default to `locator_kind: page`, which is what they
+are.
+
+**Acceptance:** the summary names each skipped content type with counts; enabling
+snapshot ingestion on a collection containing snapshot-only items makes them
+answerable and cites them with a section locator; an item holding both a PDF and a
+snapshot yields chunks from the PDF only under the default preference; the `Writing`
+regression (146 chunks, `p. N` citations) is unchanged.
 
 ### 11.3 Milestone 6 — Measurement before tuning (0.4.0)
 
@@ -603,6 +720,11 @@ Surfaced while building the PoC, not in the original list:
 | Store fingerprint / model-change guard | M4 | a changed `embedding_model` currently corrupts retrieval silently |
 | `--prune` for items moved out of a collection | M4 | not a deletion, so `deleted()` never reports it |
 | Name the skipped content types | M5 | `10 unsupported content type` is not actionable |
+| Plain-text / Markdown / CSV ingestion | M5 | free: read and split, no parser |
+| DOCX and ODT ingestion | M5 | ZIP + XML, ~30 lines each with the stdlib |
+| Per-item attachment preference | M5 | ~100 items hold both a PDF and a snapshot; naive ingestion duplicates them |
+| `page` generalised to a locator | M5 | HTML, Markdown, DOCX and notes have no pages |
+| Per-chunk embedding-model tag, `index --repair` | M4 | repair the stale chunks instead of rebuilding the store |
 | Evaluation harness | M6 | §12.1 defines a golden set that nothing executes |
 | `status` command | M9 | no way to inspect a folder's index |
 | Stray-positional error message | M9 | `index Networking` fails opaquely |
