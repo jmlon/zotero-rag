@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -31,11 +32,19 @@ from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
 from zotero_rag.errors import (
     CollectionMismatchError,
+    FingerprintMismatchError,
     NotAnIndexFolderError,
     NotIndexedError,
     ZoteroRagError,
 )
-from zotero_rag.indexer import IndexStats, index_plan
+from zotero_rag.fingerprint import StoreFingerprint, advisory, blocking
+from zotero_rag.indexer import (
+    IndexStats,
+    find_orphans,
+    index_plan,
+    prune_orphans,
+    repair_embeddings,
+)
 from zotero_rag.llm import build_chat
 from zotero_rag.planning import IndexPlan, PlannedAttachment, build_plan
 from zotero_rag.querying import QueryResult, answer_question
@@ -303,6 +312,34 @@ def _resolve_target(
     return scope, "the whole library", None
 
 
+def _check_fingerprint(store: VectorStore, config: Config, remedy: str) -> None:
+    """Compare what the store was built with against what the config now asks for.
+
+    A store with no fingerprint predates M4: it is *adopted* rather than rejected,
+    recording the current config as fact, because re-embedding a perfectly good
+    store just to gain a guard would be a poor trade. The warning says plainly what
+    that adoption cannot know.
+    """
+    intended = StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
+    recorded = store.read_fingerprint()
+
+    if recorded is None:
+        store.write_fingerprint(intended)
+        if store.count():
+            err_console.print(
+                f"[yellow]Note:[/yellow] this store predates fingerprinting; recording "
+                f"[bold]{escape(intended.embedding_model)}[/bold] as the model that built it. "
+                "If you changed embedding_model since indexing, run `index --repair`."
+            )
+        return
+
+    mismatches = recorded.compare(intended)
+    if fatal := blocking(mismatches):
+        raise FingerprintMismatchError([str(mismatch) for mismatch in fatal], remedy)
+    for mismatch in advisory(mismatches):
+        err_console.print(f"[yellow]Warning:[/yellow] {escape(str(mismatch))}.")
+
+
 def _run_index(
     plan: IndexPlan,
     config: Config,
@@ -332,6 +369,7 @@ def _run_index(
             embed=embeddings.embed_documents,
             chunk_size=config.index.chunk_size,
             chunk_overlap=config.index.chunk_overlap,
+            embedding_model=config.embedding_model,
             on_start=on_start,
         )
 
@@ -423,14 +461,37 @@ def index(
     assume_yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Skip the whole-library confirmation prompt.")
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Discard the store and re-embed everything from cache."),
+    ] = False,
+    refetch: Annotated[
+        bool,
+        typer.Option("--refetch", help="With --force, also delete cached PDFs and download again."),
+    ] = False,
+    repair: Annotated[
+        bool,
+        typer.Option(
+            "--repair",
+            help="Re-embed chunks written by a different model, reusing their stored text.",
+        ),
+    ] = False,
+    prune: Annotated[
+        bool,
+        typer.Option("--prune", help="Delete chunks whose attachment left the collection."),
+    ] = False,
     verbose: VerboseOption = False,
 ) -> None:
     """Index the PDF attachments of the pinned Zotero collection.
 
-    The first run pins its collection into config.yaml; later runs reuse it.
-    Must be run from an index folder.
+    The first run pins its collection into config.yaml; later runs reuse it and
+    re-embed only what changed in Zotero. Must be run from an index folder.
     """
     _enable_verbose(verbose)
+
+    if refetch and not force:
+        err_console.print("[bold red]Error:[/bold red] --refetch only applies with --force.")
+        raise typer.Exit(code=1)
 
     if collection is not None and collection_key is not None:
         err_console.print(
@@ -486,12 +547,79 @@ def index(
         store = VectorStore(index_dir / CHROMA_DIRNAME)
         embeddings = build_embeddings(config)
         cache_dir = index_dir / CACHE_DIRNAME
+
+        if force:
+            removed = store.count()
+            store.reset()
+            store.write_fingerprint(StoreFingerprint.intended(config))
+            console.print(f"[yellow]--force:[/yellow] discarded {_plural(removed, 'chunk')}.")
+            if refetch:
+                shutil.rmtree(cache_dir, ignore_errors=True)
+                console.print("[yellow]--refetch:[/yellow] cleared the PDF cache.")
+        else:
+            # --repair is the remedy for a model change, so it must not be blocked
+            # by the very mismatch it exists to fix.
+            if not repair:
+                _check_fingerprint(store, config, remedy=_REINDEX_REMEDY)
+            if repair:
+                _run_repair(store, config, embeddings)
+
         stats = _run_index(plan, config, store, zot, embeddings, cache_dir)
+        store.write_fingerprint(
+            StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
+        )
+        orphans = prune_orphans(store, plan) if prune else (len(find_orphans(store, plan)), 0)
     except ZoteroRagError as exc:
         _fail(exc)
         return
 
     _print_index_summary(plan, stats, store, verbose=_is_verbose())
+    _print_orphans(orphans, pruned=prune)
+
+
+_REINDEX_REMEDY = (
+    "Run `zotero-rag index --repair` to re-embed the affected chunks with the "
+    "configured model (no downloads), or `index --force` to rebuild from scratch. "
+    "Reverting the config change also resolves it."
+)
+
+
+def _run_repair(store: VectorStore, config: Config, embeddings: Any) -> None:
+    """Re-embed chunks written by a superseded model, from their stored text."""
+    with err_console.status("[dim]Re-embedding chunks from a previous model...[/dim]"):
+        stats = repair_embeddings(store, embeddings.embed_documents, config.embedding_model)
+
+    if not stats.stale:
+        console.print("[green]--repair:[/green] every chunk already matches the configured model.")
+        return
+    rebuilt = (
+        " (store rebuilt: the new model has a different vector width)" if stats.rebuilt else ""
+    )
+    console.print(
+        f"[green]--repair:[/green] re-embedded {_plural(stats.repaired, 'chunk')} with "
+        f"[bold]{escape(config.embedding_model)}[/bold]{rebuilt}."
+    )
+    if _is_verbose():
+        console.print(f"[dim]{stats.embedding_tokens} embedding tokens.[/dim]")
+
+
+def _print_orphans(orphans: tuple[int, int], pruned: bool) -> None:
+    """Report attachments that left the collection, and whether they were removed."""
+    attachments, chunks = orphans
+    if not attachments:
+        return
+    if pruned:
+        console.print(
+            f"[yellow]--prune:[/yellow] removed {_plural(chunks, 'chunk')} from "
+            f"{_plural(attachments, 'attachment')} no longer in this collection."
+        )
+    else:
+        console.print(
+            f"\n[yellow]{_plural(attachments, 'attachment')}[/yellow] in the store "
+            f"{'is' if attachments == 1 else 'are'} no longer in this collection "
+            f"(deleted, moved out, or no longer a PDF). Run [bold]index --prune[/bold] "
+            f"to remove {'it' if attachments == 1 else 'them'}."
+        )
 
 
 def _open_index() -> tuple[Config, VectorStore]:
@@ -513,6 +641,9 @@ def _open_index() -> tuple[Config, VectorStore]:
         raise NotIndexedError(
             "The vector store holds no chunks. Run `zotero-rag index` to populate it."
         )
+    # A question embedded by a different model than the store was built with cannot
+    # retrieve meaningfully, so refuse rather than answer from nonsense neighbours.
+    _check_fingerprint(store, config, remedy=_REINDEX_REMEDY)
     return config, store
 
 

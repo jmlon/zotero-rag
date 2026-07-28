@@ -16,6 +16,7 @@ from chromadb.config import Settings
 from pydantic import BaseModel, Field
 
 from zotero_rag.errors import ZoteroRagError
+from zotero_rag.fingerprint import StoreFingerprint
 
 logger = logging.getLogger(__name__)
 
@@ -91,18 +92,7 @@ class VectorStore:
     def get_by_attachment(self, attachment_key: str) -> list[StoredChunk]:
         """Every stored chunk belonging to one attachment, ordered by id."""
         found = self._collection.get(where={"attachment_key": attachment_key})
-        ids = found["ids"]
-        documents = found["documents"] or []
-        metadatas = found["metadatas"] or []
-        chunks = [
-            StoredChunk(
-                id=identifier,
-                text=documents[position] if position < len(documents) else "",
-                metadata=dict(metadatas[position]) if position < len(metadatas) else {},
-            )
-            for position, identifier in enumerate(ids)
-        ]
-        return sorted(chunks, key=lambda chunk: chunk.id)
+        return sorted(self._to_chunks(found), key=lambda chunk: chunk.id)
 
     def query(self, embedding: list[float], top_k: int) -> list[StoredChunk]:
         """The `top_k` nearest chunks to an embedded question."""
@@ -132,3 +122,142 @@ class VectorStore:
 
     def count(self) -> int:
         return int(self._collection.count())
+
+    # --- fingerprint (PRD §11.1.1) ---------------------------------------
+
+    def read_fingerprint(self) -> StoreFingerprint | None:
+        """What this store records about how it was built, if anything.
+
+        `None` means a store written before M4; the caller adopts it rather than
+        invalidating data that is probably fine.
+        """
+        return StoreFingerprint.from_metadata(self._collection.metadata)
+
+    def write_fingerprint(self, fingerprint: StoreFingerprint) -> None:
+        """Record how this store was built, preserving Chroma's own metadata."""
+        existing = dict(self._collection.metadata or {})
+        existing.update(fingerprint.to_metadata())
+        try:
+            self._collection.modify(metadata=existing)
+        except Exception as exc:  # noqa: BLE001 - chromadb raises assorted types
+            raise VectorStoreError(f"Cannot record the store fingerprint: {exc}") from exc
+
+    def derived_dimension(self) -> int | None:
+        """The true vector width, read from the data rather than from a record.
+
+        This is the one fact that cannot drift from what is stored or be changed by
+        editing a file, so it cross-checks the recorded fingerprint.
+        """
+        found = self._collection.get(limit=1, include=cast(Any, ["embeddings"]))
+        embeddings = found.get("embeddings")
+        if embeddings is None or len(embeddings) == 0:
+            return None
+        return len(embeddings[0])
+
+    # --- repair and pruning ----------------------------------------------
+
+    def stale_ids(self, embedding_model: str) -> list[str]:
+        """Ids of chunks not embedded by `embedding_model`.
+
+        Verified against chromadb 1.5.9: `$ne` also matches chunks that carry no
+        `embedding_model` at all, so chunks written before M4 count as stale — which
+        is what we want, since their true model is unknown.
+        """
+        where = cast(Any, {"embedding_model": {"$ne": embedding_model}})
+        found = self._collection.get(where=where)
+        return list(found["ids"])
+
+    def get_by_ids(self, ids: list[str]) -> list[StoredChunk]:
+        """Chunks with the given ids, text and metadata included."""
+        if not ids:
+            return []
+        found = self._collection.get(ids=ids)
+        return self._to_chunks(found)
+
+    def all_chunks(self) -> list[StoredChunk]:
+        """Every stored chunk. Used to rebuild a store from its own text."""
+        return self._to_chunks(self._collection.get())
+
+    @staticmethod
+    def _to_chunks(found: Any) -> list[StoredChunk]:
+        ids = found["ids"]
+        documents = found.get("documents") or []
+        metadatas = found.get("metadatas") or []
+        return [
+            StoredChunk(
+                id=identifier,
+                text=documents[position] if position < len(documents) else "",
+                metadata=dict(metadatas[position]) if position < len(metadatas) else {},
+            )
+            for position, identifier in enumerate(ids)
+        ]
+
+    def upsert(
+        self,
+        ids: list[str],
+        embeddings: list[list[float]],
+        documents: list[str],
+        metadatas: list[dict[str, Any]],
+    ) -> None:
+        """Replace chunks in place, keyed by id."""
+        if not ids:
+            return
+        try:
+            self._collection.upsert(
+                ids=ids,
+                embeddings=cast(Any, embeddings),
+                documents=documents,
+                metadatas=cast(Any, metadatas),
+            )
+        except Exception as exc:  # noqa: BLE001 - chromadb raises assorted types
+            raise VectorStoreError(f"Cannot update the vector store: {exc}") from exc
+
+    def delete_by_attachment(self, attachment_key: str) -> int:
+        """Drop every chunk of one attachment. Returns how many were removed."""
+        ids = self._collection.get(where={"attachment_key": attachment_key})["ids"]
+        if ids:
+            self._collection.delete(ids=list(ids))
+        return len(ids)
+
+    def delete_ids(self, ids: list[str]) -> None:
+        if ids:
+            self._collection.delete(ids=ids)
+
+    def attachment_keys(self) -> set[str]:
+        """Every attachment key present in the store."""
+        metadatas = self._collection.get(include=cast(Any, ["metadatas"]))["metadatas"] or []
+        return {
+            str(metadata["attachment_key"])
+            for metadata in metadatas
+            if metadata and metadata.get("attachment_key")
+        }
+
+    def attachment_version(self, attachment_key: str) -> int | None:
+        """The Zotero version of the attachment as stored, or `None` if unknown.
+
+        `None` covers both "never indexed" and "indexed before versions were
+        recorded"; the caller distinguishes them with `has_attachment()`.
+        """
+        found = self._collection.get(where={"attachment_key": attachment_key}, limit=1)
+        metadatas = found.get("metadatas") or []
+        if not metadatas or not metadatas[0]:
+            return None
+        raw = metadatas[0].get("attachment_version")
+        try:
+            return int(str(raw))
+        except (TypeError, ValueError):
+            return None
+
+    def reset(self) -> None:
+        """Drop the collection and recreate it empty.
+
+        A collection's vector width is fixed once written, so switching to a model
+        of a different dimension requires this rather than an in-place update.
+        """
+        try:
+            self._client.delete_collection(name=COLLECTION_NAME)
+        except Exception as exc:  # noqa: BLE001 - absent collection raises too
+            logger.debug("nothing to delete: %s", exc)
+        self._collection = self._client.get_or_create_collection(
+            name=COLLECTION_NAME, embedding_function=None
+        )

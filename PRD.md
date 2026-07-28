@@ -4,7 +4,7 @@
 all built and verified against the live library; every acceptance criterion in
 §12 passes. See **§14 Implementation status** for what was built and
 **§11 Roadmap** for the sequenced milestones that follow.
-**Version:** 0.1.0
+**Version:** 0.2.0
 
 ## 1. Goal
 
@@ -24,8 +24,9 @@ future milestones (§11):
 - Rerankers, hybrid / BM25 retrieval, windowed retrieval, agentic or multi-step RAG.
 - OCR of scanned PDFs.
 - Ingestion of HTML snapshots, EPUBs, linked URLs, and Zotero notes.
-- `--force` / clean-slate reindex.
+- `--force` / clean-slate reindex. *(Delivered in M4, §11.1.)*
 - Detecting items updated or removed in Zotero after indexing.
+  *(Delivered in M4, §11.1.)*
 - Custom system prompt from file.
 - Cost estimation and pricing tables.
 - Batched / concurrent embedding calls.
@@ -86,7 +87,8 @@ zotero-rag init [PATH]
 ### 3.3 `index`
 
 ```
-zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes] [-v]
+zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
+                 [--force [--refetch]] [--repair] [--prune] [-v]
 ```
 
 - **First run** pins the target collection into `config.yaml`
@@ -106,6 +108,13 @@ zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes] 
 - Collection path matching is case-insensitive, and leading/trailing slashes are
   ignored, so `/DataManagement/Data Trust` and `datamanagement/data trust` both
   resolve.
+- **Re-indexing (M4, §11.1).** A normal run re-embeds an attachment whose Zotero
+  `version` is newer than the stored one, dropping its old chunks first.
+  `--force` discards the store and re-embeds from `cache/`; adding `--refetch`
+  also clears the cache so files are downloaded again. `--repair` re-embeds only
+  the chunks a superseded model wrote, reusing their stored text — no downloads and
+  no re-chunking. `--prune` deletes chunks whose attachment has left the
+  collection; without it those are reported but kept.
 
 ### 3.4 `query`
 
@@ -267,18 +276,27 @@ Stored per chunk, used for both citation and future filtering:
 | `collection_name` | the (sub)collection the item was found in |
 | `page` | 1-based PDF page number |
 | `chunk_index` | index of the chunk within that page |
+| `embedding_model` | the model that produced this vector (M4) |
+| `attachment_version` | the attachment's Zotero version when embedded (M4) |
 
 Chroma document id: `<attachment_key>:<page>:<chunk_index>`.
 
 ### 7.3 Incremental indexing
 
+*Superseded by M4 (§11.1); this is what a run now does.*
+
 - Before processing an attachment, query Chroma for existing chunks with that
-  `attachment_key`. If any exist, the attachment is **skipped**.
-- The attachment key alone is the criterion — Zotero item `version` is not
-  tracked in the PoC. Consequence, accepted for now: a PDF replaced or edited in
-  Zotero after indexing is **not** re-indexed. Re-indexing changed items requires
-  the future `--force`.
-- Removal of items from Zotero is not propagated (future milestone).
+  `attachment_key`. If none exist, it is indexed.
+- If chunks exist, the attachment's Zotero `version` is compared with the
+  `attachment_version` recorded on those chunks. A newer version means the file or
+  its metadata changed, so the old chunks are **deleted** and the attachment is
+  re-embedded; otherwise it is **skipped**. Deleting first matters: a shorter
+  replacement would otherwise leave the tail pages of the old file behind.
+- A stored version of `0` (chunks written before versions were recorded) counts as
+  unchanged, so upgrading does not silently re-embed every existing store.
+- Chunks whose attachment is no longer in the pinned collection are reported, and
+  removed by `--prune`. One set difference covers three cases: deleted in Zotero,
+  moved out of the collection, and no longer a supported content type.
 
 ## 8. Query pipeline
 
@@ -399,7 +417,7 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 
 | # | Milestone | Theme | Version | Size |
 |---|---|---|---|---|
-| 4 | Store integrity and true reindexing | correctness | 0.2.0 | M |
+| 4 | Store integrity and true reindexing | correctness | 0.2.0 | ✅ **done** |
 | 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | M–L |
 | 6 | Measurement before tuning | evaluation | 0.4.0 | S–M |
 | 7 | Retrieval quality | tuning | 0.5.0 | M |
@@ -413,28 +431,45 @@ fingerprint (§11.1), naming *what* was skipped (§11.2), windowed retrieval and
 metadata filters (§11.4), and `status` (§11.6). Each is small and independently
 useful.
 
-### 11.1 Milestone 4 — Store integrity and true reindexing (0.2.0)
+### 11.1 Milestone 4 — Store integrity and true reindexing (0.2.0) — ✅ done
+
+**Status: implemented and verified live** (§14.6). Before it, the attachment key
+was the only incremental criterion (§7.3): a replaced PDF was never re-read, a
+deleted item never removed, and a changed embedding model never noticed.
 
 **Goal:** make the index trustworthy when either the library or the settings
-change. Today the attachment key is the only incremental criterion (§7.3), so a
-replaced PDF is never re-read, a deleted item is never removed, and a changed
-embedding model is not noticed.
+change.
 
 - **Store fingerprint** — see §11.1.1 for where it lives and why. **The single
   highest-value item in the roadmap per hour of work:** it converts a silent
   wrong-answer mode into a clear error.
 - **`index --force`.** Drop the collection and re-embed from `cache/`, with no
   re-download. `--force --refetch` also clears the cache.
-- **Version-aware incremental indexing.** Record the library version from
-  `zot.last_modified_version()` in `config.yaml`; later runs ask for
-  `zot.items(since=version)` and re-embed only what changed, deleting that
-  attachment's chunks first. Compare *attachment* versions, not just parent item
-  versions — the PDF is what gets replaced.
-- **Deletion sync.** `zot.deleted(since=version)` reports removed items and
-  collections; drop their chunks.
-- **`index --prune`.** Remove chunks whose attachment is no longer in the pinned
-  collection. Needed because an item *moved out* of a collection is not a
-  deletion and so never appears in `deleted()`.
+- **`index --repair`.** Re-embed only the chunks a superseded model wrote, using
+  the text already in the store — no download and no re-chunking, so chunk
+  boundaries are preserved exactly. This is the remedy for an edited
+  `embedding_model`; a changed `chunk_size` needs `--force` instead, because the
+  boundaries themselves are what changed. When the new model has a different vector
+  width the collection cannot be updated in place (Chroma fixes a collection's
+  dimension at first write), so the store is rebuilt from its own text.
+- **Version-aware incremental indexing.** Each attachment's Zotero `version` is
+  stored on its chunks and compared on the next run; a newer version re-embeds that
+  attachment after deleting its old chunks.
+
+  *Implemented differently from the plan, deliberately.* The plan was to record
+  `zot.last_modified_version()` in `config.yaml` and query `zot.items(since=…)`.
+  That bookkeeping turned out to be unnecessary: a run must fetch the whole
+  collection anyway to know its membership, so comparing per-attachment versions
+  from that fetch is both exact and stateless. `since` would only reduce API
+  traffic, which is negligible next to embedding cost — and a version recorded in
+  `config.yaml` would have been another user-editable file claiming to describe
+  the store, which is the mistake §11.1.1 exists to avoid.
+- **Deletion sync and `--prune`, unified.** One set difference — stored attachment
+  keys minus planned ones — covers deletion, an item moved out of the collection,
+  and an attachment that stopped being a supported type. `zot.deleted()` reports
+  only the first of those, so it was not needed. Orphans are *reported* by every
+  run and deleted only by `--prune`: silently discarding data during an ordinary
+  index run would be a poor default.
 
 **Acceptance:** changing `embedding_model` and running `query` is refused with a
 message naming that setting; replacing one `Writing` PDF in Zotero re-embeds
@@ -832,11 +867,11 @@ Last updated: 2026-07-27. **182 tests passing; `ruff` and `mypy` clean.**
 | 2a | Collection resolution + `index --dry-run` | ✅ verified live |
 | 2b | Download, extract, chunk, embed, store, pin | ✅ verified live |
 | 3 | `query`: retrieve, prompt, answer, cite | ✅ verified live |
+| 4 | Store fingerprint, version-aware reindexing, repair, prune | ✅ verified live |
 
-**All eight acceptance criteria (§12) are verified against the real library.**
-Everything still open is a §11 roadmap milestone, not PoC scope. Next up is
-**M4, store integrity and true reindexing (§11.1)** — the only open item that can
-make the tool answer *wrongly* rather than merely partially.
+**All eight acceptance criteria (§12) are verified against the real library**, as
+is M4 (§14.6). Next up is **M5, coverage (§11.2)** — 105 items in the library hold
+nothing but an HTML snapshot and so remain invisible to `query`.
 
 ### 14.2 `query` as built (§3.4, §8)
 
@@ -874,7 +909,8 @@ src/zotero_rag/
   chunking.py      RecursiveCharacterTextSplitter per page
   embedding.py     OpenRouter embeddings + tiktoken counting
   vectorstore.py   chromadb wrapper, StoredChunk
-  indexer.py       orchestration, IndexStats, failure isolation
+  indexer.py       orchestration, IndexStats, failure isolation, repair, prune
+  fingerprint.py   StoreFingerprint, intent-vs-fact comparison, severities
   llm.py           OpenRouter ChatOpenAI + usage extraction
   querying.py      retrieval, citation numbering, prompt, QueryResult
   data/config.yaml packaged defaults (copied by init)
@@ -951,3 +987,25 @@ categories, and a store an order of magnitude larger than `Writing`.
   Editing `embedding_model` in a populated index folder is therefore unsafe today;
   delete `chroma/` and re-index instead. Fixed by the fingerprint in §11.1, which
   is why M4 leads the roadmap.
+
+### 14.6 M4 as built and verified
+
+Verified against the real `Writing` store (146 chunks) and the pre-M4 `Networking`
+store (1,150 chunks), from a global `uv tool install`:
+
+| Check | Result |
+|---|---|
+| Adoption of a pre-M4 store | fingerprint written, dimension 1536 derived from the data, one warning printed, nothing re-embedded |
+| Same-dimension model swap (`3-small` → `ada-002`) | `query` **refused**, naming both models and offering `--repair` / `--force`; the previously silent corruption is now impossible |
+| `index --repair` | re-embedded all 146 chunks (30,863 tokens, no downloads), store then reported one model and zero stale chunks, `query` worked |
+| `index --force` | discarded 146 chunks, re-embedded to exactly 146 chunks from 22 pages, cache untouched (4 files, zero downloads) |
+| `index --force --refetch` | cache cleared, all 4 PDFs downloaded again, store rebuilt |
+| Orphan reporting | a ghost attachment was reported by a normal run and *kept* |
+| `index --prune` | removed exactly that attachment's chunk, leaving 146 |
+| Regression | 236 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+`write_fingerprint` was explicitly proved harmless to retrieval: with a fixed query
+vector against two copies of the same store, the top-5 ids and distances are
+bit-identical before and after the fingerprint is written. Worth stating because
+`collection.modify()` touching a collection's metadata is exactly the kind of call
+that could quietly rebuild an index.

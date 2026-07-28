@@ -36,6 +36,22 @@ class NotIndexedError(ZoteroRagError):
     """The index folder has no vector store yet, so there is nothing to query."""
 
 
+class FingerprintMismatchError(ZoteroRagError):
+    """The store was built with settings that make the current config invalid.
+
+    Raised rather than warned because the alternative is answering from a mixture
+    of incompatible embedding spaces, which looks like a working answer.
+    """
+
+    def __init__(self, differences: list[str], remedy: str) -> None:
+        self.differences = differences
+        joined = "; ".join(differences)
+        super().__init__(
+            f"This index was built with different settings — {joined}. "
+            f"Mixing embedding models in one store makes retrieval meaningless. {remedy}"
+        )
+
+
 class ZoteroApiError(ZoteroRagError):
     """The Zotero Web API call failed."""
 

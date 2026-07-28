@@ -16,6 +16,8 @@ from rich.console import Console
 from typer.testing import CliRunner
 
 from zotero_rag import __version__, cli
+from zotero_rag.config import Config
+from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.indexer import IndexStats
 from zotero_rag.planning import IndexPlan
 from zotero_rag.querying import QueryResult, Source, Usage
@@ -142,6 +144,76 @@ def test_query_in_a_never_indexed_folder_points_at_index(
     assert "no vector store yet" in result.output
     # It stops before needing any credential.
     assert "OPENROUTER" not in result.output
+
+
+def _populated_store(directory: Path, model: str, fingerprint: bool = True) -> VectorStore:
+    """A store holding one chunk, optionally fingerprinted with `model`."""
+    store = VectorStore(directory / "chroma")
+    store.add(
+        ids=["A:1:0"],
+        embeddings=[[1.0, 0.0, 0.5]],
+        documents=["some text"],
+        metadatas=[{"attachment_key": "A", "page": 1, "embedding_model": model}],
+    )
+    if fingerprint:
+        config = Config()
+        config.index.embedding_model = model
+        store.write_fingerprint(StoreFingerprint.intended(config, embedding_dim=3))
+    return store
+
+
+def test_query_refuses_when_the_configured_model_is_not_the_stored_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The M4 guard, end to end: the whole point of §11.1."""
+    _populated_store(tmp_path, "old/model")
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  embedding_model: new/model\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli.app, ["query", "anything"])
+
+    assert result.exit_code == 1
+    assert "embedding_model" in result.output
+    assert "old/model" in result.output and "new/model" in result.output
+    assert "--repair" in result.output
+    # It refuses before needing any credential, so no key is demanded first.
+    assert "OPENROUTER_API_KEY" not in result.output
+
+
+def test_check_fingerprint_adopts_a_store_that_predates_it(tmp_path: Path) -> None:
+    """Re-embedding a good store just to gain a guard would be a poor trade."""
+    store = _populated_store(tmp_path, "some/model", fingerprint=False)
+    assert store.read_fingerprint() is None
+
+    cli._check_fingerprint(store, Config(), remedy="...")
+
+    recorded = store.read_fingerprint()
+    assert recorded is not None
+    assert recorded.embedding_model == Config().embedding_model
+    assert recorded.embedding_dim == 3  # derived from the data, not assumed
+
+
+def test_check_fingerprint_only_warns_about_changed_chunking(tmp_path: Path) -> None:
+    store = _populated_store(tmp_path, Config().embedding_model)
+    config = Config()
+    config.index.chunk_size = 400
+    # Must not raise: every stored vector is still valid, merely shaped differently.
+    cli._check_fingerprint(store, config, remedy="...")
+
+
+def test_refetch_requires_force() -> None:
+    """Clearing the cache without rebuilding would only cost downloads."""
+    result = runner.invoke(cli.app, ["index", "--refetch"])
+    assert result.exit_code == 1
+    assert "only applies with --force" in result.output
+
+
+def test_index_help_documents_the_new_reindex_flags() -> None:
+    result = runner.invoke(cli.app, ["index", "--help"])
+    for flag in ("--force", "--refetch", "--repair", "--prune"):
+        assert flag in result.output
 
 
 def _sample_result(answer: str = "Escribir todos los días [1].", cited: bool = True) -> QueryResult:

@@ -45,11 +45,21 @@ class PlannedAttachment(BaseModel):
     doi: str = ""
     collection_name: str
     zotero_url: str = ""
+    # Zotero's own version counter for the attachment, bumped whenever the file or
+    # its metadata changes. Compared against the stored copy to decide whether an
+    # already-indexed attachment needs re-embedding (PRD §11.1).
+    version: int = 0
 
-    def chunk_metadata(self, page: int, chunk_index: int) -> dict[str, str | int]:
+    def chunk_metadata(
+        self, page: int, chunk_index: int, embedding_model: str = ""
+    ) -> dict[str, str | int]:
         """Per-chunk metadata for the vector store (PRD §7.2).
 
         Chroma rejects `None`, so every value is a string or an int.
+
+        `embedding_model` and `attachment_version` are what make repair and
+        version-aware reindexing possible: the first identifies vectors written by
+        a superseded model, the second identifies content that changed in Zotero.
         """
         return {
             "item_key": self.item_key,
@@ -62,6 +72,8 @@ class PlannedAttachment(BaseModel):
             "collection_name": self.collection_name,
             "page": page,
             "chunk_index": chunk_index,
+            "embedding_model": embedding_model,
+            "attachment_version": self.version,
         }
 
 
@@ -220,6 +232,7 @@ def build_plan(
                 doi=parent_data.get("DOI") or "",
                 collection_name=parent_collection,
                 zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
+                version=_version(data),
             )
         )
         planned_parents.add(parent_key)
@@ -240,6 +253,18 @@ def build_plan(
         )
 
     return plan
+
+
+def _version(data: dict[str, Any]) -> int:
+    """The attachment's Zotero version, or 0 when the payload omits it.
+
+    0 means "unknown", which makes the comparison in `indexer` treat the
+    attachment as unchanged rather than re-embedding it on every run.
+    """
+    try:
+        return int(str(data.get("version")))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _note_title(data: dict[str, Any]) -> str:

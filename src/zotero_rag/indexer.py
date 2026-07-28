@@ -29,6 +29,9 @@ Downloader = Callable[[str], Path]
 Embedder = Callable[[list[str]], list[list[float]]]
 ProgressHook = Callable[[PlannedAttachment], None]
 
+# Short text used only to learn a model's vector width before repairing.
+DIMENSION_PROBE = "dimension probe"
+
 
 class AttachmentFailure(BaseModel):
     attachment_key: str
@@ -41,6 +44,7 @@ class IndexStats(BaseModel):
 
     planned: int = 0
     indexed: int = 0
+    reindexed: int = 0
     already_indexed: int = 0
     no_text: int = 0
     failed: int = 0
@@ -49,6 +53,15 @@ class IndexStats(BaseModel):
     embedding_tokens: int = 0
     elapsed_s: float = 0.0
     failures: list[AttachmentFailure] = Field(default_factory=list)
+
+
+class RepairStats(BaseModel):
+    """Outcome of re-embedding chunks written by a superseded model."""
+
+    stale: int = 0
+    repaired: int = 0
+    rebuilt: bool = False
+    embedding_tokens: int = 0
 
 
 @contextmanager
@@ -65,6 +78,21 @@ def chunk_id(attachment_key: str, page: int, chunk_index: int) -> str:
     return f"{attachment_key}:{page}:{chunk_index}"
 
 
+def needs_reindex(store: VectorStore, attachment: PlannedAttachment) -> bool:
+    """True when an already-stored attachment has changed in Zotero since indexing.
+
+    Zotero bumps an attachment's `version` when its file or metadata changes, so a
+    stored version lower than the current one means the PDF we embedded is stale.
+    A stored version of `None` — chunks written before versions were recorded — is
+    treated as current, because re-embedding every old store on upgrade would be a
+    worse default than leaving it alone (PRD §11.1).
+    """
+    stored = store.attachment_version(attachment.attachment_key)
+    if stored is None or not attachment.version:
+        return False
+    return attachment.version > stored
+
+
 def index_plan(
     plan: IndexPlan,
     store: VectorStore,
@@ -72,9 +100,10 @@ def index_plan(
     embed: Embedder,
     chunk_size: int,
     chunk_overlap: int,
+    embedding_model: str = "",
     on_start: ProgressHook | None = None,
 ) -> IndexStats:
-    """Index every planned attachment, skipping those already stored.
+    """Index every planned attachment, skipping those already stored and unchanged.
 
     Per PRD §10, one attachment's failure never aborts the run: it is logged as a
     warning, recorded in `stats.failures`, and the pass continues.
@@ -86,15 +115,36 @@ def index_plan(
             if on_start is not None:
                 on_start(attachment)
 
+            replacing = False
             if store.has_attachment(attachment.attachment_key):
-                logger.info("%s already indexed; skipping", attachment.attachment_key)
-                stats.already_indexed += 1
-                continue
+                if not needs_reindex(store, attachment):
+                    logger.info("%s already indexed; skipping", attachment.attachment_key)
+                    stats.already_indexed += 1
+                    continue
+                # Changed in Zotero: drop the old chunks first, so a shorter
+                # replacement file cannot leave orphaned tail pages behind.
+                removed = store.delete_by_attachment(attachment.attachment_key)
+                logger.info(
+                    "%s changed in Zotero; re-indexing (dropped %d stale chunk(s))",
+                    attachment.attachment_key,
+                    removed,
+                )
+                replacing = True
 
             try:
                 _index_attachment(
-                    attachment, store, download, embed, chunk_size, chunk_overlap, stats
+                    attachment,
+                    store,
+                    download,
+                    embed,
+                    chunk_size,
+                    chunk_overlap,
+                    embedding_model,
+                    stats,
                 )
+                if replacing:
+                    stats.indexed -= 1
+                    stats.reindexed += 1
             except ZoteroRagError as exc:
                 logger.warning("Skipping %r: %s", attachment.title, exc)
                 stats.failed += 1
@@ -126,6 +176,7 @@ def _index_attachment(
     embed: Embedder,
     chunk_size: int,
     chunk_overlap: int,
+    embedding_model: str,
     stats: IndexStats,
 ) -> None:
     pdf_path = download(attachment.attachment_key)
@@ -151,10 +202,91 @@ def _index_attachment(
         ids=[chunk_id(attachment.attachment_key, c.page, c.index) for c in chunks],
         embeddings=embeddings,
         documents=texts,
-        metadatas=[attachment.chunk_metadata(c.page, c.index) for c in chunks],
+        metadatas=[attachment.chunk_metadata(c.page, c.index, embedding_model) for c in chunks],
     )
 
     stats.indexed += 1
     stats.pages += len(pages)
     stats.chunks += len(chunks)
     stats.embedding_tokens += count_tokens(texts)
+
+
+def find_orphans(store: VectorStore, plan: IndexPlan) -> set[str]:
+    """Attachment keys in the store that the collection no longer contains.
+
+    One mechanism covers three cases the PRD listed separately: an item deleted in
+    Zotero, an item moved out of the pinned collection, and an attachment whose
+    content type stopped qualifying. Because a run always fetches the whole
+    collection, the set difference is exact and needs no `since` bookkeeping.
+    """
+    planned = {attachment.attachment_key for attachment in plan.attachments}
+    return store.attachment_keys() - planned
+
+
+def prune_orphans(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
+    """Delete chunks of attachments no longer in the collection.
+
+    Returns (attachments removed, chunks removed).
+    """
+    orphans = find_orphans(store, plan)
+    chunks = sum(store.delete_by_attachment(key) for key in orphans)
+    if orphans:
+        logger.info("pruned %d attachment(s), %d chunk(s)", len(orphans), chunks)
+    return len(orphans), chunks
+
+
+def repair_embeddings(
+    store: VectorStore,
+    embed: Embedder,
+    embedding_model: str,
+) -> RepairStats:
+    """Re-embed chunks that a superseded model wrote, using their stored text.
+
+    No download and no PDF parsing: the chunk text is already in the store, so the
+    fix costs embedding calls only. Chunk boundaries are preserved exactly, which
+    is why this is the remedy for a changed `embedding_model` but *not* for a
+    changed `chunk_size` — that needs `--force`.
+
+    A collection's vector width is fixed once written, so a model of a different
+    dimension cannot be upserted in place: the whole store is rebuilt from its own
+    text instead.
+    """
+    stale_ids = store.stale_ids(embedding_model)
+    stats = RepairStats(stale=len(stale_ids))
+    if not stale_ids:
+        return stats
+
+    # One cheap call establishes the new model's width before committing to a
+    # strategy; embedding a real chunk here would double-count its tokens.
+    dimension = store.derived_dimension()
+    new_dimension = len(embed([DIMENSION_PROBE])[0])
+
+    if dimension is not None and dimension != new_dimension:
+        logger.info(
+            "embedding dimension changed (%d -> %d); rebuilding the store from stored text",
+            dimension,
+            new_dimension,
+        )
+        chunks = store.all_chunks()
+        store.reset()
+        stats.rebuilt = True
+    else:
+        chunks = store.get_by_ids(stale_ids)
+
+    texts = [chunk.text for chunk in chunks]
+    embeddings = embed(texts)
+    if len(embeddings) != len(chunks):
+        raise ZoteroRagError(
+            f"Embedding returned {len(embeddings)} vectors for {len(chunks)} chunks"
+        )
+
+    metadatas = [{**chunk.metadata, "embedding_model": embedding_model} for chunk in chunks]
+    store.upsert(
+        ids=[chunk.id for chunk in chunks],
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=metadatas,
+    )
+    stats.repaired = len(chunks)
+    stats.embedding_tokens = count_tokens(texts)
+    return stats

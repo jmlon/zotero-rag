@@ -129,11 +129,27 @@ and reuse it. Subcollections are included recursively.
 
 ```bash
 zotero-rag index --dry-run     # list what would be indexed, change nothing
-zotero-rag -v index            # add timings and token counts
+zotero-rag index -v            # add timings and token counts
 ```
 
-Re-running `index` is cheap and safe: attachments already in the store are skipped,
-and downloaded PDFs stay in `cache/`, so only new items cost anything.
+Re-running `index` is cheap and safe: attachments already indexed and unchanged are
+skipped, and downloaded PDFs stay in `cache/`, so only new work costs anything.
+
+### Keeping an index in step with Zotero
+
+```bash
+zotero-rag index            # picks up items added or replaced in Zotero
+zotero-rag index --prune    # also forget items deleted or moved out
+```
+
+A plain re-run notices when a PDF was **replaced** in Zotero — the attachment's
+version is stored with its chunks — and re-embeds just that attachment, dropping
+its old chunks first so nothing stale survives.
+
+Items **deleted** in Zotero, or moved out of this collection, are reported but kept
+until you ask: every run tells you how many chunks belong to attachments the
+collection no longer has, and `--prune` removes them. Deleting data during an
+ordinary index run would be a poor surprise.
 
 ### 4. Ask questions
 
@@ -162,15 +178,20 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `embedding_model` | `openai/text-embedding-3-small` | any OpenRouter embedding slug |
 
 Changing `chunk_size` or `chunk_overlap` only affects newly indexed attachments —
-existing chunks are left as they are. To rebuild, delete the `chroma/` directory
-and index again; the PDFs stay in `cache/`, so a rebuild costs embedding calls but
-no downloads.
+existing chunks keep the shape they were given. `index --force` rebuilds them all.
 
-> **Do not change `embedding_model` on a populated index.** Nothing yet records
-> which model wrote the store, so old and new vectors get mixed and retrieval
-> quietly returns nonsense — with no error, when both models share a vector
-> dimension. Delete `chroma/` and index again instead. A guard against this is the
-> first item on the roadmap (`PRD.md` §11.1).
+**Changing `embedding_model` is safe to attempt:** the store records which model
+built it, so the next `index` or `query` stops and tells you, rather than mixing
+two incompatible vector spaces and quietly returning nonsense.
+
+```bash
+zotero-rag index --repair    # re-embed with the new model, reusing stored text
+zotero-rag index --force     # rebuild from scratch (also needed after chunk_size)
+```
+
+`--repair` is the cheap path: it needs no downloads and no re-parsing, and it keeps
+chunk boundaries exactly as they were. Use `--force` when the boundaries themselves
+changed.
 
 Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defaults**.
 
@@ -194,10 +215,10 @@ This is a proof of concept, and deliberately narrow:
   skipped and counted in the run summary.
 - **No OCR.** A scanned PDF with no extractable text is skipped with a warning.
 - **Your own library only** — group libraries are not supported yet.
-- **Changes in Zotero are not tracked.** A PDF replaced or an item deleted after
-  indexing is not picked up; delete `chroma/` and re-index.
 - Retrieval is plain vector similarity — no reranking, no hybrid search, no
   metadata filters at query time.
+- **Everything is remote per call:** no batching or concurrency yet, so a large
+  collection indexes at a steady but unhurried pace.
 
 See `PRD.md` for the full specification, the verified acceptance criteria, and the
 list of planned milestones.
