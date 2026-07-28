@@ -54,6 +54,16 @@ from zotero_rag.evaluation import (
     run_settings,
 )
 from zotero_rag.fingerprint import StoreFingerprint, advisory, blocking
+from zotero_rag.generation import (
+    MATCH_DOCUMENT,
+    DocumentText,
+    GenerationStats,
+    build_generator,
+    collect_documents,
+    file_header,
+    generate_questions,
+    write_questions,
+)
 from zotero_rag.indexer import (
     IndexStats,
     find_orphans,
@@ -64,6 +74,7 @@ from zotero_rag.indexer import (
 from zotero_rag.llm import build_chat
 from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason, build_plan
 from zotero_rag.querying import QueryResult, answer_question
+from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.scaffold import init_index_folder
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
@@ -692,6 +703,27 @@ def _print_orphans(orphans: tuple[int, int], pruned: bool) -> None:
         )
 
 
+RetrievalOption = Annotated[
+    RetrievalMode | None,
+    typer.Option(
+        "--retrieval",
+        help="vector (embeddings only) or hybrid (also BM25 keyword search).",
+    ),
+]
+
+
+def _build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:
+    """The BM25 index, built once, or `None` for plain vector retrieval.
+
+    Built here rather than inside the query so a run over many questions pays for it
+    once; it is a tokenize pass over every chunk in the store.
+    """
+    if mode != "hybrid":
+        return None
+    with err_console.status("[dim]Building the keyword index...[/dim]"):
+        return KeywordIndex.from_store(store)
+
+
 def _open_index() -> tuple[Config, VectorStore]:
     """Load the index config and open its store, or explain what is missing."""
     config = load_config()
@@ -744,8 +776,15 @@ def _print_answer(result: QueryResult, show_sources: bool, verbose: bool) -> Non
 
     if verbose:
         usage = result.usage
+        # Windowing makes these two differ, and the gap is the whole story of what
+        # it cost, so say both rather than one number that no longer means one thing.
+        expanded = (
+            f" expanded to {_plural(result.chunks_in_context, 'chunk')} with neighbours;"
+            if result.chunks_in_context > result.chunks_retrieved
+            else ";"
+        )
         console.print(
-            f"\n[dim]{_plural(result.chunks_retrieved, 'chunk')} retrieved; "
+            f"\n[dim]{_plural(result.chunks_retrieved, 'chunk')} retrieved{expanded} "
             f"{usage.prompt_tokens} prompt + {usage.completion_tokens} completion tokens "
             f"({usage.embedding_tokens} to embed the question), "
             f"{usage.elapsed_s:.1f}s elapsed.[/dim]"
@@ -764,6 +803,10 @@ def _answer_as_json(result: QueryResult, show_sources: bool) -> str:
             **result.usage.model_dump(),
             "total_tokens": result.usage.total_tokens,
         },
+        "retrieval": {
+            "chunks_retrieved": result.chunks_retrieved,
+            "chunks_in_context": result.chunks_in_context,
+        },
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
@@ -775,6 +818,15 @@ def query(
         int | None,
         typer.Option("--top-k", help="Chunks to retrieve; overrides the configured top_k.", min=1),
     ] = None,
+    window: Annotated[
+        int | None,
+        typer.Option(
+            "--window",
+            help="Also include N neighbouring chunks either side of each hit.",
+            min=0,
+        ),
+    ] = None,
+    retrieval: RetrievalOption = None,
     show_sources: Annotated[
         bool,
         typer.Option("--show-sources", help="Also print the full text of each retrieved chunk."),
@@ -792,6 +844,8 @@ def query(
 
     try:
         config, store = _open_index()
+        mode = retrieval if retrieval is not None else config.index.retrieval
+        keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
 
@@ -808,6 +862,9 @@ def query(
                 embed_query=embeddings.embed_query,
                 answer=ask,
                 top_k=top_k if top_k is not None else config.index.top_k,
+                window=window if window is not None else config.index.retrieval_window,
+                mode=mode,
+                keyword_index=keyword_index,
             )
     except ZoteroRagError as exc:
         _fail(exc)
@@ -925,11 +982,12 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
         )
 
     settings = report.settings
+    windowing = f" ±{settings.retrieval_window}" if settings.retrieval_window else ""
     console.print(
         f"\n[dim]{settings.llm_model} answering, {settings.judge_model} grading, "
         f"{settings.embedding_model} embedding · top_k {settings.top_k} · "
         f"chunks {settings.chunk_size}/{settings.chunk_overlap} · "
-        f"temperature {settings.temperature} · {settings.retrieval} retrieval · "
+        f"temperature {settings.temperature} · {settings.retrieval}{windowing} retrieval · "
         f"{_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
     )
 
@@ -951,6 +1009,15 @@ def eval_command(
         int | None,
         typer.Option("--top-k", help="Chunks to retrieve; overrides the configured top_k.", min=1),
     ] = None,
+    window: Annotated[
+        int | None,
+        typer.Option(
+            "--window",
+            help="Also include N neighbouring chunks either side of each hit.",
+            min=0,
+        ),
+    ] = None,
+    retrieval: RetrievalOption = None,
     only: Annotated[
         list[str] | None,
         typer.Option("--only", help="Run just this question id; repeatable."),
@@ -982,6 +1049,9 @@ def eval_command(
         questions = _select_questions(load_questions(questions_path), only or [])
 
         chosen_top_k = top_k if top_k is not None else config.index.top_k
+        chosen_window = window if window is not None else config.index.retrieval_window
+        mode = retrieval if retrieval is not None else config.index.retrieval
+        keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
         verdict_of = build_verdict_fn(config)
@@ -997,6 +1067,9 @@ def eval_command(
                 embed_query=embeddings.embed_query,
                 answer=ask,
                 top_k=chosen_top_k,
+                window=chosen_window,
+                mode=mode,
+                keyword_index=keyword_index,
             )
 
         # Progress on stderr, so --json on stdout is never contaminated.
@@ -1016,7 +1089,14 @@ def eval_command(
             outcomes = evaluate(questions, answer_one, verdict_of, assessor, on_start)
 
         report = EvalReport(
-            settings=run_settings(config, store, chosen_top_k, questions_path),
+            settings=run_settings(
+                config,
+                store,
+                chosen_top_k,
+                questions_path,
+                window=chosen_window,
+                mode=mode,
+            ),
             aggregate=aggregate(outcomes),
             results=outcomes,
         )
@@ -1029,6 +1109,216 @@ def eval_command(
         print(report.model_dump_json(indent=2))  # noqa: T201
         return
     _print_eval_report(report, verbose=_is_verbose())
+
+
+#: Above this many documents, generation is worth confirming: it is one LLM call
+#: per document over most of that document's text, which on a large collection is
+#: a real bill rather than a rounding error.
+_CONFIRM_DOCUMENTS = 30
+
+
+def _select_documents(
+    documents: list[DocumentText], only_item: list[str], limit: int | None
+) -> list[DocumentText]:
+    """Narrow to the requested items, complaining about keys that are not indexed."""
+    if only_item:
+        wanted = list(dict.fromkeys(only_item))
+        by_key = {document.item_key: document for document in documents}
+        if missing := [key for key in wanted if key not in by_key]:
+            raise QuestionSetError(
+                f"No indexed document for item {', '.join(repr(key) for key in missing)}. "
+                "Item keys come from the store, so an item with no indexed attachment "
+                "cannot have questions generated for it."
+            )
+        documents = [by_key[key] for key in wanted]
+    return documents[:limit] if limit is not None else documents
+
+
+def _print_generation_plan(documents: list[DocumentText], per_document: int) -> None:
+    """The dry run: what would be read, and roughly what it would cost."""
+    table = Table(title="Documents that would be used", title_justify="left")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Title", overflow="ellipsis", max_width=46)
+    table.add_column("Authors", overflow="ellipsis", max_width=22)
+    table.add_column("Year", justify="right")
+    table.add_column("Chunks", justify="right")
+    table.add_column("Chars", justify="right")
+    table.add_column("Item", style="dim")
+
+    estimate = 0
+    for number, document in enumerate(documents, start=1):
+        estimate += document.prompt_tokens_estimate
+        table.add_row(
+            str(number),
+            escape(document.title),
+            escape(document.authors) or "[dim]—[/dim]",
+            document.year or "[dim]—[/dim]",
+            str(document.chunks),
+            f"{len(document.text)}{'*' if document.truncated else ''}",
+            document.item_key,
+        )
+    console.print(table)
+
+    console.print(
+        f"\n[bold]{_plural(per_document * len(documents), 'question')}[/bold] would be "
+        f"written from {_plural(len(documents), 'document')} "
+        f"({per_document} each), in {_plural(len(documents), 'call')} costing roughly "
+        f"{estimate} prompt tokens."
+    )
+    if any(document.truncated for document in documents):
+        console.print(
+            "  [dim]* sampled head-and-tail to fit eval.document_char_budget; "
+            "the middle of the document is not shown to the generator.[/dim]"
+        )
+    console.print("\n[dim]Dry run: nothing was generated and nothing was written.[/dim]")
+
+
+def _print_generation_summary(
+    path: Path, stats: GenerationStats, per_document: int, verbose: bool
+) -> None:
+    console.print(
+        f"\n[bold green]Wrote {_plural(stats.questions, 'question')}[/bold green] from "
+        f"{_plural(stats.documents, 'document')} to [bold]{path}[/bold]."
+    )
+    expected = per_document * stats.documents
+    if stats.questions != expected:
+        console.print(
+            f"  [dim]{expected} were requested; the generator returned {stats.questions}.[/dim]"
+        )
+    if stats.truncated:
+        console.print(
+            f"  [dim]{stats.truncated} document(s) were longer than "
+            f"eval.document_char_budget and were sampled head-and-tail.[/dim]"
+        )
+    if stats.failures:
+        console.print(f"\n[yellow]{_plural(len(stats.failures), 'document')} produced nothing:")
+        for failure in stats.failures:
+            console.print(f"  [yellow]•[/yellow] {escape(failure)}")
+
+    console.print(
+        "\n[bold]Next:[/bold] read through the file and edit it — the questions are a "
+        "model's reading of each paper, and a generated set cannot ask what the corpus "
+        "fails to answer. Then run [bold]zotero-rag eval[/bold]."
+    )
+    if verbose:
+        console.print(
+            f"[dim]{stats.prompt_tokens} prompt + {stats.completion_tokens} completion "
+            f"tokens, {stats.elapsed_s:.1f}s elapsed.[/dim]"
+        )
+
+
+@app.command("generate-questions")
+def generate_questions_command(
+    out: Annotated[
+        Path | None,
+        typer.Option("--out", help="Where to write the set; defaults to the configured file."),
+    ] = None,
+    per_document: Annotated[
+        int | None,
+        typer.Option("--per-document", help="Questions per document.", min=1),
+    ] = None,
+    language: Annotated[
+        str,
+        typer.Option("--language", help="Language to write the questions in."),
+    ] = MATCH_DOCUMENT,
+    only_item: Annotated[
+        list[str] | None,
+        typer.Option("--only-item", help="Use just this Zotero item key; repeatable."),
+    ] = None,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Use only the first N documents.", min=1),
+    ] = None,
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing question set.")
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List the documents and the estimated cost; write nothing."),
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the confirmation on a large collection.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Write a starting questions.yaml from the documents already indexed.
+
+    Questions come from the vector store rather than from `cache/`, so every one of
+    them is answerable from the index and each carries the exact item it was
+    written from. The result is a draft to edit, not a finished golden set.
+    """
+    _enable_verbose(verbose)
+
+    try:
+        config, store = _open_index()
+        count = per_document if per_document is not None else config.eval.questions_per_document
+        documents = _select_documents(
+            collect_documents(store, config.eval.document_char_budget),
+            only_item or [],
+            limit,
+        )
+        if not documents:
+            raise NotIndexedError(
+                "No indexed document carries an item key, so no question can name the "
+                "item it came from. Re-index this folder to record them."
+            )
+
+        if dry_run:
+            _print_generation_plan(documents, count)
+            return
+
+        destination = out if out is not None else resolve_questions_path(config, None)
+        # Refuse before spending anything, not after.
+        if destination.exists() and not force:
+            raise QuestionSetError(
+                f"{destination} already exists. Generated questions would overwrite a set "
+                "you may have edited; pass --force to replace it, or --out to write "
+                "elsewhere."
+            )
+
+        if len(documents) > _CONFIRM_DOCUMENTS and not assume_yes:
+            estimate = sum(document.prompt_tokens_estimate for document in documents)
+            err_console.print(
+                f"[yellow]Warning:[/yellow] this would make "
+                f"{_plural(len(documents), 'call')} costing roughly {estimate} prompt "
+                f"tokens. Try --dry-run, or --limit, first."
+            )
+            if not typer.confirm(
+                f"Generate questions for {len(documents)} documents?", default=False
+            ):
+                raise typer.Abort()
+
+        generator = build_generator(config)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Writing questions...", total=len(documents))
+
+            def on_start(document: DocumentText) -> None:
+                progress.update(task, advance=1, description=escape(document.title[:48]))
+
+            questions, stats = generate_questions(documents, generator, count, language, on_start)
+
+        if not questions:
+            raise QuestionSetError(
+                "The generator returned no usable question for any document, so nothing "
+                "was written. Run with -v to see what each document reported."
+            )
+
+        write_questions(
+            destination, questions, header=file_header(config, stats, language), force=True
+        )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    _print_generation_summary(destination, stats, count, verbose=_is_verbose())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -18,8 +18,9 @@ from typer.testing import CliRunner
 
 from zotero_rag import __version__, cli
 from zotero_rag.config import Config
-from zotero_rag.evaluation import JudgeVerdict, RawVerdict
+from zotero_rag.evaluation import JudgeVerdict, RawVerdict, load_questions
 from zotero_rag.fingerprint import StoreFingerprint
+from zotero_rag.generation import DocumentText, GeneratedQuestion, RawGeneration
 from zotero_rag.indexer import IndexStats
 from zotero_rag.planning import IndexPlan, PlannedAttachment
 from zotero_rag.querying import QueryResult, Source, Usage
@@ -42,7 +43,7 @@ def _isolate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_help_lists_every_planned_command() -> None:
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    for command in ("list-collections", "init", "index", "query", "eval"):
+    for command in ("list-collections", "init", "index", "query", "eval", "generate-questions"):
         assert command in result.output
 
 
@@ -301,7 +302,7 @@ def test_verbose_reports_prompt_and_completion_tokens() -> None:
 
 def test_json_output_has_the_documented_shape() -> None:
     payload = json.loads(cli._answer_as_json(_sample_result(), show_sources=False))
-    assert set(payload) == {"answer", "sources", "usage"}
+    assert set(payload) == {"answer", "sources", "usage", "retrieval"}
     assert payload["answer"].startswith("Escribir")
     assert payload["usage"]["total_tokens"] == 150
     source = payload["sources"][0]
@@ -674,3 +675,438 @@ def test_eval_assess_context_adds_the_retrieval_verdict(
     payload = json.loads(result.stdout)
     assert payload["results"][0]["context_sufficiency"] == "partial"
     assert payload["aggregate"]["context_counts"] == {"partial": 1}
+
+
+# --- `generate-questions` (PRD §11.3.2) ----------------------------------
+
+
+def _generation_index_folder(tmp_path: Path, documents: int = 1) -> None:
+    """An index folder with `documents` indexed items and no question set yet."""
+    store = VectorStore(tmp_path / "chroma")
+    config = Config()
+    for number in range(1, documents + 1):
+        store.add(
+            ids=[f"ATT{number}:1:0", f"ATT{number}:2:0"],
+            embeddings=[[1.0, 0.0, 0.5], [0.9, 0.1, 0.4]],
+            documents=[f"Paper {number} introduces a fog node.", f"Paper {number} concludes."],
+            metadatas=[
+                {
+                    "attachment_key": f"ATT{number}",
+                    "item_key": f"ITEM{number}",
+                    "title": f"Paper Number {number}",
+                    "authors": f"Author{number}, Ann",
+                    "year": "2016",
+                    "page": page,
+                    "chunk_index": 0,
+                    "embedding_model": config.embedding_model,
+                }
+                for page in (1, 2)
+            ],
+        )
+    store.write_fingerprint(StoreFingerprint.intended(config, embedding_dim=3))
+    (tmp_path / "config.yaml").write_text("index:\n  top_k: 3\n", encoding="utf-8")
+
+
+def _stub_generator(monkeypatch: pytest.MonkeyPatch, per_call: int = 2) -> list[str]:
+    """Replace the generation seam; returns the list of languages it was asked for."""
+    languages: list[str] = []
+
+    def generate_for(document: DocumentText, count: int, language: str) -> RawGeneration:
+        languages.append(language)
+        return RawGeneration(
+            questions=[
+                GeneratedQuestion(
+                    question=f"What does {document.title} propose ({number})?",
+                    answer=f"It proposes a fog node: number {number}.",
+                    expected_points=["it sits between edge and cloud", "it is close to the data"],
+                )
+                for number in range(1, per_call + 1)
+            ],
+            prompt_tokens=1200,
+            completion_tokens=150,
+        )
+
+    monkeypatch.setattr(cli, "build_generator", lambda config: generate_for)
+    return languages
+
+
+def test_generate_questions_is_listed_in_the_help() -> None:
+    result = runner.invoke(cli.app, ["--help"])
+    assert "generate-questions" in result.output
+
+
+def test_generate_questions_outside_an_index_folder_fails_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["generate-questions"])
+    assert result.exit_code == 1
+    assert "config.yaml" in result.output
+
+
+def test_generate_questions_dry_run_costs_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path, documents=2)
+    monkeypatch.chdir(tmp_path)
+
+    def must_not_build(config: object) -> object:
+        raise AssertionError("--dry-run reached the generator")
+
+    monkeypatch.setattr(cli, "build_generator", must_not_build)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--dry-run"])
+
+    assert result.exit_code == 0
+    assert "Paper Number 1" in result.output and "Paper Number 2" in result.output
+    assert "prompt tokens" in result.output
+    assert "nothing was written" in result.output
+    assert not (tmp_path / "questions.yaml").exists()
+
+
+def test_generate_questions_writes_a_set_that_eval_can_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The end-to-end guarantee: generation feeds eval without hand-editing."""
+    _generation_index_folder(tmp_path, documents=2)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch, per_call=2)
+
+    result = runner.invoke(cli.app, ["generate-questions"])
+
+    assert result.exit_code == 0
+    assert "Wrote 4 questions" in result.output
+    assert "2 documents" in result.output
+
+    questions = load_questions(tmp_path / "questions.yaml")
+    assert len(questions) == 4
+    # Provenance is exact: each question names the item its text came from.
+    assert {question.expected_items[0] for question in questions} == {"ITEM1", "ITEM2"}
+    assert [question.id for question in questions] == [
+        "author1-2016-1",
+        "author1-2016-2",
+        "author2-2016-1",
+        "author2-2016-2",
+    ]
+
+
+def test_generate_questions_tells_you_to_edit_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated set is a draft; the command has to say so, not just the file."""
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch)
+
+    result = runner.invoke(cli.app, ["generate-questions"])
+
+    assert "edit it" in result.output
+    assert "zotero-rag eval" in result.output
+    assert "EDIT THIS FILE" in (tmp_path / "questions.yaml").read_text(encoding="utf-8")
+
+
+def test_generate_questions_refuses_to_clobber_an_existing_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "questions.yaml").write_text("questions: []\n", encoding="utf-8")
+
+    def must_not_build(config: object) -> object:
+        raise AssertionError("it spent a generation call before refusing")
+
+    monkeypatch.setattr(cli, "build_generator", must_not_build)
+
+    result = runner.invoke(cli.app, ["generate-questions"])
+
+    assert result.exit_code == 1
+    assert "already exists" in result.output
+    assert "--force" in result.output
+    # Refused before spending anything, and left the file untouched.
+    assert (tmp_path / "questions.yaml").read_text(encoding="utf-8") == "questions: []\n"
+
+
+def test_generate_questions_force_replaces_the_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "questions.yaml").write_text("questions: []\n", encoding="utf-8")
+    _stub_generator(monkeypatch)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--force"])
+
+    assert result.exit_code == 0
+    assert len(load_questions(tmp_path / "questions.yaml")) == 2
+
+
+def test_generate_questions_out_writes_elsewhere(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--out", "draft.yaml"])
+
+    assert result.exit_code == 0
+    assert (tmp_path / "draft.yaml").exists()
+    assert not (tmp_path / "questions.yaml").exists()
+
+
+def test_generate_questions_language_is_passed_through(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    languages = _stub_generator(monkeypatch)
+
+    runner.invoke(cli.app, ["generate-questions", "--language", "Spanish"])
+
+    assert languages == ["Spanish"]
+
+
+def test_generate_questions_only_item_narrows_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path, documents=3)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch, per_call=1)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--only-item", "ITEM2"])
+
+    assert result.exit_code == 0
+    questions = load_questions(tmp_path / "questions.yaml")
+    assert [question.expected_items[0] for question in questions] == ["ITEM2"]
+
+
+def test_generate_questions_only_item_with_an_unindexed_key_explains_why(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--only-item", "NOPE"])
+
+    assert result.exit_code == 1
+    assert "NOPE" in result.output
+    assert "no indexed attachment" in result.output
+
+
+def test_generate_questions_limit_caps_the_documents(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path, documents=3)
+    monkeypatch.chdir(tmp_path)
+    _stub_generator(monkeypatch, per_call=1)
+
+    result = runner.invoke(cli.app, ["generate-questions", "--limit", "2"])
+
+    assert result.exit_code == 0
+    assert len(load_questions(tmp_path / "questions.yaml")) == 2
+
+
+def test_generate_questions_reports_a_document_that_produced_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path, documents=2)
+    monkeypatch.chdir(tmp_path)
+
+    def flaky(document: DocumentText, count: int, language: str) -> RawGeneration:
+        if document.item_key == "ITEM1":
+            raise RuntimeError("the provider said no")
+        return RawGeneration(
+            questions=[GeneratedQuestion(question="Real?", answer="Yes.", expected_points=["a"])]
+        )
+
+    monkeypatch.setattr(cli, "build_generator", lambda config: flaky)
+
+    result = runner.invoke(cli.app, ["generate-questions"])
+
+    assert result.exit_code == 0
+    assert "Wrote 1 question" in result.output
+    assert "produced nothing" in result.output
+    assert "Paper Number 1" in result.output
+
+
+def test_generate_questions_writes_nothing_when_every_document_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _generation_index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    def always_fails(document: DocumentText, count: int, language: str) -> RawGeneration:
+        raise RuntimeError("no")
+
+    monkeypatch.setattr(cli, "build_generator", lambda config: always_fails)
+
+    result = runner.invoke(cli.app, ["generate-questions"])
+
+    assert result.exit_code == 1
+    assert "no usable question" in result.output
+    assert not (tmp_path / "questions.yaml").exists()
+
+
+# --- windowed retrieval through the CLI (M7, §11.4) ----------------------
+
+
+def test_query_help_documents_the_window_flag() -> None:
+    result = runner.invoke(cli.app, ["query", "--help"])
+    assert "--window" in result.output
+    assert "neighbouring" in result.output
+
+
+def test_window_defaults_to_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  retrieval_window: 2\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
+
+    assert payload["settings"]["retrieval_window"] == 2
+
+
+def test_window_flag_overrides_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run's window has to reach the report, or two runs are not comparable."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  retrieval_window: 2\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--window", "0", "--json"]).stdout)
+
+    assert payload["settings"]["retrieval_window"] == 0
+
+
+def test_eval_settings_line_shows_the_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--window", "1", "--retrieval", "vector"])
+
+    assert "vector ±1 retrieval" in result.output
+
+
+def test_a_negative_window_is_rejected() -> None:
+    result = runner.invoke(cli.app, ["query", "anything", "--window", "-1"])
+    assert result.exit_code != 0
+
+
+# --- hybrid retrieval through the CLI (M7, §11.4.2) ----------------------
+
+
+def test_query_help_documents_the_retrieval_flag() -> None:
+    result = runner.invoke(cli.app, ["query", "--help"])
+    assert "--retrieval" in result.output
+    assert "hybrid" in result.output
+
+
+def test_retrieval_mode_defaults_to_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  retrieval: hybrid\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
+
+    assert payload["settings"]["retrieval"] == "hybrid"
+
+
+def test_retrieval_flag_overrides_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  retrieval: hybrid\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--retrieval", "vector", "--json"]).stdout)
+
+    assert payload["settings"]["retrieval"] == "vector"
+
+
+def test_an_unknown_retrieval_mode_is_rejected() -> None:
+    result = runner.invoke(cli.app, ["query", "anything", "--retrieval", "magic"])
+    assert result.exit_code != 0
+
+
+def test_hybrid_builds_the_keyword_index_once_per_eval_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rebuilding it per question would tokenize the whole store N times over."""
+    _eval_index_folder(tmp_path, ONE_QUESTION + "  - id: two\n    question: And?\n    answer: x\n")
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+    builds: list[int] = []
+
+    real = cli.KeywordIndex.from_store
+
+    def counted(store: object) -> object:
+        builds.append(1)
+        return real(store)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli.KeywordIndex, "from_store", staticmethod(counted))
+
+    result = runner.invoke(cli.app, ["eval", "--retrieval", "hybrid", "--json"])
+
+    assert result.exit_code == 0
+    assert len(json.loads(result.stdout)["results"]) == 2
+    assert builds == [1]
+
+
+def test_vector_mode_builds_no_keyword_index(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    def must_not_build(store: object) -> object:
+        raise AssertionError("vector retrieval built a keyword index")
+
+    monkeypatch.setattr(cli.KeywordIndex, "from_store", staticmethod(must_not_build))
+
+    assert runner.invoke(cli.app, ["eval", "--retrieval", "vector"]).exit_code == 0
+
+
+def test_eval_settings_line_names_the_retrieval_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--retrieval", "hybrid"])
+
+    assert "hybrid" in result.output
+
+
+def test_hybrid_is_the_shipped_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """§11.4.2 accepted it on the evidence; the packaged config must agree."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
+
+    assert payload["settings"]["retrieval"] == "hybrid"
+    assert Config().index.retrieval == "hybrid"

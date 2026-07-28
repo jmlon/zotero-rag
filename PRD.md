@@ -121,20 +121,30 @@ zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
 ### 3.4 `query`
 
 ```
-zotero-rag query "QUESTION" [--top-k N] [--show-sources] [--json] [-v]
+zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
+                            [--show-sources] [--json] [-v]
 ```
 
 - One-shot query. Retrieves `top_k` chunks, calls the LLM, prints the answer
   followed by a numbered source list.
 - `--show-sources` additionally prints the full text of each retrieved chunk.
-- `--json` emits a machine-readable object (`answer`, `sources[]`, `usage`).
+- `--json` emits a machine-readable object (`answer`, `sources[]`, `usage`,
+  `retrieval`). The last carries `chunks_retrieved` and `chunks_in_context`, which
+  differ once `--window` is in use.
 - `--top-k` overrides the configured value for this call.
+- `--window N` also sends the N chunks either side of each hit, in reading order
+  (§11.4.1). Defaults to `retrieval_window`, which is `0` — measurement did not
+  support making it the default.
+- `--retrieval vector|hybrid` picks the strategy (§11.4.2). `hybrid` fuses a BM25
+  keyword ranking with the vector one and **is the default**, because it measured
+  better at no token cost. It is a query-time choice: switching it never requires
+  re-indexing.
 
 ### 3.5 `eval`
 
 ```
-zotero-rag eval [--questions FILE] [--top-k N] [--only ID]... [--assess-context]
-                [--json] [-v]
+zotero-rag eval [--questions FILE] [--top-k N] [--window N] [--retrieval MODE]
+                [--only ID]... [--assess-context] [--json] [-v]
 ```
 
 - Runs a golden set of questions (§11.3) against the index and scores it: a table
@@ -151,6 +161,34 @@ zotero-rag eval [--questions FILE] [--top-k N] [--only ID]... [--assess-context]
   answer at all, which separates a retrieval failure from a generation one.
 - `--json` emits the whole report (`settings`, `aggregate`, `results[]`) on
   stdout, with progress diverted to stderr.
+
+### 3.6 `generate-questions`
+
+```
+zotero-rag generate-questions [--out PATH] [--per-document N] [--language LANG]
+                              [--only-item KEY]... [--limit N] [--force]
+                              [--dry-run] [--yes] [-v]
+```
+
+- Writes a starting `questions.yaml` (§11.3.2) from the documents **already
+  indexed**, so writing a golden set by hand is no longer the price of measuring a
+  collection. One LLM call per document.
+- Questions come from the **vector store, not `cache/`**: a question written from
+  unindexed text could never be answered from the index, and would sit in the set
+  as a permanent false failure. Each question therefore carries the exact
+  `expected_items` key of the item its text came from.
+- `--per-document` (default `eval.questions_per_document`, 3) sets how many;
+  `--language` defaults to the language of each document, so `--language Spanish`
+  is how §12.1's Spanish-over-English setup is reproduced.
+- `--dry-run` lists the documents with chunk and character counts and an estimated
+  prompt-token cost, and writes nothing. Above 30 documents an ordinary run asks
+  for confirmation, as a whole-library `index` does; `--yes` skips it.
+- **Refuses to overwrite an existing question set** unless `--force` is given, and
+  refuses *before* making any model call. `--out` writes elsewhere.
+- `--only-item` (repeatable) and `--limit` narrow the run, which is how a trial on
+  one paper is done before spending on a whole collection.
+- The result is a **draft to edit**, not a finished golden set, and the file's own
+  header says so — see the end of §11.3.2 for why.
 
 ## 4. Zotero access
 
@@ -225,7 +263,9 @@ index:
 
   chunk_size: 1000        # characters (RecursiveCharacterTextSplitter)
   chunk_overlap: 200      # characters
-  top_k: 5
+  top_k: 10               # 5 before 0.4.4; raised on M7's evidence (§11.4.1)
+  retrieval_window: 0     # neighbours either side of each hit (M7, §11.4.1)
+  retrieval: hybrid       # vector | hybrid (BM25 fused with vectors, §11.4.2)
   temperature: 0.0
 
   # Which attachment wins when an item has several readable ones (§7.1).
@@ -243,6 +283,11 @@ eval:                       # M6, §11.3
   judge_model: null         # null => grade with the answering model
   judge_temperature: 0.0
   context_char_budget: 12000       # cap on the context handed to --assess-context
+
+  # `generate-questions` (§11.3.2)
+  generator_model: null     # null => write questions with the answering model
+  questions_per_document: 3
+  document_char_budget: 30000      # per document; longer ones are sampled head-and-tail
 ```
 
 Multilingual corpora are supported by overriding `embedding_model` with a
@@ -429,7 +474,10 @@ PyTorch, no sentence-transformers. Embeddings are always remote via OpenRouter.
 Runtime: `pyzotero`, `chromadb`, `pypdf`, `langchain-core`, `langchain-openai`,
 `langchain-text-splitters`, `typer`, `rich`, `pydantic`, `pyyaml`,
 `python-dotenv`, `tiktoken` (token counts for `-v`), `httpx` (imported directly to
-catch the transport errors `pyzotero` lets through — see §14.7).
+catch the transport errors `pyzotero` lets through — see §14.7), `rank-bm25`
+(keyword retrieval, §11.4.2 — pure Python over numpy, which `chromadb` already
+requires, so it adds no new native dependency). It ships no type stubs, so `mypy`
+has one scoped `ignore_missing_imports` override for it and no others.
 
 HTML, DOCX, ODT and EPUB are read with the **standard library only**
 (`html.parser`, `zipfile`, `xml.etree`). No BeautifulSoup, `lxml`, or
@@ -503,7 +551,7 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 | 4 | Store integrity and true reindexing | correctness | 0.2.0 | ✅ **done** |
 | 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | ✅ **done** |
 | 6 | Measurement before tuning | evaluation | 0.4.0 | ✅ **done** |
-| 7 | Retrieval quality | tuning | 0.5.0 | M |
+| 7 | Retrieval quality | tuning | 0.5.0 | 🚧 windowing done (§11.4.1); rest M |
 | 8 | Scale and cost | performance | 0.6.0 | S–M |
 | 9 | Daily use | ergonomics | 0.7.0 | M |
 | 10 | Reach: group libraries, other stores, MCP | breadth | 0.8.0 | M |
@@ -798,21 +846,103 @@ Two findings that only appear once the harness exists, both of which change how
   coverage difference smaller than a few points is noise. The mechanical metrics
   are the ones worth regressing against, which is the argument for having them.
 
+#### 11.3.2 `generate-questions` (0.4.1) — ✅ done
+
+**Status: implemented and verified live** (§14.9).
+
+**The problem M6 left behind.** Evaluation is executable, but a golden set still
+has to be written by hand, and §11.3.1 showed how much that costs: the 3-question
+`Writing` set cannot resolve a tuning decision, and the 21-question `Networking`
+set that can took an afternoon of reading. The harness is therefore bounded not by
+code but by how many questions someone is willing to write — and a user with a
+50-paper collection will write none.
+
+**`zotero-rag generate-questions`** (§3.6) writes a starting `questions.yaml` from
+the documents already indexed: one LLM call per document, yielding
+`questions_per_document` questions each with a reference answer and expected points.
+
+Two design decisions carry the value:
+
+- **Generate from the vector store, not from `cache/`.** The cache is the obvious
+  source — the PDFs are sitting there — but it is the wrong one. A question written
+  from text that is not *in the index* can never be answered from the index, so it
+  would sit in the golden set as a permanent false failure, silently depressing
+  every score and every comparison built on it. Generating from the store inverts
+  that: every question is answerable in principle, so a failure means retrieval or
+  generation genuinely failed. It also needs no downloads and no re-parsing, and it
+  still works after `--force --refetch` has emptied the cache.
+- **`expected_items` is exact, because the generator knows where the text came
+  from.** This is the property that separated the two hand-written sets: the
+  `Networking` set could name one source article per question and so measures
+  retrieval discrimination, while `Writing` could only check that retrieval stayed
+  inside the collection (§12.1, §12.2). Generated sets get the strong version for
+  free, which is the single best reason to prefer them as a starting point.
+
+Supporting behaviour, all of it following existing conventions: `--dry-run` lists
+the documents with character counts and an estimated prompt-token cost and writes
+nothing; `--out` and `--force` exist because silently overwriting a curated set
+would be the worst thing this command could do, and the check happens *before* any
+model call rather than after; `--only-item` and `--limit` narrow a trial run; a
+collection over 30 documents asks for confirmation, as a whole-library `index`
+does; one document whose generation fails is reported and skipped rather than
+losing the rest of the run (§10).
+
+**A long paper is sampled head-and-tail, not truncated.** `document_char_budget`
+defaults to 30,000 characters, and 14 of `Networking`'s 16 documents exceed it. A
+plain truncation would hand the model the abstract and introduction and drop the
+results and conclusions — precisely the "main points" the questions are supposed to
+be about — so 70% of the budget comes from the head and 30% from the tail, with the
+gap marked and the prompt told not to ask about the omitted middle.
+
+**The written file is read back through `load_questions` before the command
+returns.** Emitting YAML that `eval` cannot parse is the obvious failure mode here:
+reference answers are prose full of colons, quotes and accents, every one a YAML
+hazard, and hand-quoting them is exactly what went wrong while writing
+`Networking.yaml` by hand. Serialising with PyYAML and then re-parsing makes
+"generation cannot produce something evaluation cannot read" a checked guarantee
+rather than an intention.
+
+**Acceptance:** `generate-questions` on `Networking` writes a set that `eval` runs
+with no hand-editing, whose scores are comparable to the hand-written set, and
+`--dry-run` estimates the cost without spending it. **All verified — §14.9.**
+
+**What a generated set is not, and the file says so itself.** Every question comes
+from a single document, so the set tests whether retrieval can find the document a
+question was written from. That is a real regression harness and it is not the same
+as measuring what you want to know: it under-tests synthesis across several papers,
+and it structurally cannot ask a question the corpus fails to answer — so it can
+never produce the §12.8 "I don't know" case. The header comment written into every
+generated file says all of this and tells the user to edit it, because a draft that
+looks finished is worse than one that admits it isn't.
+
+**Deferred, deliberately.** A `--merge` mode that adds questions only for documents
+not already covered would make the command usable incrementally as a collection
+grows; today a second run replaces the file. Worth having, not worth blocking on.
+
 ### 11.4 Milestone 7 — Retrieval quality (0.5.0)
 
 **Depends on M6.** Each item below is a hypothesis to be accepted or rejected by
 `eval`, cheapest first.
 
-- **Windowed retrieval (S).** Chunk ids are `<attachment_key>:<page>:<chunk_index>`,
-  so fetching ±N neighbours of each hit is a `get()` by id — no new storage, and it
-  addresses the case where an answer is split across a chunk boundary.
+- **Windowed retrieval (S) — ✅ built, ❌ rejected as a default.** Implemented as
+  `retrieval_window` / `--window` (§3.4) and measured; the mechanism works and the
+  numbers say not to switch it on. §11.4.1 has the frontier and the reasoning. This
+  is the first hypothesis this section put to `eval`, and the answer was no — which
+  is what §11.3 was built for.
+- **Retrieval diversity (S) — surfaced by §11.4.1, not in the original list.** A
+  per-document cap, or maximal-marginal-relevance over the candidates. At `top_k:
+  30` one question came back with all thirty chunks from a single document, while
+  the paper it was actually about never appeared at any `top_k`. Nothing else on
+  this list addresses that, and it is the cheapest item here.
 - **Query-time metadata filters (S).** `--year`, `--author`, `--collection`,
   `--doi` mapped to Chroma `where` clauses. The metadata is already stored (§7.2);
-  `year` needs an integer companion field for range comparisons.
-- **Hybrid retrieval.** BM25 over the stored documents — `rank_bm25` is pure
-  Python and does not breach §9 — fused with the vector hits by reciprocal rank
-  fusion, behind `retrieval: vector|hybrid`. Helps exactly where embeddings are
-  weakest: acronyms, author names, and exact phrases.
+  `year` needs an integer companion field for range comparisons. §11.4.1's
+  persistent miss is a candidate: `--author ALzaid` would have found it.
+- **Hybrid retrieval — ✅ built, ✅ accepted, and now the default.** BM25 via
+  `rank_bm25` fused with the vector hits by reciprocal rank fusion, behind
+  `retrieval: vector|hybrid` (§3.4). It measured better on two independent question
+  sets **for no extra tokens**, which is what separates it from windowing.
+  §11.4.2 has the numbers.
 - **Reranking without heavy dependencies.** An LLM reranker (a cheap model scores
   each candidate, keep the best `top_k`) behind `reranker: null|llm`, retrieving
   `top_k × fanout` candidates first. A hosted rerank API is a possible second
@@ -840,6 +970,226 @@ Two findings that only appear once the harness exists, both of which change how
   Note the shape of the `top_k: 1` failure: 13 of 21 questions answered "I don't
   know" rather than guessing from one chunk. The §12.8 abstention behaviour holds
   up under starvation, which is the good half of a bad setting.
+
+  §11.4.1 extends this to `top_k` 20 and 30 and finds the returns stop.
+
+#### 11.4.1 Windowed retrieval, measured and rejected (0.4.2)
+
+**Built as specified.** `expand_window()` in `querying.py` fetches each hit's ±N
+neighbours in reading order, deduplicates where two hits' windows overlap, and
+preserves the hit's similarity distance. Off by default (`retrieval_window: 0`),
+overridable per run with `--window` on both `query` and `eval`, and recorded in the
+eval report so a windowed run cannot be mistaken for a plain one.
+
+Two implementation notes worth keeping:
+
+- **Neighbours are taken across the whole attachment, not within the page.** This
+  looks like a detail and is the opposite: `chunk_overlap` already stitches
+  consecutive chunks *inside* a segment together, so a segment boundary is the one
+  place in the store where no overlap exists at all. A window confined to one page
+  would skip the only join that is genuinely unbridged.
+- **A neighbour on another page becomes its own numbered source**, rather than
+  being folded into the hit's. The text really is on that page, and citing where it
+  sits beats attributing it to the page next door. `top_k` therefore still bounds
+  the *hits*, while the source count may exceed it — which is why `QueryResult`
+  now carries `chunks_retrieved` and `chunks_in_context` separately.
+
+**The measurement.** All runs on the 21-question `Networking` set (§12.2), ordered
+by the tokens spent answering — because every one of these levers buys quality with
+context, so cost is the axis they have to be compared on:
+
+| answer tokens | `top_k` | window | mean score | point coverage | hit | cited |
+|---|---|---|---|---|---|---|
+| 33.2k | 5 | 0 | 1.81 | 53.3–56.0% | 86% | 76% |
+| 61.5k | 10 | 0 | 2.38 | 67.9% | 95% | 81% |
+| 74.0k | 5 | **1** | 1.76 | 52.5% | 86% | 71% |
+| 111.1k | 5 | **2** | 2.14 | 68.6% | 86% | 71% |
+| 117.8k | 20 | 0 | 2.48 | 74.5% | 95% | 86% |
+| 136.6k | 10 | **1** | 2.33 | 68.4% | 95% | 86% |
+| 174.0k | 30 | 0 | 2.48 | 76.4% | 95% | 86% |
+| 196.9k | 10 | **2** | **2.62** | 74.6% | 95% | 86% |
+
+**Verdict: every windowed configuration is dominated by, or tied with, a
+non-windowed one costing the same or less.**
+
+- `window: 1` is simply bad — worse than its own baseline at both `top_k` values
+  (1.76 vs 1.81; 2.33 vs 2.38) for 2.2× the tokens. It adds enough text to dilute
+  and not enough to complete: `zheng-1` and `wang-2` both fell from `partial` to
+  `wrong`, and the citation rate at `top_k: 5` dropped 76% → 71%.
+- `window: 2` genuinely helps — `wang-1` `wrong` → 80% coverage, `cfr-rl-3` 8% →
+  58% — but `top_k: 5, window: 2` (111k, 2.14) is beaten outright by `top_k: 10,
+  window: 0` (61k, 2.38): better score, comparable coverage, 45% fewer tokens.
+- The best single result *is* windowed — `top_k: 10, window: 2` at 2.62 — but its
+  fair comparison is `top_k: 30, window: 0` at 174k: score 2.62 vs 2.48, coverage
+  74.6% vs 76.4%. One metric each, with the coverage gap inside the noise band
+  §11.3.1 measured, for 13% more spend. That is a tie, not a win.
+
+**Why this is not surprising, in hindsight.** A neighbour is by construction in the
+same attachment — therefore the same item — as its hit, so **windowing cannot change
+retrieval hit rate at all**: it was 86% at `window` 0, 1 and 2 alike, and 95% at
+every `top_k ≥ 10` regardless of window. Raising `top_k` brings in *new documents*;
+widening the window only elaborates documents already found. On a corpus where the
+binding constraint is still finding the right paper, the lever that cannot address
+that loses to the one that can.
+
+**Kept, not enabled.** The feature stays: it is small, config-gated, tested, and the
+mechanism is sound. A corpus with much smaller chunks, or long documents whose
+argument genuinely spans many chunks, could invert this — and the point of §11.3 is
+that anyone can now find out for their own collection with one `eval --window`.
+
+**A second result, free from the same runs: `top_k` returns stop.** 5 → 10 is worth
++0.57 mean score; 10 → 20 is +0.10; 20 → 30 is **+0.00** (coverage +1.9 points,
+inside noise). So the useful range on this store ends around 10–20, and anything
+past 20 is pure spend.
+
+**The shipped default became `top_k: 10` in 0.4.4.** It was held at 5 through 0.4.3
+on the argument that a reranker might change the arithmetic — but by then 5 → 10 had
+improved *every* metric in *every* configuration measured: both retrieval modes, both
+question sets, windowed and not. Holding a default at a value that never won any
+comparison, on the strength of a feature that does not exist yet, is not caution but
+inertia. The trade is explicit and belongs in the release note rather than in a
+footnote: **roughly 1.9× the tokens per query** for +0.57 mean score and +9 points of
+retrieval hit rate. `top_k: 5` remains one line of config for anyone who would rather
+have the cheaper query, and when reranking does arrive it will be measured against
+this default rather than the old one.
+
+**A changed default reaches new index folders only, and that is worth knowing before
+wondering why nothing improved.** `init` copies the packaged `config.yaml` *by value*
+(§3.2), so a folder created before 0.4.4 holds `top_k: 5` as an explicit setting, and
+by §5.1's precedence an explicit local value beats the packaged default. Verified: an
+existing `Networking` folder still resolved `top_k=5` after the change, and scored
+1.71 — its old numbers — while a freshly initialised folder resolved 10.
+
+Two consequences, one good and one to act on:
+
+- Nobody gets a surprise bill from upgrading. The token cost arrives only when a user
+  edits the file or creates a new folder, which is the right way round for a change
+  that doubles per-query spend.
+- **Existing folders need one edit to benefit**: set `top_k: 10` in their
+  `config.yaml`. Nothing tells them so, which is precisely the gap §11.8's *config
+  schema version and migration* item describes. The same run also showed the other
+  half of that gap working in our favour: `retrieval` was *absent* from the old file,
+  so it correctly inherited the new `hybrid` default. Keys present are pinned; keys
+  absent are inherited — a reasonable rule that no user has been told about, and the
+  case for a `status` command (§11.6) reporting effective settings rather than
+  configured ones.
+
+**The most useful thing these runs found is a question that no amount of context
+fixes.** `jellyfish-3` misses at `top_k` 5, 10, 20 *and* 30, and at every window.
+Its text is "¿Qué metodologías de evaluación utilizaron los autores para validar sus
+propuestas...?" — which names nothing from the Jellyfish paper, so all 30 slots fill
+with the *systematic literature review* on evaluation methodology, a paper the
+question describes better than its own source does. Two things follow, and neither
+is about context size:
+
+- **Retrieval has no diversity constraint.** Thirty chunks came back and every one
+  was from a single document. A per-document cap or maximal-marginal-relevance
+  belongs on this list, and would have cost nothing here.
+- **"The authors" is under-specified for a corpus-wide search.** The question was
+  written while holding one paper, and reads as ambiguous once 16 are in scope. The
+  §11.3.2 generator prompt already forbids exactly this phrasing in *generated*
+  sets; the hand-written set of §12.2 has the flaw the generator was told to avoid.
+  Worth fixing there, and worth remembering when writing questions by hand.
+
+#### 11.4.2 Hybrid retrieval, measured and adopted (0.4.3)
+
+**Built as specified**, in a new `retrieval.py`: BM25 over every stored chunk,
+reciprocal rank fusion with the vector ranking, behind `retrieval: vector|hybrid`
+plus `--retrieval` on `query` and `eval`. `rank_bm25` is the one new dependency;
+numpy came with `chromadb` already, so §9 holds.
+
+Four decisions that shaped the result:
+
+- **Fusion is rank-based, not score-based.** A cosine distance and a BM25 score
+  share no scale, and normalising them — min-max over the candidates, say — makes the
+  merged order depend on how extreme the *worst* candidate happened to be. Positions
+  are comparable; magnitudes are not.
+- **Each retriever runs deeper than the final cut** (`max(4 × top_k, 20)`). Fusing
+  two `top_k`-long lists gives the merge almost nothing to work with; the case worth
+  catching is a chunk ranked 14th by vectors and 2nd by BM25.
+- **Tokenizing folds accents and splits on punctuation.** Folding is what lets a
+  Spanish question match text with different diacritics — without it half the §12.2
+  questions match nothing. Splitting means `CFR-RL` → `["cfr", "rl"]`, so the query
+  and the paper agree however either punctuates the name. No stopword list: BM25's
+  IDF already discounts ubiquitous words, and a fixed list would have to pick a
+  language, which is wrong for a corpus queried in Spanish and written in English.
+- **The keyword index is built once per process**, not per question. It is a
+  tokenize pass over the whole store — 0.21s for 1,186 chunks — and `eval` over 48
+  questions must not pay that 48 times.
+
+**The measurement.** Two independent question sets, and the token columns are the
+point: fusion changes *which* chunks reach the model, not how many, so it is
+essentially free.
+
+Hand-written set, 21 questions (§12.2):
+
+| mode | `top_k` | mean score | point coverage | hit | cited | answer tokens |
+|---|---|---|---|---|---|---|
+| vector | 5 | 1.81 | 53.3% | 86% | 76% | 33.3k |
+| **hybrid** | 5 | 1.81 | 55.8% | 86% | 81% | 33.7k |
+| vector | 10 | 2.38 | 67.9% | 95% | 81% | 61.5k |
+| **hybrid** | 10 | 2.33 | 72.1% | 95% | **95%** | 62.9k |
+| **hybrid** (repeat) | 10 | 2.52 | 72.3% | 95% | **95%** | 62.8k |
+
+Generated set, 48 questions (§11.3.2) — an independent sample:
+
+| mode | `top_k` | mean score | point coverage | hit | cited | answer tokens |
+|---|---|---|---|---|---|---|
+| vector | 5 | 2.08 | 61.6% | 81% | 73% | 72.5k |
+| **hybrid** | 5 | **2.38** | **67.7%** | **90%** | **77%** | 71.5k |
+
+**Verdict: accepted, and made the default.** The evidence, in the order it should be
+trusted (§11.3.1: mechanical metrics first, then coverage, then the ordinal score):
+
+- **Citation rate** — mechanical, exactly reproducible — rose 81% → **95%** at
+  `top_k: 10`, identical across both hybrid runs. Twenty of twenty-one answers cite
+  the paper they should.
+- **Retrieval hit rate** rose 81% → **90%** on the 48-question set: roughly four more
+  questions found their source paper. On the hand-written set it did not move (86%,
+  95%), for a reason given below.
+- **Point coverage** rose on both sets by 4–6 points, above the ±2.7 noise floor, and
+  reproduced to within 0.2 points across the two hybrid runs.
+- **Mean score** rose on the generated set (2.08 → 2.38) and was flat on the
+  hand-written one — the apparent 2.38 → 2.33 dip was judge noise, since the repeat
+  gave 2.52.
+- **Cost: nil.** 33.3k → 33.7k and 61.5k → 62.9k tokens, and the 48-question run was
+  actually 1k *cheaper*. Compare windowing, which bought its gains at 2–3× (§11.4.1).
+
+**Why hit rate improved on the generated set but not the hand-written one.** Generated
+questions were written while reading their source paper, so they echo its vocabulary —
+`PEMA`, `PEDL`, `Ee-Routing`, `DMCF`. That is precisely the case BM25 is for. The
+hand-written questions are paraphrases, which is exactly where BM25 has nothing to
+contribute and dense retrieval already works. The two sets did not disagree; they
+measured different things, and having both is what made that visible.
+
+**Hybrid wants `top_k ≥ 10`, and here is the failure that shows why.** At `top_k: 5`,
+fusion gives roughly half the slots to each retriever, so a run keeps only two or
+three vector hits. `sdn-review-3` — "¿cuáles son los cuatro beneficios principales que
+SDN ofrece?" — graded `good` under vector and **`no answer`** under hybrid at
+`top_k: 5`: the right item was still retrieved, but the chunk actually listing the four
+benefits was displaced by keyword matches, and the model correctly declined rather than
+invent them. At `top_k: 10` it is `good` again in both hybrid runs. The abstention is
+the system behaving well (§12.8) around a retrieval setting that is too tight; no run
+ever under-filled `top_k` or returned nothing.
+
+**Default changed to `hybrid`** (0.4.3). Enabling hybrid imposes no token cost, so no
+user gets a surprise bill from upgrading — only ~0.2s per 1,000 chunks of start-up.
+
+**`top_k` followed in 0.4.4** (§11.4.1), which makes the shipped defaults exactly the
+best configuration measured: **`top_k: 10` with hybrid** — mean 2.33–2.52, coverage
+72%, hit 95%, cited 95%, against the PoC default's 1.81 / 53% / 86% / 76%. That is
+where the two levers differ: hybrid supplied its share of the gain for free, while
+`top_k` had to be paid for in tokens.
+
+**Deferred: persisting the keyword index.** It is rebuilt per process, which is 0.21s
+at 1,186 chunks but extrapolates to ~9s on a 50,000-chunk store — paid on every
+one-shot `query`. That belongs with M8's scale work, not here, and `retrieval: vector`
+is the escape hatch until then.
+
+**What hybrid did not fix.** `jellyfish-3` still misses at every `top_k` and in both
+modes, exactly as §11.4.1 predicted: its question contains no distinctive term, so
+there is nothing for BM25 to match either. Two of this section's remaining items —
+retrieval diversity and metadata filters — are still the candidates for it.
 
 ### 11.5 Milestone 8 — Scale and cost (0.6.0)
 
@@ -939,10 +1289,12 @@ Surfaced while building the PoC, not in the original list:
 | Per-chunk embedding-model tag, `index --repair` | M4 | repair the stale chunks instead of rebuilding the store |
 | Evaluation harness | M6 ✅ | §12.1 defines a golden set that nothing executes |
 | Per-question source provenance in a golden set | M6 ✅ | one article per question is what makes hit rate discriminating (§12.2) |
+| `generate-questions` | M6 ✅ §11.3.2 | measurement was bounded by how many questions a user will hand-write |
+| `--merge` for incremental question sets | **deferred**, §11.3.2 | a second run replaces the file; adding only uncovered documents is the incremental form |
 | `status` command | M9 | no way to inspect a folder's index |
 | Stray-positional error message | M9 | `index Networking` fails opaquely |
 | Cache size reporting and pruning | M9 | the cache only ever grows |
-| Config schema version and migration | M11 | later settings must not break existing folders |
+| Config schema version and migration | M11 | later settings must not break existing folders — and, per §11.4.1, an improved *default* never reaches a folder that pinned the old value |
 
 **Not scheduled** — deferred because their value for *this* corpus is unproven,
 not because they are uninteresting: agentic / multi-step RAG, hierarchical
@@ -1071,7 +1423,7 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-28. **348 tests passing; `ruff`, `ruff format` and `mypy` clean.**
+Last updated: 2026-07-28. **442 tests passing; `ruff`, `ruff format` and `mypy` clean.**
 
 ### 14.1 Done
 
@@ -1085,10 +1437,25 @@ Last updated: 2026-07-28. **348 tests passing; `ruff`, `ruff format` and `mypy` 
 | 4 | Store fingerprint, version-aware reindexing, repair, prune | ✅ verified live |
 | 5 | HTML / text / DOCX / ODT / EPUB / notes, locators, preference | ✅ verified live |
 | 6 | `eval`: golden sets, LLM judge, hit rate, coverage, comparable runs | ✅ verified live |
+| 6b | `generate-questions`: a golden set written from the index itself (§11.3.2) | ✅ verified live |
+| 7a | Windowed retrieval — built and measured; **rejected as a default** (§11.4.1) | ✅ verified live |
+| 7b | Hybrid BM25 + vector retrieval — **accepted, now the default** (§11.4.2) | ✅ verified live |
 
 **All eight acceptance criteria (§12) are verified against the real library**, as
-are M4 (§14.6), M5 (§14.7) and M6 (§14.8). Next up is **M7, retrieval quality
-(§11.4)** — and it now has a baseline to be measured against rather than eyeballed.
+are M4 (§14.6), M5 (§14.7), M6 (§14.8), §11.3.2 (§14.9), §11.4.1 (§14.10) and
+§11.4.2 (§14.11). M7 continues with **retrieval diversity**, which §11.4.1 turned up
+as the cheapest remaining win and which hybrid did not address, then metadata
+filters and reranking — each accepted or rejected the same way.
+
+**The scoreboard so far**, all on the 21-question `Networking` set. The PoC default
+(`top_k: 5`, vector) scored 1.81/5 with 76% of answers citing the right paper. **The
+shipped defaults are now `top_k: 10` with hybrid retrieval** (0.4.3, 0.4.4), scoring
+2.33–2.52 with **95%** citing the right paper, for 1.9× the tokens. Of that gain,
+`top_k` supplied the tokens and hybrid supplied the accuracy for free. Both were
+chosen by measurement, and windowing was declined by the same measurement — which is
+the whole return on M6.
+
+Folders created before 0.4.4 keep `top_k: 5` until edited; see the end of §11.4.1.
 
 ### 14.2 `query` as built (§3.4, §8)
 
@@ -1115,12 +1482,15 @@ are M4 (§14.6), M5 (§14.7) and M6 (§14.8). Next up is **M7, retrieval quality
 
 ```
 src/zotero_rag/
-  cli.py           typer app: list-collections, init, index, query, eval
+  cli.py           typer app: list-collections, init, index, query, eval,
+                   generate-questions
   config.py        pydantic models, layered loading, pin_collection()
   scaffold.py      init: config.yaml + .env + .gitignore
   zotero_api.py    client, collection tree, path/key resolution, item fetch
   planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata()
+  retrieval.py     BM25 keyword index, reciprocal rank fusion, retrieve() (M7)
   evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
+  generation.py    generate-questions: reassemble documents, write a set (§11.3.2)
   documents.py     formats, content-type mapping, locator kinds
   html_text.py     stdlib HTML → sections (snapshots and notes)
   office.py        DOCX / ODT / EPUB via zipfile + xml.etree
@@ -1160,6 +1530,14 @@ uv run zotero-rag eval
 Expected: 4 PDFs, 22 pages, 146 chunks, ~30,900 embedding tokens, ~7s. A second
 `index` reports 0 indexed / 4 skipped. The query answers in Spanish in ~3s,
 citing 2–3 real `Writing` items with working `zotero.org` URLs.
+
+**The figures recorded in §12 and §14.2 predate 0.4.3/0.4.4** and were measured at
+`top_k: 5` with vector retrieval — §12.7's "5 chunks, 1,287 prompt + 181 completion
+tokens" is that configuration, not this one. A run today retrieves 10 chunks and fuses
+BM25 with the vectors, so expect roughly double the prompt tokens and possibly a
+different set of cited pages. The acceptance criteria themselves still hold; only the
+counts moved. Add `--top-k 5 --retrieval vector` to reproduce the original numbers
+exactly.
 
 Expected from `eval`: 3 questions, retrieval hit 100%, expected item cited 100%,
 mean score ~1.3/5 and point coverage 22–40% — the last two are *low on purpose*,
@@ -1323,3 +1701,133 @@ quality score would have told them apart.
 spent 31,097 prompt + 2,172 completion tokens answering and a further 24,234
 grading — grading is ~42% of the bill. Conflating the two under one "tokens"
 figure would have hidden that, which is why `judge_tokens` is its own field.
+
+### 14.9 `generate-questions` as built and verified (§11.3.2)
+
+Verified live against the indexed `Networking` store (16 documents, 1,186 chunks):
+
+| Check | Result |
+|---|---|
+| `--dry-run` | listed all 16 documents with chunk and character counts, estimated **97,780 prompt tokens**, wrote nothing, made no model call |
+| Estimate accuracy | the real run spent **106,222** prompt tokens — the dry run was within 8%, so it is usable for deciding whether to proceed |
+| Generation | **48 questions from 16 documents** (3 each), 106,222 prompt + 7,507 completion tokens, 129s |
+| Head-and-tail sampling | 12 documents exceeded the 30,000-character budget and were sampled, reported in the summary |
+| `eval` on the generated set, **unedited** | ran all 48: mean **2.08/5**, retrieval hit **81%**, expected item cited **73%**, coverage **61.6%**, 4 perfect / 5 good / 30 partial / 3 wrong / 6 no answer |
+| Comparable to the hand-written set | the 21-question hand-written set scored 1.81 / 86% / 76% / 53% — close enough on every metric that neither set looks anomalous, which is the mutual validation worth having |
+| Overwrite refusal | an existing `questions.yaml` is refused with `--force` named, **before** any generation call; the file is left byte-identical |
+| Failure isolation | a document whose generation fails is named in the summary and the run still writes the rest |
+| Round-trip guarantee | the written file is re-parsed by `load_questions` before the command returns |
+| Regression | 389 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**Question quality is better than expected, and independently checkable.** The
+generated `zhang-2020-1` — "What problem does CFR-RL address in traffic engineering
+and how does it propose to solve it?" — is very nearly the hand-written `cfr-rl-1`
+of §12.2, arrived at independently from the same paper. That correspondence is the
+strongest evidence available that the generator is asking about main points rather
+than trivia.
+
+**Two ugly ids, found by running it and fixed.** Both were in the derived question
+ids, which matter because `--only` takes them:
+
+- `Fröhlich` became **`fr-hlich`**: the slug regex stripped the `ö` as a
+  non-ASCII character and left a gap. Now the name is NFKD-decomposed and its
+  combining marks dropped, so it slugs to `frohlich`.
+- A title-derived stem was cut mid-word at 32 characters —
+  **`traffic-engineering-with-reinfor`**. Now trimmed back to the last word
+  boundary, giving `traffic-engineering-with`.
+
+**The generator will faithfully write questions about a worthless document.** All
+three questions generated from `KJFG9YUE` — the saved Bing search page of §12.2 —
+were retrieval misses in the evaluation, because a search-results page has nothing
+the rest of the corpus can answer about. Nothing malfunctioned: the command
+generated from what was indexed, and evaluation then correctly reported those
+questions as unanswered. It is a clean demonstration of why the output is a draft
+to review, and `--only-item` is the tool for excluding such documents up front. It
+is also an argument for the M9 `status` command: junk in a collection is easier to
+notice when something lists what was indexed.
+
+### 14.10 Windowed retrieval as built and measured (§11.4.1)
+
+Verified live against the indexed `Networking` store (16 documents, 1,186 chunks),
+nine `eval` runs over the 21-question set of §12.2.
+
+| Check | Result |
+|---|---|
+| Mechanism | `--top-k 2 --window 1` expanded 2 hits to 4 chunks and answered correctly with CFR-RL's `r = 1/U` reward, citing p. 3 |
+| `window: 0` is byte-identical to the pre-M7 path | the hits are returned untouched; no store call is made at all |
+| Dedup | two adjacent hits with overlapping windows emit each chunk once |
+| Page-boundary crossing | a hit on the first chunk of page 2 pulls the last chunk of page 1 — the one join `chunk_overlap` does not cover |
+| Distances survive | the refetched copy of a hit is replaced by the retrieved object, so `Source.distance` is still populated |
+| Recorded in the report | `retrieval_window` appears in `settings`, and the summary line reads `vector ±2 retrieval` |
+| **Quality verdict** | **rejected as a default** — every windowed run is dominated by or tied with a cheaper non-windowed one (§11.4.1) |
+| Regression | 406 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**What made the verdict trustworthy rather than a coin flip.** The comparison that
+mattered was not "does windowing help?" — it does, at `window: 2` — but "does it
+help more than spending the same tokens on `top_k`?" Answering that needed the
+non-windowed configurations at matched cost, so `top_k` 20 and 30 were measured too.
+Without those two runs the honest conclusion would have been "windowing improves
+quality at 3× the cost", which is true and tells nobody what to do. §11.3.1's noise
+floor did the rest of the work: it is what licenses calling a 1.8-point coverage gap
+a tie instead of a result.
+
+**A bug this work fixed in passing.** `VectorStore.get_by_attachment()` sorted its
+chunks by *id string*, so page 10 came back before page 2 and an attachment was
+handed to the caller scrambled. Nothing depended on the order before — its callers
+wanted a single chunk or built a dict — but windowed retrieval does, and so did
+`generate-questions`, which had quietly needed its own numeric sort. Both now share
+`reading_order_key()` in `vectorstore.py` and the duplicate is gone.
+
+**The cost of a rejected feature was ~9 eval runs and one afternoon**, which is the
+argument for M6 restated: the alternative was shipping `retrieval_window: 2` as a
+default because the mechanism is elegant and one answer looked better.
+
+### 14.11 Hybrid retrieval as built and measured (§11.4.2)
+
+Verified live against the indexed `Networking` store (16 documents, 1,186 chunks),
+five `eval` runs across two question sets.
+
+| Check | Result |
+|---|---|
+| Fusion engages | `-v` reports `hybrid: 20 vector + 20 keyword candidate(s) fused to 3` |
+| Keyword index built once per process | monkeypatched counter proves one build for a multi-question `eval`; `vector` mode builds none at all |
+| Build cost | **0.21s for 1,186 chunks** (0.10s reading Chroma, 0.11s tokenizing + BM25) |
+| Acronym query end to end | `--retrieval hybrid` answered "¿Qué es rEDKSP?" citing Jellyfish pp. 6 and 9 — as did vector, so this one was never the differentiator |
+| **Quality verdict** | **accepted** — better on both sets at nil token cost; citation rate 81% → 95% at `top_k: 10` (§11.4.2) |
+| Default changed | `retrieval: hybrid` shipped; a test pins the packaged default so it cannot drift back silently |
+| No degenerate retrievals | across all hybrid runs, no row retrieved zero chunks and none under-filled `top_k` |
+| Regression | 442 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**A bug the tests caught before any user could.** The first implementation filtered
+BM25 results on `score > 0`, on the reasoning that a zero score means the chunk holds
+no query term. That reasoning is wrong. `rank_bm25` uses the Robertson–Sparck-Jones
+IDF, `log(N − df + 0.5) − log(df + 0.5)`, which is **exactly zero when a term appears
+in half the documents** and negative above that. So a genuine match can score zero —
+reliably on a small store, where `df = N/2` is easy to hit — and a two-chunk test
+corpus made `search("fog")` return nothing at all. The filter now tests token
+presence directly, with the token sets kept per chunk for the purpose. Worth
+recording because the wrong version would have looked perfectly healthy on the
+1,186-chunk store and quietly failed for anyone with a small collection.
+
+**Why two question sets earned their keep.** Hybrid moved retrieval hit rate by nine
+points on the generated set and not at all on the hand-written one. Neither number is
+wrong: generated questions echo the vocabulary of the paper they were written from,
+which is what BM25 matches, while hand-written questions are paraphrases, which is
+where dense retrieval already wins and BM25 has nothing to add. One set alone would
+have supported either "hybrid transforms retrieval" or "hybrid does nothing for
+retrieval", and both would have been overclaims.
+
+**Windowing and hybrid, side by side**, since they were assessed the same way and
+came out opposite:
+
+| | windowing (`window: 2`) | hybrid |
+|---|---|---|
+| Token cost | 2–3× | ~1.0× |
+| Retrieval hit rate | cannot change it, by construction | +9 points where terms are distinctive |
+| Citation rate | −5 points at `top_k: 5` | +14 points at `top_k: 10` |
+| Beaten by spending the same tokens on `top_k`? | yes | there are no tokens to respend |
+| Outcome | kept, off by default | **default** |
+
+The asymmetry is the lesson: windowing elaborates documents already found, hybrid
+changes *which* documents are found. Only the second can move the metric that was
+actually binding.

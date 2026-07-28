@@ -21,7 +21,25 @@ index:
 
     chunk_size: 1000 # characters
     chunk_overlap: 200 # characters
-    top_k: 5
+    # Passages retrieved per question. 10 rather than 5 because every measured metric
+    # improved — mean score 1.81 -> 2.38, retrieval hit 86% -> 95% — for roughly 1.9x
+    # the tokens per query. Returns flatten by 20 and stop entirely past it. Lower it
+    # to 5 if cost matters more than accuracy for your questions.
+    top_k: 10
+    # Neighbouring chunks pulled in either side of each hit, in reading order, so a
+    # claim arrives with the sentences that give it meaning. 0 disables it. Raising
+    # it multiplies the passages sent to the model, so measure with `eval` first.
+    retrieval_window: 0
+    # vector = embeddings only. hybrid also runs a BM25 keyword search and fuses the
+    # two rankings, which helps where embeddings are weakest: acronyms, author names
+    # and exact phrases. Query-time only — switching it needs no re-indexing.
+    #
+    # hybrid is the default because it measured better on two independent question
+    # sets for no extra tokens. It pays off most with top_k >= 10: at top_k 5 roughly
+    # half the slots go to each retriever, which can push out a passage the vectors
+    # had ranked well. Set `vector` to skip building the keyword index, which costs
+    # ~0.2s per 1,000 chunks at start-up.
+    retrieval: hybrid
     temperature: 0.0
 
     # Which attachment wins when an item has several readable ones. Many items
@@ -53,3 +71,11 @@ eval:
     # Characters of retrieved context handed to the optional --assess-context
     # pass, so a large top_k cannot overflow the judge's window.
     context_char_budget: 12000
+
+    # `generate-questions`: writes a starting questions.yaml from the indexed
+    # documents themselves. null => use the answering model.
+    generator_model: null
+    questions_per_document: 3
+    # Characters of each document shown to the generator. A paper longer than this
+    # is sampled head-and-tail, so the conclusions arrive with the abstract.
+    document_char_budget: 30000

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from zotero_rag.documents import LocatorKind
 from zotero_rag.embedding import count_tokens
 from zotero_rag.llm import LLMError, message_text, usage_from_message
+from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
 from zotero_rag.vectorstore import StoredChunk, VectorStore
 
 logger = logging.getLogger(__name__)
@@ -115,7 +116,11 @@ class QueryResult(BaseModel):
     answer: str
     sources: list[Source] = Field(default_factory=list)
     usage: Usage = Field(default_factory=Usage)
+    #: Passages similarity search returned — the `top_k` hits.
     chunks_retrieved: int = 0
+    #: Passages actually put in front of the model. Larger than `chunks_retrieved`
+    #: when windowed retrieval pulled in neighbours (§11.4).
+    chunks_in_context: int = 0
 
 
 _CITATION_MARKER = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
@@ -187,6 +192,64 @@ def collect_sources(chunks: list[StoredChunk]) -> tuple[list[Source], list[int]]
     return sources, numbers
 
 
+def expand_window(store: VectorStore, hits: list[StoredChunk], window: int) -> list[StoredChunk]:
+    """Add each hit's ±`window` neighbours in reading order (PRD §11.4).
+
+    A 1,000-character chunk can easily cut a claim from the sentence that gives it
+    meaning — "this reduces delay by 13.73%" is far less useful without the chunk
+    that says what *this* is. Windowing hands the model the neighbourhood of every
+    hit instead of the hit alone.
+
+    Neighbours are taken across the whole **attachment**, not just within the page
+    or section the hit sits in. That matters more than it sounds: `chunk_overlap`
+    already stitches consecutive chunks *inside* one segment together, but segments
+    are chunked independently, so a page or section boundary is the one place in the
+    store where no overlap exists at all. Restricting the window to a single segment
+    would therefore miss the only join that is genuinely unbridged.
+
+    A chunk is emitted once even when two nearby hits both claim it, and the
+    retrieved object is preferred over the refetched one so its similarity distance
+    survives. `window <= 0` returns the hits untouched, which is the pre-M7 path.
+
+    Cost is one `get()` per distinct attachment among the hits — no embedding calls,
+    no new storage. It fetches whole attachments, which is fine at this scale; a
+    store with very long documents would want the ids narrowed first.
+    """
+    if window <= 0 or not hits:
+        return list(hits)
+
+    attachments = {_text(hit.metadata, "attachment_key") for hit in hits}
+    ordered: dict[str, list[StoredChunk]] = {
+        key: store.get_by_attachment(key) for key in attachments if key
+    }
+    positions = {
+        key: {chunk.id: index for index, chunk in enumerate(sequence)}
+        for key, sequence in ordered.items()
+    }
+    # Hits carry the distance; the refetched copies do not.
+    by_id = {hit.id: hit for hit in hits}
+
+    expanded: list[StoredChunk] = []
+    emitted: set[str] = set()
+    for hit in hits:
+        key = _text(hit.metadata, "attachment_key")
+        sequence = ordered.get(key, [])
+        index = positions.get(key, {}).get(hit.id)
+        # An unplaceable hit (no attachment key, or a store written oddly) still
+        # reaches the model; it simply gets no neighbours.
+        neighbourhood = (
+            sequence[max(0, index - window) : index + window + 1] if index is not None else [hit]
+        )
+        for chunk in neighbourhood:
+            if chunk.id in emitted:
+                continue
+            emitted.add(chunk.id)
+            expanded.append(by_id.get(chunk.id, chunk))
+
+    logger.info("windowed retrieval: %d hit(s) expanded to %d chunk(s)", len(hits), len(expanded))
+    return expanded
+
+
 def build_context(chunks: list[StoredChunk], numbers: list[int], sources: list[Source]) -> str:
     """Render the retrieved passages as numbered, attributed blocks.
 
@@ -214,8 +277,20 @@ def answer_question(
     embed_query: QuestionEmbedder,
     answer: Answerer,
     top_k: int,
+    window: int = 0,
+    mode: RetrievalMode = "vector",
+    keyword_index: KeywordIndex | None = None,
 ) -> QueryResult:
     """Retrieve `top_k` chunks for the question and have the LLM answer from them.
+
+    With `window` above zero, each hit arrives with its neighbours (§11.4). A
+    neighbour on another page becomes its own numbered source rather than being
+    folded into the hit's: the text really is on that page, and citing where it
+    actually sits is more honest than attributing it to the page next door.
+
+    With `mode="hybrid"` and a `keyword_index`, BM25 hits are fused with the vector
+    hits before the cut (§11.4.2). Windowing then applies to whatever survived, so
+    the two levers compose.
 
     With nothing retrieved, no LLM call is made: an empty context can only
     produce "I don't know", and saying so costs nothing.
@@ -223,11 +298,12 @@ def answer_question(
     start = time.perf_counter()
 
     embedding = embed_query(question)
-    chunks = store.query(embedding, top_k)
+    hits = retrieve(store, embedding, question, top_k, mode, keyword_index)
+    chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
     usage = Usage(embedding_tokens=count_tokens([question]))
 
-    if not chunks:
+    if not hits:
         logger.info("no chunks retrieved for %r", question)
         usage.elapsed_s = time.perf_counter() - start
         return QueryResult(question=question, answer=NO_CONTEXT_ANSWER, usage=usage)
@@ -259,5 +335,6 @@ def answer_question(
         answer=text,
         sources=sources,
         usage=usage,
-        chunks_retrieved=len(chunks),
+        chunks_retrieved=len(hits),
+        chunks_in_context=len(chunks),
     )

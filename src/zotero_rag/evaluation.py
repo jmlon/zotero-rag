@@ -761,12 +761,14 @@ class RunSettings(BaseModel):
     embedding_model: str = ""
     judge_model: str = ""
     top_k: int = 0
+    #: Neighbours fetched either side of each hit (§11.4). 0 is plain retrieval.
+    retrieval_window: int = 0
     chunk_size: int = 0
     chunk_overlap: int = 0
     temperature: float = 0.0
     judge_temperature: float = 0.0
-    #: Vector retrieval only until M7 adds alternatives; recorded now so a later
-    #: report cannot be mistaken for one produced by this path.
+    #: `vector` or `hybrid` (§11.4.2). Recorded so a fused run cannot be mistaken
+    #: for a plain one when two reports are compared.
     retrieval: str = "vector"
     reranker: str | None = None
     questions_file: str = ""
@@ -775,7 +777,12 @@ class RunSettings(BaseModel):
 
 
 def run_settings(
-    config: Config, store: VectorStore, top_k: int, questions_path: Path
+    config: Config,
+    store: VectorStore,
+    top_k: int,
+    questions_path: Path,
+    window: int = 0,
+    mode: str = "vector",
 ) -> RunSettings:
     """Snapshot the settings behind a run."""
     return RunSettings(
@@ -785,6 +792,8 @@ def run_settings(
         embedding_model=config.embedding_model,
         judge_model=config.judge_model,
         top_k=top_k,
+        retrieval_window=window,
+        retrieval=mode,
         chunk_size=config.index.chunk_size,
         chunk_overlap=config.index.chunk_overlap,
         temperature=config.index.temperature,

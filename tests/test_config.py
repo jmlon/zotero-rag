@@ -32,7 +32,11 @@ def test_packaged_defaults_match_the_prd() -> None:
     config = Config.model_validate(packaged_defaults())
     assert config.index.chunk_size == 1000
     assert config.index.chunk_overlap == 200
-    assert config.index.top_k == 5
+    # Retrieval defaults are the ones M7 measured (§11.4.1, §11.4.2); pinned here so
+    # they cannot drift back to the unmeasured PoC values unnoticed.
+    assert config.index.top_k == 10
+    assert config.index.retrieval == "hybrid"
+    assert config.index.retrieval_window == 0
     assert config.global_.zotero_library_type == "user"
     assert config.global_.defaults.vector_db == "chroma"
     assert config.global_.defaults.reranker is None

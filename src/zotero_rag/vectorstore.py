@@ -37,6 +37,23 @@ class VectorStoreError(ZoteroRagError):
     """The vector store could not be opened or written."""
 
 
+def reading_order_key(chunk: StoredChunk) -> tuple[str, int, int]:
+    """Where a chunk sits in its document: attachment, locator ordinal, chunk index.
+
+    Chunk ids are `<attachment_key>:<locator>:<chunk_index>`, so sorting the *ids*
+    as strings puts page 10 before page 2 and hands the reader a scrambled document.
+    Reading order has to come from the numeric metadata instead.
+    """
+
+    def number(field: str) -> int:
+        try:
+            return int(str(chunk.metadata.get(field)))
+        except (TypeError, ValueError):
+            return 0
+
+    return str(chunk.metadata.get("attachment_key") or ""), number("page"), number("chunk_index")
+
+
 class VectorStore:
     """Thin wrapper over one persistent Chroma collection."""
 
@@ -90,9 +107,9 @@ class VectorStore:
             raise VectorStoreError(f"Cannot write to the vector store: {exc}") from exc
 
     def get_by_attachment(self, attachment_key: str) -> list[StoredChunk]:
-        """Every stored chunk belonging to one attachment, ordered by id."""
+        """Every stored chunk of one attachment, in reading order."""
         found = self._collection.get(where={"attachment_key": attachment_key})
-        return sorted(self._to_chunks(found), key=lambda chunk: chunk.id)
+        return sorted(self._to_chunks(found), key=reading_order_key)
 
     def query(self, embedding: list[float], top_k: int) -> list[StoredChunk]:
         """The `top_k` nearest chunks to an embedded question."""

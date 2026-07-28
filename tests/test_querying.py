@@ -20,6 +20,7 @@ from zotero_rag.querying import (
     build_context,
     cited_numbers,
     collect_sources,
+    expand_window,
 )
 from zotero_rag.vectorstore import StoredChunk, VectorStore
 
@@ -269,3 +270,149 @@ def test_block_style_content_is_flattened_into_text() -> None:
         content=[{"type": "text", "text": "First. "}, {"type": "text", "text": "Second."}]
     )
     assert message_text(message) == "First. Second."
+
+
+# --- windowed retrieval (M7, §11.4) --------------------------------------
+
+
+def populate_document(store: VectorStore, pages: dict[int, list[str]]) -> None:
+    """Store a multi-page attachment: {page: [chunk text, ...]}.
+
+    The embedding encodes the page, so a query vector can select a known page.
+    """
+    ids, embeddings, documents, metadatas = [], [], [], []
+    for page, texts in pages.items():
+        for index, text in enumerate(texts):
+            ids.append(f"ATT1:{page}:{index}")
+            embeddings.append([float(page), float(index), 0.5])
+            documents.append(text)
+            metadatas.append(metadata(page=page, chunk_index=index))
+    store.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
+
+
+def test_a_window_of_zero_is_the_pre_m7_path(store: VectorStore) -> None:
+    populate_document(store, {1: ["a", "b", "c"]})
+    hits = [chunk("b", page=1, chunk_index=1)]
+    assert expand_window(store, hits, window=0) == hits
+
+
+def test_a_window_adds_the_neighbours_either_side(store: VectorStore) -> None:
+    populate_document(store, {1: ["first", "second", "third", "fourth"]})
+    hits = store.query([1.0, 1.0, 0.5], top_k=1)
+    assert [hit.text for hit in hits] == ["second"]
+
+    expanded = expand_window(store, hits, window=1)
+
+    # Reading order, not hit-first order: the model reads it as prose.
+    assert [c.text for c in expanded] == ["first", "second", "third"]
+
+
+def test_a_window_crosses_a_page_boundary(store: VectorStore) -> None:
+    """The one join with no `chunk_overlap` to stitch it: segments are chunked apart."""
+    populate_document(store, {1: ["p1c0", "p1c1"], 2: ["p2c0", "p2c1"]})
+    hits = [chunk("p2c0", page=2, chunk_index=0)]
+
+    expanded = expand_window(store, hits, window=1)
+
+    assert [c.text for c in expanded] == ["p1c1", "p2c0", "p2c1"]
+
+
+def test_a_window_stops_at_the_edges_of_the_document(store: VectorStore) -> None:
+    populate_document(store, {1: ["only", "second"]})
+    hits = [chunk("only", page=1, chunk_index=0)]
+    assert [c.text for c in expand_window(store, hits, window=5)] == ["only", "second"]
+
+
+def test_overlapping_windows_emit_each_chunk_once(store: VectorStore) -> None:
+    """Two adjacent hits would otherwise repeat the same text in the prompt."""
+    populate_document(store, {1: ["a", "b", "c", "d", "e"]})
+    hits = [chunk("b", page=1, chunk_index=1), chunk("c", page=1, chunk_index=2)]
+
+    expanded = expand_window(store, hits, window=1)
+
+    assert [c.text for c in expanded] == ["a", "b", "c", "d"]
+    assert len({c.id for c in expanded}) == len(expanded)
+
+
+def test_a_window_does_not_reach_into_another_attachment(store: VectorStore) -> None:
+    """Neighbours are only neighbours within one document."""
+    store.add(
+        ids=["ATT1:1:0", "ATT2:1:0"],
+        embeddings=[[1.0, 0.0, 0.5], [2.0, 0.0, 0.5]],
+        documents=["from one", "from two"],
+        metadatas=[metadata(attachment_key="ATT1"), metadata(attachment_key="ATT2")],
+    )
+    hits = [chunk("from one", attachment_key="ATT1", page=1)]
+    assert [c.text for c in expand_window(store, hits, window=3)] == ["from one"]
+
+
+def test_the_hit_keeps_its_similarity_distance(store: VectorStore) -> None:
+    """Refetched neighbours have no distance; the hit's must survive the expansion."""
+    populate_document(store, {1: ["a", "b", "c"]})
+    hits = store.query([1.0, 1.0, 0.5], top_k=1)
+    hit_id = hits[0].id
+
+    expanded = expand_window(store, hits, window=1)
+
+    by_id = {c.id: c for c in expanded}
+    assert by_id[hit_id].distance == hits[0].distance
+    assert by_id[hit_id].distance is not None
+
+
+def test_an_unplaceable_hit_still_reaches_the_model(store: VectorStore) -> None:
+    """A chunk with no attachment key gets no neighbours, but is not dropped."""
+    orphan = StoredChunk(id="X:1:0", text="orphaned", metadata={"page": 1})
+    assert expand_window(store, [orphan], window=2) == [orphan]
+
+
+def test_windowing_reports_both_counts(store: VectorStore) -> None:
+    populate_document(store, {1: ["alpha", "beta", "gamma"]})
+
+    result = answer_question(
+        "why?",
+        store=store,
+        embed_query=lambda _: [1.0, 1.0, 0.5],
+        answer=lambda _: reply(),
+        top_k=1,
+        window=1,
+    )
+
+    # `top_k` still bounds the hits; the context is what grew.
+    assert result.chunks_retrieved == 1
+    assert result.chunks_in_context == 3
+
+
+def test_windowing_puts_the_neighbour_text_in_the_prompt(store: VectorStore) -> None:
+    populate_document(store, {1: ["the preceding sentence", "the hit", "the following one"]})
+    seen: list[str] = []
+
+    def answer(messages: list[BaseMessage]) -> AIMessage:
+        seen.append(str(messages[-1].content))
+        return reply()
+
+    answer_question(
+        "why?",
+        store=store,
+        embed_query=lambda _: [1.0, 1.0, 0.5],
+        answer=answer,
+        top_k=1,
+        window=1,
+    )
+
+    assert "the preceding sentence" in seen[0]
+    assert "the following one" in seen[0]
+
+
+def test_a_neighbour_on_another_page_becomes_its_own_source(store: VectorStore) -> None:
+    """Citing the page the text is really on beats attributing it to the next one."""
+    populate_document(store, {1: ["page one tail"], 2: ["page two head"]})
+    hits = [chunk("page two head", page=2, chunk_index=0)]
+
+    sources, _ = collect_sources(expand_window(store, hits, window=1))
+
+    assert [source.page for source in sources] == [1, 2]
+    assert [source.locator for source in sources] == ["p. 1", "p. 2"]
+
+
+def test_windowing_leaves_an_empty_retrieval_alone(store: VectorStore) -> None:
+    assert expand_window(store, [], window=2) == []

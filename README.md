@@ -30,8 +30,9 @@ Sources
 Questions may be asked in any language, whatever language the papers are in.
 
 There is also a `zotero-rag eval` command that scores the index against a set of
-questions you write, so "does a bigger `top_k` help?" has a number for an answer
-instead of an impression.
+questions, so "does a bigger `top_k` help?" has a number for an answer instead of
+an impression — and `zotero-rag generate-questions` will draft that set from the
+papers you have already indexed.
 
 ## Requirements
 
@@ -191,6 +192,8 @@ ordinary index run would be a poor surprise.
 ```bash
 zotero-rag query "What makes an abstract effective?"
 zotero-rag query "..." --top-k 10        # retrieve more passages
+zotero-rag query "..." --window 2        # also send each hit's neighbours
+zotero-rag query "..." --retrieval vector # embeddings only, no keyword search
 zotero-rag query "..." --show-sources    # print the full text of each passage
 zotero-rag query "..." --json            # machine-readable answer/sources/usage
 zotero-rag query "..." -v                # prompt and completion token counts
@@ -203,8 +206,30 @@ inventing an answer — that is the point of the citations.
 ### 5. Measure it, before you tune it
 
 Whether a larger `top_k`, a different chunk size, or another embedding model
-actually helps is a question with a number for an answer. Write a `questions.yaml`
-beside your `config.yaml`:
+actually helps is a question with a number for an answer. You need a set of
+questions to measure against — and you can have the tool draft one from the papers
+it has already indexed:
+
+```bash
+zotero-rag generate-questions --dry-run    # what it would read, and the token cost
+zotero-rag generate-questions              # writes questions.yaml
+zotero-rag generate-questions --language Spanish --per-document 5
+zotero-rag generate-questions --only-item TR6MHCJ2   # try one paper first
+```
+
+That writes three questions per indexed document, each with a reference answer,
+the points a correct answer should make, and — the useful part — the exact Zotero
+item the text came from, so retrieval can be scored against the right paper without
+you looking any keys up. It will not overwrite an existing set unless you pass
+`--force`.
+
+**Read the result and edit it.** Every question is written from one document, so the
+set measures whether retrieval can find that document; it won't test pulling an
+answer together from four papers, and it can't ask something your library doesn't
+answer. It is a good floor, not a substitute for the questions you actually care
+about. Adding your own to the same file is the point.
+
+Or write one by hand, beside your `config.yaml`:
 
 ```yaml
 questions:
@@ -234,10 +259,53 @@ they separate "retrieval never found the paper" from "retrieval found it and the
 answer ignored it", and those have different fixes.
 
 Two ready-made sets live in `questions/` — a 3-question `Writing` smoke test and a
-21-question `Networking` set. On the latter, `top_k: 10` measurably beats the
-default of 5 (mean score 2.38 vs 1.81, retrieval hit 95% vs 86%) for about 1.5× the
-tokens. A 3-question set, by contrast, turned out too small to resolve any such
-difference — if you write your own, aim for twenty rather than three.
+21-question `Networking` set. A 3-question set turned out too small to resolve any
+difference at all, so if you write your own, aim for twenty rather than three.
+
+### What the measurements actually said
+
+Everything below came out of `eval` on the 21-question set, and is why the defaults
+are what they are:
+
+- **`top_k: 10` is the default because it clearly beat 5**: mean score 2.38 vs 1.81,
+  retrieval hit 95% vs 86%, for about 1.9× the tokens per query. Set it back to `5`
+  if you would rather have the cheaper query.
+- **Past 20 it stops paying.** 10 → 20 gains a little; 20 → 30 gains nothing at all
+  while costing 50% more.
+- **`retrieval: hybrid` is on by default because it won, for free.** Adding a BM25
+  keyword search alongside the vector search and merging the two rankings raised the
+  share of answers citing the right paper from 81% to **95%**, and found the right
+  paper for 9% more questions on a second question set — while costing the same
+  tokens, because it changes *which* passages are sent, not how many. It helps most
+  where embeddings are weakest: acronyms, author names, exact phrases. Set
+  `retrieval: vector` to turn it off, which also skips building the keyword index
+  (about 0.2s per 1,000 chunks at start-up).
+- **Hybrid wants `top_k: 10` or more.** At `top_k: 5` roughly half the slots go to
+  each retriever, so you keep only two or three vector hits — enough that one test
+  question lost the passage it needed and honestly answered "I don't know" instead.
+- **`retrieval_window` is off by default because it lost.** Sending each hit's
+  neighbours does improve answers at `--window 2` — but spending those same tokens
+  on a larger `top_k` improves them more. At every budget tested, a plain run beat
+  or matched the windowed one. It is kept because a library with smaller chunks or
+  longer documents could come out differently, and one `eval --window 2` will tell
+  you. The reason it loses is structural: a neighbour is always from a document you
+  already retrieved, so windowing cannot help you find a paper you missed.
+
+The shipped defaults are now that best-measured combination — `top_k: 10` with hybrid
+retrieval — rather than the untested values the tool started life with.
+
+**Upgrading an existing index folder?** Your `config.yaml` was written when you ran
+`init`, and its values win over the built-in defaults, so an older folder keeps
+whatever it says — usually `top_k: 5`. To pick up the new default, edit that one line.
+Settings your file does not mention at all, such as `retrieval`, are inherited
+automatically.
+
+```bash
+zotero-rag eval --top-k 10                 # compare against your current setting
+zotero-rag eval --retrieval vector         # what hybrid is buying you
+zotero-rag eval --window 2                 # is windowing worth it for your library?
+zotero-rag query "..." --top-k 10
+```
 
 Note that grading costs tokens too — roughly 40% of a run's bill — so `eval`
 reports the judge's usage as its own figure rather than folding it in.
@@ -248,7 +316,9 @@ Edit the `config.yaml` in the index folder. Useful settings:
 
 | setting | default | what it does |
 |---|---|---|
-| `top_k` | `5` | passages retrieved per question |
+| `top_k` | `10` | passages retrieved per question; `5` is cheaper, `20` is not better |
+| `retrieval_window` | `0` | also send N neighbouring chunks either side of each hit |
+| `retrieval` | `hybrid` | `vector` (embeddings only) or `hybrid` (also BM25 keyword search) |
 | `attachment_preference` | `[pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several |
 | `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
 | `index_notes` | `true` | index your Zotero notes alongside each item's file |
@@ -258,6 +328,8 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `embedding_model` | `openai/text-embedding-3-small` | any OpenRouter embedding slug |
 | `eval.questions_file` | `questions.yaml` | golden set used by `eval` |
 | `eval.judge_model` | `null` | grading model; `null` means the answering model |
+| `eval.questions_per_document` | `3` | questions `generate-questions` writes per document |
+| `eval.document_char_budget` | `30000` | characters of each document shown to the generator |
 
 Changing `chunk_size` or `chunk_overlap` only affects newly indexed attachments —
 existing chunks keep the shape they were given. `index --force` rebuilds them all.
@@ -300,8 +372,14 @@ This is a proof of concept, and deliberately narrow:
 - **A saved web page is only as good as what was saved.** Snapshots of paywalled
   articles are usually the abstract page, not the full text.
 - **Your own library only** — group libraries are not supported yet.
-- Retrieval is plain vector similarity — no reranking, no hybrid search, no
-  metadata filters at query time.
+- Retrieval combines vector similarity with BM25 keywords, but there is **no
+  reranking and no metadata filtering** at query time yet. There is no diversity
+  constraint either, so a single well-matched paper can occupy every slot and crowd
+  out the one you wanted — and a question with no distinctive wording ("what
+  methodology did the authors use?") can miss its paper no matter how many passages
+  you retrieve.
+- The keyword index is rebuilt each time the tool starts, so on a very large store
+  `query` pays a second or two before answering. `retrieval: vector` avoids it.
 - **Everything is remote per call:** no batching or concurrency yet, so a large
   collection indexes at a steady but unhurried pace.
 

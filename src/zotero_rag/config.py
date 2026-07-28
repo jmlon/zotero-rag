@@ -97,7 +97,17 @@ class IndexConfig(BaseModel):
 
     chunk_size: int = Field(default=1000, gt=0)
     chunk_overlap: int = Field(default=200, ge=0)
-    top_k: int = Field(default=5, gt=0)
+    #: 10 since 0.4.4. Measured: every metric improved from 5 to 10 in both
+    #: retrieval modes on both question sets, and the returns stop by 20 (§11.4.1).
+    top_k: int = Field(default=10, gt=0)
+    #: Neighbouring chunks fetched either side of each hit (M7, §11.4). 0 disables
+    #: windowing, which is the pre-M7 behaviour.
+    retrieval_window: int = Field(default=0, ge=0)
+    #: `hybrid` fuses BM25 keyword hits with the vector hits (M7, §11.4.2). It is a
+    #: query-time choice only — no re-indexing, and the store is untouched. The
+    #: default because it measured better on two independent question sets at no
+    #: token cost; `vector` remains available and is faster to start on a huge store.
+    retrieval: Literal["vector", "hybrid"] = "hybrid"
     temperature: float = Field(default=0.0, ge=0.0)
 
     # Which attachment to index when an item offers several readable ones. Roughly
@@ -146,6 +156,15 @@ class EvalConfig(BaseModel):
     #: many characters, so a large `top_k` cannot overflow the judge's window.
     context_char_budget: int = Field(default=12000, gt=0)
 
+    # --- `generate-questions` (§11.3.2) ---
+    #: null => generate with the answering model.
+    generator_model: str | None = None
+    questions_per_document: int = Field(default=3, gt=0)
+    #: Characters of each document shown to the generator. A long paper is
+    #: sampled head-and-tail rather than merely truncated, so the conclusions
+    #: reach the model along with the abstract.
+    document_char_budget: int = Field(default=30000, gt=0)
+
 
 class Config(BaseModel):
     """The merged configuration for a run."""
@@ -167,6 +186,11 @@ class Config(BaseModel):
     def judge_model(self) -> str:
         """The grading model: the configured one, else whatever answers."""
         return self.eval.judge_model or self.llm_model
+
+    @property
+    def generator_model(self) -> str:
+        """The question-writing model: the configured one, else whatever answers."""
+        return self.eval.generator_model or self.llm_model
 
     @property
     def embedding_model(self) -> str:
