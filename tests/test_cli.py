@@ -7,6 +7,7 @@ These never reach the network: `load_env` is neutralised so a developer's real
 from __future__ import annotations
 
 import json
+import logging
 from io import StringIO
 from pathlib import Path
 
@@ -84,6 +85,36 @@ def test_index_summary_reports_items_seen(tmp_path: Path) -> None:
     text = out.getvalue()
     assert "Indexed 4 PDFs" in text
     assert "6 items seen in 1 collection" in text
+
+
+@pytest.fixture
+def pypdf_logger() -> logging.Logger:
+    """The pypdf logger, reset so the assertion cannot depend on test order."""
+    logger = logging.getLogger("pypdf")
+    logger.setLevel(logging.WARNING)
+    return logger
+
+
+def test_pypdf_recovery_chatter_is_hidden_by_default(
+    pypdf_logger: logging.Logger, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """pypdf warns and recovers on malformed files; that noise broke the progress bar."""
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(cli.app, ["index", "--dry-run"])
+    assert not pypdf_logger.isEnabledFor(logging.WARNING)
+
+
+@pytest.mark.parametrize("arguments", [["-v", "index", "--dry-run"], ["index", "-v", "--dry-run"]])
+def test_verbose_brings_back_pypdf_warnings(
+    arguments: list[str],
+    pypdf_logger: logging.Logger,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Suppression must be one flag away, wherever `-v` is given."""
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(cli.app, arguments)
+    assert pypdf_logger.isEnabledFor(logging.WARNING)
 
 
 def test_query_requires_a_question() -> None:

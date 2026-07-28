@@ -315,7 +315,14 @@ dimming the uncited ones. `--json` always carries all retrieved sources, each
 with a `cited` boolean.
 
 Chunks retrieved from the **same page of the same attachment** collapse into one
-numbered source, so a page is never listed twice.
+numbered source, so a page is never listed twice. Two pages of the *same* document
+remain two sources, because a citation names a page.
+
+Source numbers therefore stay tied to the passages as they were given to the
+model, which means the printed list can have **gaps** — an answer citing `[2]` and
+`[4]` lists only 2 and 4. This is deliberate: renumbering to 1..n would mean
+rewriting the markers inside the model's own text, which can only drift out of
+sync with what it wrote.
 
 ## 9. Dependencies
 
@@ -341,7 +348,12 @@ vector DB is `chromadb`); keep `pinecone` as a planned future milestone.
   items seen, attachments indexed, chunks written, skipped (by reason), failed.
 - **Logging:** standard `logging`; `-v/--verbose` reports elapsed time and token
   usage (embedding tokens for `index`, prompt/completion tokens for `query`).
-  Cost estimation is out of scope.
+  Cost estimation is out of scope. `-v` is accepted both before the subcommand and
+  on `index`/`query` themselves.
+  Third-party recovery chatter is suppressed below `ERROR` unless `-v` is given:
+  `pypdf` logs a warning for each quirk in a malformed file and then extracts the
+  page anyway, so those lines are not actionable and they interleave with the
+  progress bar. A page we genuinely cannot read is reported by us, not by pypdf.
 - **Type safety:** pydantic models for config and for the item/chunk/result
   structures; `ruff` and `mypy` (default strictness) must pass, run locally
   (`uv run ruff check . && uv run mypy`). Wiring them into CI is a future

@@ -65,6 +65,13 @@ app = typer.Typer(
 )
 
 
+# pypdf logs a warning for every quirk it finds in a malformed file ("Ignoring
+# wrong pointing object ...") and then recovers, so the page is still extracted.
+# Those messages are not actionable, and they interleave with the progress bar; a
+# page we genuinely cannot read is reported by `extraction.py` itself.
+NOISY_LOGGERS = ("pypdf",)
+
+
 def _setup_logging(verbose: bool) -> None:
     """Warnings and above by default; -v raises this package to INFO."""
     logging.basicConfig(
@@ -73,6 +80,14 @@ def _setup_logging(verbose: bool) -> None:
         handlers=[RichHandler(console=err_console, show_time=False, show_path=False)],
     )
     logging.getLogger("zotero_rag").setLevel(logging.INFO if verbose else logging.WARNING)
+    _set_noisy_logger_level(verbose)
+
+
+def _set_noisy_logger_level(verbose: bool) -> None:
+    """Hide third-party recovery chatter unless the user asked for detail."""
+    level = logging.WARNING if verbose else logging.ERROR
+    for name in NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
 
 
 # `-v` is accepted both before the subcommand (as a global flag) and on `index`
@@ -86,6 +101,7 @@ def _enable_verbose(verbose: bool) -> None:
     """Raise this package to INFO when a subcommand was given its own `-v`."""
     if verbose:
         logging.getLogger("zotero_rag").setLevel(logging.INFO)
+        _set_noisy_logger_level(True)
 
 
 def _version_callback(value: bool) -> None:
