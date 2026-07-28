@@ -1,0 +1,134 @@
+"""Reranking retrieved candidates before they reach the answering model (§11.4.3).
+
+Retrieval ranks by *similarity*; a reranker ranks by *relevance to this question*.
+A cross-encoder reads the question and each passage together, so it can tell that a
+passage merely on the same subject is not the one that answers what was asked — a
+judgement no embedding comparison can make, because the embedding was computed
+without knowing the question.
+
+It composes with everything upstream. Reranking consumes whatever the configured
+strategy produced — vector or hybrid — and runs *before* windowing, which is the only
+order that makes sense: a window's neighbours are context for a hit, not candidates
+in their own right, so they must be added to the selection the reranker has already
+made rather than competing in it.
+
+Cohere's hosted API is used rather than a local cross-encoder because a local one
+would mean `sentence-transformers` and PyTorch, which §9 forbids outright. Reaching
+it needs no new dependency either: `httpx` is already required (§14.7), and the API
+is one POST.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable, Sequence
+
+import httpx
+
+from zotero_rag.config import Config
+from zotero_rag.errors import ZoteroRagError
+from zotero_rag.vectorstore import StoredChunk
+
+logger = logging.getLogger(__name__)
+
+COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
+REQUEST_TIMEOUT_S = 30.0
+
+#: The reranking network seam: (question, documents, top_n) -> [(index, score), ...],
+#: best first, indices into `documents`.
+RerankFn = Callable[[str, list[str], int], list[tuple[int, float]]]
+
+
+class RerankError(ZoteroRagError):
+    """The reranker is misconfigured — a bad model name, or a rejected key."""
+
+
+def build_reranker(config: Config) -> RerankFn:
+    """A reranker calling Cohere. Requires the Cohere credential.
+
+    The credential is asserted here, at build time, so a misconfigured folder fails
+    before a single question is embedded rather than part-way through a run.
+    """
+    config.global_.require_cohere()
+    model = config.index.reranker_model
+    api_key = config.global_.cohere_api_key
+
+    def rerank(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        response = httpx.post(
+            COHERE_RERANK_URL,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            json={
+                "model": model,
+                "query": question,
+                "documents": documents,
+                "top_n": min(top_n, len(documents)),
+            },
+            timeout=REQUEST_TIMEOUT_S,
+        )
+        # A 4xx is a configuration fault — an unknown model, a rejected key, a
+        # malformed request — and it will fail identically for every remaining
+        # question. Raising beats degrading silently 21 times in a row.
+        if 400 <= response.status_code < 500:
+            raise RerankError(
+                f"Cohere rejected the rerank request for model {model!r} "
+                f"(HTTP {response.status_code}): {response.text[:200]}"
+            )
+        response.raise_for_status()
+
+        results = response.json().get("results") or []
+        return [
+            (int(entry["index"]), float(entry.get("relevance_score", 0.0)))
+            for entry in results
+            if "index" in entry
+        ]
+
+    return rerank
+
+
+def candidate_count(top_k: int, fanout: int) -> int:
+    """How many candidates to retrieve so the reranker has something to choose from.
+
+    A reranker handed exactly `top_k` candidates can only reorder them, which changes
+    nothing about *which* passages the model sees — and the ordering of a small
+    context matters far less than its contents. The gain comes from retrieving wider
+    and letting the reranker discard.
+    """
+    return max(top_k * max(fanout, 1), top_k)
+
+
+def apply_rerank(
+    candidates: Sequence[StoredChunk],
+    question: str,
+    top_k: int,
+    rerank: RerankFn | None,
+) -> tuple[list[StoredChunk], bool]:
+    """Reorder `candidates` by relevance and cut to `top_k`.
+
+    Returns the chunks and whether reranking actually applied. A transient failure
+    falls back to the retrieved order rather than losing the question (§10) — but it
+    is reported as *not* reranked, because a run that silently half-reranked would
+    make two `eval` reports incomparable while looking identical.
+
+    A misconfiguration (`RerankError`) is deliberately *not* caught here: it would
+    recur for every question, so the run should stop and say so.
+    """
+    ordered = list(candidates[:top_k])
+    if rerank is None or not candidates:
+        return ordered, False
+
+    try:
+        ranked = rerank(question, [chunk.text for chunk in candidates], top_k)
+    except RerankError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - transport and provider errors vary
+        logger.warning("reranking failed, keeping the retrieved order: %s", exc)
+        return ordered, False
+
+    picked = [candidates[index] for index, _ in ranked if 0 <= index < len(candidates)]
+    if not picked:
+        # A provider that answers 200 with nothing usable must not empty the context.
+        logger.warning("the reranker returned no usable result, keeping the retrieved order")
+        return ordered, False
+
+    logger.info("reranked %d candidate(s) down to %d", len(candidates), min(len(picked), top_k))
+    return picked[:top_k], True

@@ -18,6 +18,7 @@ from pydantic import BaseModel, Field
 from zotero_rag.documents import LocatorKind
 from zotero_rag.embedding import count_tokens
 from zotero_rag.llm import LLMError, message_text, usage_from_message
+from zotero_rag.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
 from zotero_rag.vectorstore import StoredChunk, VectorStore
 
@@ -121,6 +122,12 @@ class QueryResult(BaseModel):
     #: Passages actually put in front of the model. Larger than `chunks_retrieved`
     #: when windowed retrieval pulled in neighbours (§11.4).
     chunks_in_context: int = 0
+    #: Candidates retrieved before reranking cut them down (§11.4.3); equal to
+    #: `chunks_retrieved` when no reranker ran.
+    candidates_considered: int = 0
+    #: Whether reranking actually applied. False after a transient provider failure,
+    #: so a silently un-reranked run cannot pass for a reranked one.
+    reranked: bool = False
 
 
 _CITATION_MARKER = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
@@ -280,6 +287,8 @@ def answer_question(
     window: int = 0,
     mode: RetrievalMode = "vector",
     keyword_index: KeywordIndex | None = None,
+    rerank: RerankFn | None = None,
+    rerank_fanout: int = 4,
 ) -> QueryResult:
     """Retrieve `top_k` chunks for the question and have the LLM answer from them.
 
@@ -292,13 +301,22 @@ def answer_question(
     hits before the cut (§11.4.2). Windowing then applies to whatever survived, so
     the two levers compose.
 
+    With a `rerank`, `top_k × rerank_fanout` candidates are retrieved and the
+    reranker chooses the `top_k` best (§11.4.3). The order of the three stages is
+    fixed and deliberate: **retrieve wide → rerank → window**. Windowing last is what
+    keeps a hit's neighbours as context rather than letting them compete as
+    candidates, and reranking before the cut is what lets it discard rather than
+    merely reorder.
+
     With nothing retrieved, no LLM call is made: an empty context can only
     produce "I don't know", and saying so costs nothing.
     """
     start = time.perf_counter()
 
     embedding = embed_query(question)
-    hits = retrieve(store, embedding, question, top_k, mode, keyword_index)
+    depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
+    candidates = retrieve(store, embedding, question, depth, mode, keyword_index)
+    hits, reranked = apply_rerank(candidates, question, top_k, rerank)
     chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
     usage = Usage(embedding_tokens=count_tokens([question]))
@@ -337,4 +355,6 @@ def answer_question(
         usage=usage,
         chunks_retrieved=len(hits),
         chunks_in_context=len(chunks),
+        candidates_considered=len(candidates),
+        reranked=reranked,
     )

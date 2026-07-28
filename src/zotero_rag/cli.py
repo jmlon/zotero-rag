@@ -33,6 +33,7 @@ from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
 from zotero_rag.errors import (
     CollectionMismatchError,
+    ConfigError,
     FingerprintMismatchError,
     NotAnIndexFolderError,
     NotIndexedError,
@@ -74,6 +75,7 @@ from zotero_rag.indexer import (
 from zotero_rag.llm import build_chat
 from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason, build_plan
 from zotero_rag.querying import QueryResult, answer_question
+from zotero_rag.reranking import RerankFn, build_reranker
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.scaffold import init_index_folder
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
@@ -712,6 +714,29 @@ RetrievalOption = Annotated[
 ]
 
 
+RerankerOption = Annotated[
+    str | None,
+    typer.Option(
+        "--reranker",
+        help="none, or cohere to re-score the retrieved passages against the question.",
+    ),
+]
+
+
+def _resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | None, str | None]:
+    """The reranker to use and its name, honouring `--reranker none` as "off".
+
+    Returns `(None, None)` when disabled. Building it asserts the Cohere credential,
+    so a folder that asks for reranking without a key fails immediately.
+    """
+    name = config.reranker if override is None else (None if override == "none" else override)
+    if name is None:
+        return None, None
+    if name != "cohere":
+        raise ConfigError(f"Unknown reranker {name!r}. Use `cohere`, or `none` to disable it.")
+    return build_reranker(config), name
+
+
 def _build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:
     """The BM25 index, built once, or `None` for plain vector retrieval.
 
@@ -806,6 +831,8 @@ def _answer_as_json(result: QueryResult, show_sources: bool) -> str:
         "retrieval": {
             "chunks_retrieved": result.chunks_retrieved,
             "chunks_in_context": result.chunks_in_context,
+            "candidates_considered": result.candidates_considered,
+            "reranked": result.reranked,
         },
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
@@ -827,6 +854,7 @@ def query(
         ),
     ] = None,
     retrieval: RetrievalOption = None,
+    reranker: RerankerOption = None,
     show_sources: Annotated[
         bool,
         typer.Option("--show-sources", help="Also print the full text of each retrieved chunk."),
@@ -845,6 +873,7 @@ def query(
     try:
         config, store = _open_index()
         mode = retrieval if retrieval is not None else config.index.retrieval
+        rerank, _ = _resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
@@ -865,6 +894,8 @@ def query(
                 window=window if window is not None else config.index.retrieval_window,
                 mode=mode,
                 keyword_index=keyword_index,
+                rerank=rerank,
+                rerank_fanout=config.index.reranker_fanout,
             )
     except ZoteroRagError as exc:
         _fail(exc)
@@ -983,13 +1014,27 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
 
     settings = report.settings
     windowing = f" ±{settings.retrieval_window}" if settings.retrieval_window else ""
+    reranking = (
+        f" · reranked by {settings.reranker_model} (×{settings.reranker_fanout})"
+        if settings.reranker
+        else ""
+    )
     console.print(
         f"\n[dim]{settings.llm_model} answering, {settings.judge_model} grading, "
         f"{settings.embedding_model} embedding · top_k {settings.top_k} · "
         f"chunks {settings.chunk_size}/{settings.chunk_overlap} · "
-        f"temperature {settings.temperature} · {settings.retrieval}{windowing} retrieval · "
-        f"{_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
+        f"temperature {settings.temperature} · {settings.retrieval}{windowing} retrieval"
+        f"{reranking} · {_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
     )
+
+    # A configured reranker that quietly did not run on every question would make two
+    # reports incomparable while looking identical, so say so plainly.
+    if settings.reranker and summary.reranked_questions < summary.questions:
+        console.print(
+            f"  [yellow]reranking applied to only {summary.reranked_questions} of "
+            f"{summary.questions} questions[/yellow] [dim](the rest kept the retrieved "
+            f"order after a provider failure; rerun to retry)[/dim]"
+        )
 
     if verbose:
         for outcome in report.results:
@@ -1018,6 +1063,7 @@ def eval_command(
         ),
     ] = None,
     retrieval: RetrievalOption = None,
+    reranker: RerankerOption = None,
     only: Annotated[
         list[str] | None,
         typer.Option("--only", help="Run just this question id; repeatable."),
@@ -1051,6 +1097,7 @@ def eval_command(
         chosen_top_k = top_k if top_k is not None else config.index.top_k
         chosen_window = window if window is not None else config.index.retrieval_window
         mode = retrieval if retrieval is not None else config.index.retrieval
+        rerank, rerank_name = _resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
@@ -1070,6 +1117,8 @@ def eval_command(
                 window=chosen_window,
                 mode=mode,
                 keyword_index=keyword_index,
+                rerank=rerank,
+                rerank_fanout=config.index.reranker_fanout,
             )
 
         # Progress on stderr, so --json on stdout is never contaminated.
@@ -1096,6 +1145,7 @@ def eval_command(
                 questions_path,
                 window=chosen_window,
                 mode=mode,
+                reranker=rerank_name,
             ),
             aggregate=aggregate(outcomes),
             results=outcomes,

@@ -568,6 +568,9 @@ class QuestionOutcome(BaseModel):
     answer: str = ""
     #: Retrieval, independent of what the answer did with it.
     chunks_retrieved: int = 0
+    candidates_considered: int = 0
+    #: False when a configured reranker did not actually apply to this question.
+    reranked: bool = False
     hit: bool | None = None
     cited_expected: bool | None = None
     cited_sources: int = 0
@@ -645,6 +648,8 @@ def evaluate_question(
         coverage=judgement.coverage,
         answer=result.answer,
         chunks_retrieved=result.chunks_retrieved,
+        candidates_considered=result.candidates_considered,
+        reranked=result.reranked,
         hit=retrieval_hit(result.sources, question),
         cited_expected=cited_expected(result.sources, question),
         cited_sources=sum(1 for source in result.sources if source.cited),
@@ -705,6 +710,9 @@ class EvalAggregate(BaseModel):
     judge_tokens: int = 0
     elapsed_s: float = 0.0
     errors: int = 0
+    #: Questions where a configured reranker silently fell back to the retrieved
+    #: order. Reported because a half-reranked run must not pass for a reranked one.
+    reranked_questions: int = 0
 
     @computed_field  # type: ignore[prop-decorator]
     @property
@@ -744,6 +752,7 @@ def aggregate(outcomes: Sequence[QuestionOutcome]) -> EvalAggregate:
         judge_tokens=sum(o.judge_tokens for o in outcomes),
         elapsed_s=sum(o.elapsed_s for o in outcomes),
         errors=sum(1 for o in outcomes if o.grade is Grade.ERROR),
+        reranked_questions=sum(1 for o in outcomes if o.reranked),
     )
 
 
@@ -770,7 +779,10 @@ class RunSettings(BaseModel):
     #: `vector` or `hybrid` (§11.4.2). Recorded so a fused run cannot be mistaken
     #: for a plain one when two reports are compared.
     retrieval: str = "vector"
+    #: `None` when no reranking ran (§11.4.3).
     reranker: str | None = None
+    reranker_model: str | None = None
+    reranker_fanout: int = 0
     questions_file: str = ""
     store_chunks: int = 0
     embedding_dim: int | None = None
@@ -783,6 +795,7 @@ def run_settings(
     questions_path: Path,
     window: int = 0,
     mode: str = "vector",
+    reranker: str | None = None,
 ) -> RunSettings:
     """Snapshot the settings behind a run."""
     return RunSettings(
@@ -798,7 +811,9 @@ def run_settings(
         chunk_overlap=config.index.chunk_overlap,
         temperature=config.index.temperature,
         judge_temperature=config.eval.judge_temperature,
-        reranker=config.global_.defaults.reranker,
+        reranker=reranker,
+        reranker_model=config.index.reranker_model if reranker else None,
+        reranker_fanout=config.index.reranker_fanout if reranker else 0,
         questions_file=str(questions_path),
         store_chunks=store.count(),
         embedding_dim=store.derived_dimension(),

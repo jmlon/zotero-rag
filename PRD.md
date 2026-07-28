@@ -122,7 +122,7 @@ zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
 
 ```
 zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
-                            [--show-sources] [--json] [-v]
+                            [--reranker none|cohere] [--show-sources] [--json] [-v]
 ```
 
 - One-shot query. Retrieves `top_k` chunks, calls the LLM, prints the answer
@@ -139,12 +139,18 @@ zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
   keyword ranking with the vector one and **is the default**, because it measured
   better at no token cost. It is a query-time choice: switching it never requires
   re-indexing.
+- `--reranker cohere` re-scores the retrieved candidates against the question and
+  keeps the best `top_k` (§11.4.3), on top of whichever `--retrieval` mode ran.
+  `--reranker none` disables a configured one. Off by default because it needs
+  `COHERE_API_KEY`; recommended where that key exists, since `top_k: 5` with
+  reranking beat `top_k: 10` without it on half the context.
 
 ### 3.5 `eval`
 
 ```
 zotero-rag eval [--questions FILE] [--top-k N] [--window N] [--retrieval MODE]
-                [--only ID]... [--assess-context] [--json] [-v]
+                [--reranker none|cohere] [--only ID]... [--assess-context]
+                [--json] [-v]
 ```
 
 - Runs a golden set of questions (§11.3) against the index and scores it: a table
@@ -236,6 +242,13 @@ folders — work.
 Required variables: `OPENROUTER_ENDPOINT`, `OPENROUTER_API_KEY`,
 `ZOTERO_LIBRARY_ID`, `ZOTERO_API_KEY`.
 
+**Conditionally required:** `COHERE_API_KEY`, needed only when `reranker: cohere` is
+enabled (§11.4.3). It is asserted when the reranker is built, so a folder that does
+not use reranking never demands it — and one that does fails immediately rather than
+part-way through a run. Cohere is a second provider because OpenRouter proxies chat
+completions and embeddings but not reranking; every other credential still routes
+through OpenRouter as §5.1 intends.
+
 ### 5.3 Schema
 
 Modelled with pydantic `BaseModel`s, mirroring `ragbench/config.py`.
@@ -247,12 +260,13 @@ global:
   api_key_env: OPENROUTER_API_KEY
   zotero_library_id_env: ZOTERO_LIBRARY_ID
   zotero_api_key_env: ZOTERO_API_KEY
+  cohere_api_key_env: COHERE_API_KEY   # only needed if a reranker is enabled
   zotero_library_type: user
   defaults:
     llm_model: openai/gpt-4o-mini
     embedding_model: openai/text-embedding-3-small
     vector_db: chroma
-    reranker: null
+    reranker: null            # null | cohere; inherited by the index (§11.4.3)
 
 index:
   # Pinned by the first `index` run; null in a freshly initialized folder.
@@ -266,6 +280,9 @@ index:
   top_k: 10               # 5 before 0.4.4; raised on M7's evidence (§11.4.1)
   retrieval_window: 0     # neighbours either side of each hit (M7, §11.4.1)
   retrieval: hybrid       # vector | hybrid (BM25 fused with vectors, §11.4.2)
+  reranker: null          # null => inherit global.defaults.reranker (§11.4.3)
+  reranker_model: rerank-v4.0-fast
+  reranker_fanout: 4      # candidates retrieved per final passage
   temperature: 0.0
 
   # Which attachment wins when an item has several readable ones (§7.1).
@@ -469,7 +486,9 @@ sync with what it wrote.
 ## 9. Dependencies
 
 Hard constraint: **no heavyweight dependencies** — no HuggingFace libraries, no
-PyTorch, no sentence-transformers. Embeddings are always remote via OpenRouter.
+PyTorch, no sentence-transformers. Embeddings are always remote via OpenRouter, and
+reranking is remote via Cohere for the same reason: a local cross-encoder is the one
+obvious way to implement §11.4.3 and it would breach this rule outright.
 
 Runtime: `pyzotero`, `chromadb`, `pypdf`, `langchain-core`, `langchain-openai`,
 `langchain-text-splitters`, `typer`, `rich`, `pydantic`, `pyyaml`,
@@ -943,10 +962,12 @@ grows; today a second run replaces the file. Worth having, not worth blocking on
   `retrieval: vector|hybrid` (§3.4). It measured better on two independent question
   sets **for no extra tokens**, which is what separates it from windowing.
   §11.4.2 has the numbers.
-- **Reranking without heavy dependencies.** An LLM reranker (a cheap model scores
-  each candidate, keep the best `top_k`) behind `reranker: null|llm`, retrieving
-  `top_k × fanout` candidates first. A hosted rerank API is a possible second
-  provider; a local cross-encoder is not, under §9.
+- **Reranking without heavy dependencies — ✅ built, ✅ accepted, off by default.**
+  Implemented with the "possible second provider" this plan mentioned rather than the
+  LLM scorer: Cohere's hosted `rerank-v4.0-fast` behind `reranker: null|cohere`,
+  retrieving `top_k × fanout` candidates first. It is the best result M7 has produced
+  and it **reduces** token spend; the switch stays off only because it needs a
+  credential most users will not have. §11.4.3 has the numbers.
 - **Revisit the default `top_k` — M6 has now answered this, and the answer is
   yes.** On the 21-question `Networking` set every metric improves monotonically
   with `top_k`, and the step from 5 to 10 is larger than the noise floor by an
@@ -1191,6 +1212,91 @@ modes, exactly as §11.4.1 predicted: its question contains no distinctive term,
 there is nothing for BM25 to match either. Two of this section's remaining items —
 retrieval diversity and metadata filters — are still the candidates for it.
 
+#### 11.4.3 Reranking, measured and adopted as the recommendation (0.4.5)
+
+**Built with a hosted cross-encoder**, in `reranking.py`: Cohere's
+`rerank-v4.0-fast` behind `reranker: null|cohere`, plus `--reranker` on `query` and
+`eval`. A local cross-encoder would mean `sentence-transformers` and PyTorch, which
+§9 forbids outright; the hosted API needs **no new dependency at all**, because
+`httpx` is already required (§14.7) and reranking is one POST.
+
+Retrieval ranks by *similarity*, a reranker by *relevance to this question*. The
+distinction is not cosmetic: an embedding is computed without knowing the question, so
+it cannot tell a passage that is merely on the subject from the one that answers what
+was asked. A cross-encoder reads both together.
+
+**The stage order is fixed and deliberate: retrieve wide → rerank → window.**
+
+- Reranking *before* the cut is what lets it discard rather than merely reorder. A
+  reranker handed exactly `top_k` candidates changes nothing about which passages the
+  model sees, and the ordering of a small context matters far less than its contents.
+  Hence `reranker_fanout: 4` — `top_k: 10` retrieves 40 and keeps 10.
+- Windowing *after* is what keeps a window's neighbours as context for a chosen hit
+  rather than rivals competing to be chosen. Reranking them would let a low-scoring
+  neighbour be dropped, which defeats the point of asking for it.
+- It composes with `retrieval` untouched: hybrid fuses its candidates first, then the
+  reranker sees the fused list. Verified live: `hybrid: 80 vector + 80 keyword
+  candidate(s) fused to 20` followed by `reranked 20 candidate(s) down to 5`.
+
+**The measurement**, 21-question `Networking` set, best rows in bold:
+
+| `top_k` | retrieval | reranker | mean score | coverage | hit | cited | LLM tokens |
+|---|---|---|---|---|---|---|---|
+| 5 | vector | — | 1.81 | 53.3% | 86% | 76% | 33.3k |
+| 5 | hybrid | — | 1.81 | 55.8% | 86% | 81% | 33.7k |
+| **5** | **hybrid** | **cohere** | **2.38** | **73.8%** | **95%** | **95%** | **33.9k** |
+| 10 | vector | — | 2.38 | 67.9% | 95% | 81% | 61.5k |
+| 10 | hybrid | — | 2.33–2.52 | 72.1–72.3% | 95% | 95% | 62.9k |
+| **10** | **hybrid** | **cohere** | **2.62** | **75.5%** | **95%** | **95%** | **63.4k** |
+
+**Verdict: accepted, and it is the first change that buys quality while *reducing*
+context.** Two readings, both worth stating:
+
+- **At `top_k: 5`, reranking matches or beats `top_k: 10` without it, on half the
+  LLM tokens.** 2.38 vs 2.38 on score, and *better* on coverage (73.8% vs 67.9–72.3%),
+  with hit rate rising 86% → 95% and citation 81% → 95%. This is the classic reranker
+  payoff — retrieve wide, send narrow — and it is the configuration to prefer.
+- **At `top_k: 10`, reranking gives the best result the project has recorded**: 2.62
+  mean, 75.5% coverage. The previous best equal to it was `top_k: 10, window: 2` at
+  196.9k tokens (§11.4.1); this reaches it on 63.4k, a third of the context.
+- **Reranking raised hit rate at `top_k: 5` from 86% to 95%**, which windowing could
+  not do at all and hybrid could not do on this set. The reason is structural and the
+  mirror of §11.4.1's: the reranker is choosing from 20 candidates rather than 5, so
+  papers that were retrieved-but-cut now survive. It changes *which* documents reach
+  the model, which is the only kind of change that moves this metric.
+
+**A cost caveat that the token column does not show, and must not be read past.**
+Those are **LLM tokens only**. Reranking adds one Cohere request per question — 20 to
+40 documents each — billed by a second provider in search units, and our accounting
+(§10) counts none of it. So "half the tokens" is a claim about *context*, not about
+*money*: at these volumes the LLM saving is small in absolute terms and the rerank
+charge is not obviously smaller. Settling that needs M8's pricing table, and until
+then the honest claim is quality-per-context-token, not quality-per-dollar. Latency
+is measurable now and modest: ~1s added to a single query.
+
+**Off by default, and this is not timidity.** `reranker: cohere` requires
+`COHERE_API_KEY`. Defaulting it on would make `query` fail outright for every user who
+has only the OpenRouter and Zotero credentials that §5.2 asks for — trading a working
+tool for a better one they cannot run. So the default is `null`, the credential is
+asserted at build time rather than mid-run, and the recommendation lives in the
+documentation: **if you have a Cohere key, `top_k: 5` with `reranker: cohere` is both
+better and cheaper in context than the shipped default.**
+
+**Failure policy, split by cause.** A 4xx — unknown model, rejected key — raises
+`RerankError` and stops the run, because it will fail identically for every remaining
+question and a hundred silent degradations is the worse outcome. Anything else
+(timeout, 5xx, a 200 with no usable ranking) logs a warning and falls back to the
+retrieved order, but records `reranked: false`, and `eval` prints *reranking applied
+to only N of M questions*. A run that quietly half-reranked would otherwise be
+indistinguishable from a reranked one while not being comparable to either.
+
+**`jellyfish-3` still misses, now with 40 reranked candidates.** Three M7 levers have
+now failed on it — deeper `top_k` (to 30), keyword fusion, and reranking over four
+times the candidates. That is conclusive: the question names nothing from its own
+paper (§11.4.1), so no amount of retrieval depth or re-scoring can find it. Metadata
+filters, or fixing the question, are the only remaining answers, and it is the
+strongest evidence in the PRD for the "under-specified question" failure mode.
+
 ### 11.5 Milestone 8 — Scale and cost (0.6.0)
 
 - **Batched and concurrent embedding.** Embedding is serial per attachment today.
@@ -1260,7 +1366,7 @@ From §1.1 and the original §11 list:
 | OCR of scanned PDFs | M5 — **deferred**, §11.2.1 |
 | HTML snapshot / EPUB / notes ingestion | M5 ✅ |
 | Metadata filters at query time (year, author, tag) | M7 |
-| Rerankers | M7 |
+| Rerankers | M7 ✅ §11.4.3 |
 | Hybrid / BM25 retrieval | M7 |
 | Windowed retrieval | M7 |
 | Cost estimation and pricing tables | M8 — also covers the `eval` cost column deferred from M6 |
@@ -1423,7 +1529,7 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-28. **442 tests passing; `ruff`, `ruff format` and `mypy` clean.**
+Last updated: 2026-07-28. **470 tests passing; `ruff`, `ruff format` and `mypy` clean.**
 
 ### 14.1 Done
 
@@ -1440,6 +1546,7 @@ Last updated: 2026-07-28. **442 tests passing; `ruff`, `ruff format` and `mypy` 
 | 6b | `generate-questions`: a golden set written from the index itself (§11.3.2) | ✅ verified live |
 | 7a | Windowed retrieval — built and measured; **rejected as a default** (§11.4.1) | ✅ verified live |
 | 7b | Hybrid BM25 + vector retrieval — **accepted, now the default** (§11.4.2) | ✅ verified live |
+| 7c | Cohere reranking — **accepted, recommended, off by default** (needs a key) (§11.4.3) | ✅ verified live |
 
 **All eight acceptance criteria (§12) are verified against the real library**, as
 are M4 (§14.6), M5 (§14.7), M6 (§14.8), §11.3.2 (§14.9), §11.4.1 (§14.10) and
@@ -1447,12 +1554,20 @@ are M4 (§14.6), M5 (§14.7), M6 (§14.8), §11.3.2 (§14.9), §11.4.1 (§14.10)
 as the cheapest remaining win and which hybrid did not address, then metadata
 filters and reranking — each accepted or rejected the same way.
 
-**The scoreboard so far**, all on the 21-question `Networking` set. The PoC default
-(`top_k: 5`, vector) scored 1.81/5 with 76% of answers citing the right paper. **The
-shipped defaults are now `top_k: 10` with hybrid retrieval** (0.4.3, 0.4.4), scoring
-2.33–2.52 with **95%** citing the right paper, for 1.9× the tokens. Of that gain,
-`top_k` supplied the tokens and hybrid supplied the accuracy for free. Both were
-chosen by measurement, and windowing was declined by the same measurement — which is
+**The scoreboard so far**, all on the 21-question `Networking` set:
+
+| configuration | mean score | coverage | hit | cited | LLM tokens |
+|---|---|---|---|---|---|
+| PoC default — `top_k: 5`, vector | 1.81 | 53.3% | 86% | 76% | 33.3k |
+| shipped default — `top_k: 10`, hybrid | 2.33–2.52 | 72.1–72.3% | 95% | 95% | 62.9k |
+| recommended with a Cohere key — `top_k: 5`, hybrid, reranked | 2.38 | 73.8% | 95% | 95% | **33.9k** |
+| best measured — `top_k: 10`, hybrid, reranked | **2.62** | **75.5%** | 95% | 95% | 63.4k |
+
+Read against the PoC baseline, the share of answers citing the right paper went 76% →
+95% and point coverage 53% → 76%. The instructive part is *how* each lever paid:
+`top_k` bought quality with tokens, hybrid bought it for free, reranking bought it
+while *giving tokens back* — and windowing was declined outright by the same
+measurement. None of those four conclusions was predictable from the design, which is
 the whole return on M6.
 
 Folders created before 0.4.4 keep `top_k: 5` until edited; see the end of §11.4.1.
@@ -1489,6 +1604,7 @@ src/zotero_rag/
   zotero_api.py    client, collection tree, path/key resolution, item fetch
   planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata()
   retrieval.py     BM25 keyword index, reciprocal rank fusion, retrieve() (M7)
+  reranking.py     Cohere cross-encoder reranking of candidates (M7, §11.4.3)
   evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
   generation.py    generate-questions: reassemble documents, write a set (§11.3.2)
   documents.py     formats, content-type mapping, locator kinds
@@ -1831,3 +1947,51 @@ came out opposite:
 The asymmetry is the lesson: windowing elaborates documents already found, hybrid
 changes *which* documents are found. Only the second can move the metric that was
 actually binding.
+
+### 14.12 Reranking as built and measured (§11.4.3)
+
+Verified live against the indexed `Networking` store, two `eval` runs plus a
+single-query trace, using Cohere `rerank-v4.0-fast`.
+
+| Check | Result |
+|---|---|
+| The model exists and behaves | probed directly before building anything: given three passages and a CFR-RL question it scored the right one 0.908, the Jellyfish one 0.165, and dropped the mercury one entirely |
+| Composes with hybrid | `-v` shows `hybrid: 80 vector + 80 keyword candidate(s) fused to 20` then `reranked 20 candidate(s) down to 5` |
+| Composes with windowing, in the right order | reranking picks the hits, then windowing expands them; a test asserts the neighbour reaches the model without having competed as a candidate |
+| Fanout honoured | `candidates_considered` is 20 at `top_k: 5` and 40 at `top_k: 10` |
+| Applied to every question | 21/21 in both runs — no silent fallbacks |
+| **Quality verdict** | **accepted** — best result recorded, and the first lever to improve quality while *reducing* context (§11.4.3) |
+| Missing credential | `--reranker cohere` without `COHERE_API_KEY` fails naming the variable, before any question is embedded |
+| Misconfiguration vs. outage | a 4xx raises `RerankError` and stops; a 5xx or timeout warns, keeps the retrieved order, and is reported as not reranked |
+| Off by default | pinned by a test, so it cannot start demanding a credential by accident |
+| No new dependency | `httpx` was already required; §9 holds, and a local cross-encoder would have breached it |
+| Regression | 470 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**The result worth remembering**, because it inverts the pattern of the two levers
+before it: `top_k: 5` with reranking scored 2.38 with 73.8% coverage on **33.9k** LLM
+tokens, against `top_k: 10` without it at 2.38 and 67.9–72.3% on **61.5–62.9k**. Equal
+or better quality on half the context. Windowing bought quality at 2–3× context and
+was rejected; hybrid bought it at 1×; reranking bought it at 0.5×.
+
+**A caveat recorded deliberately, because the table invites the wrong reading.** Those
+are LLM tokens. Reranking makes one Cohere request per question — 20 to 40 documents —
+billed in search units by a provider our accounting does not touch at all (verified:
+the run's token buckets are prompt, completion, embedding and judge; there is no
+rerank bucket). "Half the tokens" is therefore a statement about *context*, not about
+*money*, and at these volumes the LLM saving is small in absolute terms while the
+rerank charge is not obviously smaller. Resolving that is M8's pricing table, and
+until then the claim stands only as quality-per-context-token. Latency is measurable
+today: about one extra second per query.
+
+**Why the switch is off despite winning.** It needs `COHERE_API_KEY`. Turning it on by
+default would make `query` fail outright for anyone holding only the credentials §5.2
+asks for — exchanging a tool that works for one they cannot run. Hybrid could become a
+default because it cost nothing and needed nothing; reranking cannot, on the second
+count alone. The recommendation therefore lives in the documentation instead, which is
+the right place for advice that depends on what a user has.
+
+**Three levers have now failed on `jellyfish-3`** — `top_k` to 30, keyword fusion, and
+reranking over 40 candidates. A question that names nothing from its own paper cannot
+be retrieved, however much retrieval is thrown at it. That is now the best-evidenced
+finding in §11.4, and it points at metadata filters rather than at anything ranking can
+do.

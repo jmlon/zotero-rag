@@ -58,6 +58,11 @@ def render_env_template(global_config: GlobalConfig) -> str:
 # Used by `index` and `query`; `list-collections` does not need it.
 {global_config.endpoint_env}={global_config.endpoint}
 {global_config.api_key_env}=
+
+# Cohere — OPTIONAL, leave blank unless you set `reranker: cohere` in config.yaml.
+# Reranking measurably improves answers and sends less text to the LLM, but it is a
+# second provider: https://dashboard.cohere.com/api-keys
+{global_config.cohere_api_key_env}=
 """
 
 

@@ -99,6 +99,9 @@ Now open `.env` and fill in `ZOTERO_LIBRARY_ID`, `ZOTERO_API_KEY`, and
 file; `config.yaml` holds the *names* of those variables, never their values, so it
 is safe to commit.
 
+`COHERE_API_KEY` is also in the template but can be left blank — it is only needed if
+you turn on reranking, and nothing asks for it until you do.
+
 **You don't need a copy of your keys in every index folder.** `.env` files are
 layered, nearest first — the index folder, then each parent folder, then `~/.env` —
 and a blank entry is ignored rather than treated as empty. So one `.env` beside
@@ -194,6 +197,7 @@ zotero-rag query "What makes an abstract effective?"
 zotero-rag query "..." --top-k 10        # retrieve more passages
 zotero-rag query "..." --window 2        # also send each hit's neighbours
 zotero-rag query "..." --retrieval vector # embeddings only, no keyword search
+zotero-rag query "..." --reranker cohere  # re-score the passages against the question
 zotero-rag query "..." --show-sources    # print the full text of each passage
 zotero-rag query "..." --json            # machine-readable answer/sources/usage
 zotero-rag query "..." -v                # prompt and completion token counts
@@ -291,8 +295,29 @@ are what they are:
   you. The reason it loses is structural: a neighbour is always from a document you
   already retrieved, so windowing cannot help you find a paper you missed.
 
-The shipped defaults are now that best-measured combination — `top_k: 10` with hybrid
-retrieval — rather than the untested values the tool started life with.
+- **Reranking is the best thing you can turn on, and it makes queries *cheaper*.**
+  With `reranker: cohere`, the tool retrieves four times as many passages as it needs,
+  has Cohere's cross-encoder score each one against your actual question, and keeps
+  only the best. Measured: `top_k: 5` with reranking matched `top_k: 10` without it on
+  score, beat it on point coverage (73.8% vs 68–72%), raised the share of questions
+  that found the right paper from 86% to 95% — and sent **half as much text** to the
+  answering model. It is off by default only because it needs a Cohere API key.
+
+The shipped defaults are the best combination measured *without* extra credentials:
+`top_k: 10` with hybrid retrieval. If you have a Cohere key, the better and cheaper
+setting is `top_k: 5` with `reranker: cohere`.
+
+```yaml
+index:
+    top_k: 5
+    retrieval: hybrid
+    reranker: cohere      # needs COHERE_API_KEY in your .env
+```
+
+A note on cost, since "cheaper" is easy to over-read: reranking halves the *text sent
+to the LLM*, but adds one Cohere request per question, billed separately. Whether your
+total bill goes down depends on the two providers' prices, which the tool does not yet
+track. What is measured is that you get better answers from less context.
 
 **Upgrading an existing index folder?** Your `config.yaml` was written when you ran
 `init`, and its values win over the built-in defaults, so an older folder keeps
@@ -304,6 +329,7 @@ automatically.
 zotero-rag eval --top-k 10                 # compare against your current setting
 zotero-rag eval --retrieval vector         # what hybrid is buying you
 zotero-rag eval --window 2                 # is windowing worth it for your library?
+zotero-rag eval --top-k 5 --reranker cohere  # better and cheaper, if you have the key
 zotero-rag query "..." --top-k 10
 ```
 
@@ -319,6 +345,8 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `top_k` | `10` | passages retrieved per question; `5` is cheaper, `20` is not better |
 | `retrieval_window` | `0` | also send N neighbouring chunks either side of each hit |
 | `retrieval` | `hybrid` | `vector` (embeddings only) or `hybrid` (also BM25 keyword search) |
+| `reranker` | `null` | `cohere` re-scores retrieved passages against the question (needs `COHERE_API_KEY`) |
+| `reranker_fanout` | `4` | candidates retrieved per final passage, for the reranker to choose from |
 | `attachment_preference` | `[pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several |
 | `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
 | `index_notes` | `true` | index your Zotero notes alongside each item's file |
@@ -372,12 +400,15 @@ This is a proof of concept, and deliberately narrow:
 - **A saved web page is only as good as what was saved.** Snapshots of paywalled
   articles are usually the abstract page, not the full text.
 - **Your own library only** — group libraries are not supported yet.
-- Retrieval combines vector similarity with BM25 keywords, but there is **no
-  reranking and no metadata filtering** at query time yet. There is no diversity
-  constraint either, so a single well-matched paper can occupy every slot and crowd
-  out the one you wanted — and a question with no distinctive wording ("what
-  methodology did the authors use?") can miss its paper no matter how many passages
-  you retrieve.
+- Retrieval combines vector similarity with BM25 keywords, and optional reranking, but
+  there is **no metadata filtering** at query time yet and no diversity constraint, so
+  a single well-matched paper can occupy every slot and crowd out the one you wanted.
+  A question with no distinctive wording ("what methodology did the authors use?") can
+  miss its paper no matter how many passages you retrieve — deeper retrieval, keyword
+  search and reranking were all measured against one such question and none of them
+  found it.
+- Reranking needs a Cohere API key, a second provider alongside OpenRouter, and its
+  cost is not included in the token counts the tool reports.
 - The keyword index is rebuilt each time the tool starts, so on a very large store
   `query` pays a second or two before answering. `retrieval: vector` avoids it.
 - **Everything is remote per call:** no batching or concurrency yet, so a large

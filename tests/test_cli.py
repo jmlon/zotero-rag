@@ -1110,3 +1110,108 @@ def test_hybrid_is_the_shipped_default(tmp_path: Path, monkeypatch: pytest.Monke
 
     assert payload["settings"]["retrieval"] == "hybrid"
     assert Config().index.retrieval == "hybrid"
+
+
+# --- reranking through the CLI (M7, §11.4.3) -----------------------------
+
+
+def test_query_help_documents_the_reranker_flag() -> None:
+    result = runner.invoke(cli.app, ["query", "--help"])
+    assert "--reranker" in result.output
+    assert "cohere" in result.output
+
+
+def test_reranking_is_off_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defaulting it on would break `query` for everyone without a Cohere key."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    def must_not_build(config: object) -> object:
+        raise AssertionError("a reranker was built without being asked for")
+
+    monkeypatch.setattr(cli, "build_reranker", must_not_build)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
+
+    assert payload["settings"]["reranker"] is None
+    assert Config().reranker is None
+
+
+def test_asking_for_a_reranker_without_a_key_fails_before_any_work(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--reranker", "cohere"])
+
+    assert result.exit_code == 1
+    assert "COHERE_API_KEY" in result.output
+
+
+def test_an_unknown_reranker_is_named_in_the_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["query", "anything", "--reranker", "magic"])
+
+    assert result.exit_code == 1
+    assert "magic" in result.output
+
+
+def test_reranker_none_overrides_a_configured_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`--reranker none` must switch it off without needing the credential."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  reranker: cohere\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--reranker", "none", "--json"])
+
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["settings"]["reranker"] is None
+
+
+def test_a_configured_reranker_is_recorded_in_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+    monkeypatch.setattr(cli, "build_reranker", lambda config: lambda q, docs, n: [(0, 0.9)])
+
+    result = runner.invoke(cli.app, ["eval", "--reranker", "cohere", "--json"])
+
+    settings = json.loads(result.stdout)["settings"]
+    assert settings["reranker"] == "cohere"
+    assert settings["reranker_model"] == "rerank-v4.0-fast"
+    assert settings["reranker_fanout"] == 4
+    assert json.loads(result.stdout)["results"][0]["reranked"] is True
+
+
+def test_a_reranker_that_silently_fell_back_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two reports must not look identical when one was only half reranked."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    def flaky(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        raise RuntimeError("503")
+
+    monkeypatch.setattr(cli, "build_reranker", lambda config: flaky)
+
+    result = runner.invoke(cli.app, ["eval", "--reranker", "cohere"])
+
+    assert result.exit_code == 0
+    assert "reranking applied to only 0 of 1 questions" in result.output

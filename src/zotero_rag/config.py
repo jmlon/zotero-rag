@@ -49,6 +49,9 @@ class GlobalConfig(BaseModel):
     api_key_env: str = "OPENROUTER_API_KEY"
     zotero_library_id_env: str = "ZOTERO_LIBRARY_ID"
     zotero_api_key_env: str = "ZOTERO_API_KEY"
+    #: Only needed when a reranker is enabled (§11.4.3). Cohere is a second provider
+    #: because OpenRouter proxies chat and embeddings but not reranking.
+    cohere_api_key_env: str = "COHERE_API_KEY"
     zotero_library_type: Literal["user", "group"] = "user"
     defaults: Defaults = Field(default_factory=Defaults)
 
@@ -57,6 +60,7 @@ class GlobalConfig(BaseModel):
     api_key: str = Field(default="", exclude=True)
     zotero_library_id: str = Field(default="", exclude=True)
     zotero_api_key: str = Field(default="", exclude=True)
+    cohere_api_key: str = Field(default="", exclude=True)
 
     def resolve_env(self) -> None:
         """Populate the resolved credential fields from the environment.
@@ -69,6 +73,7 @@ class GlobalConfig(BaseModel):
         self.api_key = os.environ.get(self.api_key_env, "")
         self.zotero_library_id = os.environ.get(self.zotero_library_id_env, "")
         self.zotero_api_key = os.environ.get(self.zotero_api_key_env, "")
+        self.cohere_api_key = os.environ.get(self.cohere_api_key_env, "")
 
     def require_zotero(self) -> None:
         missing = [
@@ -85,6 +90,11 @@ class GlobalConfig(BaseModel):
     def require_openrouter(self) -> None:
         if not self.api_key:
             raise MissingCredentialError([self.api_key_env], "OpenRouter")
+
+    def require_cohere(self) -> None:
+        """Asserted only when a reranker is enabled, never for an ordinary query."""
+        if not self.cohere_api_key:
+            raise MissingCredentialError([self.cohere_api_key_env], "Cohere reranking")
 
 
 class IndexConfig(BaseModel):
@@ -108,6 +118,13 @@ class IndexConfig(BaseModel):
     #: default because it measured better on two independent question sets at no
     #: token cost; `vector` remains available and is faster to start on a huge store.
     retrieval: Literal["vector", "hybrid"] = "hybrid"
+    #: null => inherit `global.defaults.reranker`. `cohere` reranks the candidates
+    #: before the answer is built (§11.4.3); it composes with any `retrieval` mode.
+    reranker: Literal["cohere"] | None = None
+    reranker_model: str = "rerank-v4.0-fast"
+    #: Candidates retrieved per final passage, so the reranker has room to discard.
+    #: A fanout of 1 lets it only reorder, which changes nothing about what is sent.
+    reranker_fanout: int = Field(default=4, ge=1)
     temperature: float = Field(default=0.0, ge=0.0)
 
     # Which attachment to index when an item offers several readable ones. Roughly
@@ -191,6 +208,11 @@ class Config(BaseModel):
     def generator_model(self) -> str:
         """The question-writing model: the configured one, else whatever answers."""
         return self.eval.generator_model or self.llm_model
+
+    @property
+    def reranker(self) -> str | None:
+        """The reranker to use, or `None` for no reranking."""
+        return self.index.reranker or self.global_.defaults.reranker
 
     @property
     def embedding_model(self) -> str:

@@ -5,11 +5,15 @@ global:
     api_key_env: OPENROUTER_API_KEY
     zotero_library_id_env: ZOTERO_LIBRARY_ID
     zotero_api_key_env: ZOTERO_API_KEY
+    # Only needed if you enable a reranker below. Cohere is a separate provider
+    # because OpenRouter proxies chat and embeddings, but not reranking.
+    cohere_api_key_env: COHERE_API_KEY
     zotero_library_type: user
     defaults:
         llm_model: openai/gpt-4o-mini
         embedding_model: openai/text-embedding-3-small
         vector_db: chroma
+        # null | cohere. Inherited by the index unless it sets its own.
         reranker: null
 
 index:
@@ -40,6 +44,18 @@ index:
     # had ranked well. Set `vector` to skip building the keyword index, which costs
     # ~0.2s per 1,000 chunks at start-up.
     retrieval: hybrid
+
+    # Reranking re-scores the retrieved passages against the question with a
+    # cross-encoder, then keeps the best top_k. It works on top of any retrieval
+    # mode above. null => inherit global.defaults.reranker; `cohere` enables it and
+    # requires COHERE_API_KEY.
+    reranker: null
+    reranker_model: rerank-v4.0-fast
+    # Candidates retrieved per final passage: with top_k 10 and fanout 4, 40 passages
+    # are retrieved and the best 10 kept. A fanout of 1 would let the reranker only
+    # reorder what was already going to be sent, which is close to pointless.
+    reranker_fanout: 4
+
     temperature: 0.0
 
     # Which attachment wins when an item has several readable ones. Many items

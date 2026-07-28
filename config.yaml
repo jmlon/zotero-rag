@@ -24,7 +24,7 @@ index:
 
     chunk_size: 1000 # characters
     chunk_overlap: 200 # characters
-    top_k: 5
+    top_k: 10
     temperature: 0.0
 
     # null => inherit from global.defaults

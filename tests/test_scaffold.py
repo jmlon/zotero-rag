@@ -135,3 +135,22 @@ def test_env_template_contains_no_real_credentials(
     monkeypatch.setenv("ZOTERO_API_KEY", "supersecret")
     init_index_folder(tmp_path, global_config)
     assert "supersecret" not in (tmp_path / ENV_FILENAME).read_text(encoding="utf-8")
+
+
+def test_the_env_template_carries_the_optional_cohere_variable(tmp_path: Path) -> None:
+    """It must be present but blank: needed only if reranking is switched on."""
+    init_index_folder(tmp_path, GlobalConfig())
+
+    env = (tmp_path / ".env").read_text(encoding="utf-8")
+
+    assert "COHERE_API_KEY=" in env
+    assert "OPTIONAL" in env
+    # Blank, so the empty-value rule in `load_env` ignores it entirely (§5.2).
+    assert "COHERE_API_KEY=\n" in env
+
+
+def test_a_renamed_cohere_variable_reaches_the_template() -> None:
+    """§3.2: the names come from the config, so a customised one must follow."""
+    config = GlobalConfig()
+    config.cohere_api_key_env = "MY_RERANK_KEY"
+    assert "MY_RERANK_KEY=" in render_env_template(config)
