@@ -161,9 +161,16 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `llm_model` | `openai/gpt-4o-mini` | any OpenRouter chat model slug |
 | `embedding_model` | `openai/text-embedding-3-small` | any OpenRouter embedding slug |
 
-Changing `chunk_size` or `embedding_model` only affects newly indexed
-attachments — existing chunks are left as they are. To rebuild from scratch,
-delete the `chroma/` directory and index again.
+Changing `chunk_size` or `chunk_overlap` only affects newly indexed attachments —
+existing chunks are left as they are. To rebuild, delete the `chroma/` directory
+and index again; the PDFs stay in `cache/`, so a rebuild costs embedding calls but
+no downloads.
+
+> **Do not change `embedding_model` on a populated index.** Nothing yet records
+> which model wrote the store, so old and new vectors get mixed and retrieval
+> quietly returns nonsense — with no error, when both models share a vector
+> dimension. Delete `chroma/` and index again instead. A guard against this is the
+> first item on the roadmap (`PRD.md` §11.1).
 
 Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defaults**.
 

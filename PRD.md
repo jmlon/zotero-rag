@@ -2,7 +2,8 @@
 
 **Status:** PoC complete — `list-collections`, `init`, `index`, and `query` are
 all built and verified against the live library; every acceptance criterion in
-§12 passes. See **§14 Implementation status**.
+§12 passes. See **§14 Implementation status** for what was built and
+**§11 Roadmap** for the sequenced milestones that follow.
 **Version:** 0.1.0
 
 ## 1. Goal
@@ -365,15 +366,254 @@ vector DB is `chromadb`); keep `pinecone` as a planned future milestone.
   formatting. The end-to-end path is validated by the manual smoke test in §12
   once the environment variables are configured.
 
-## 11. Future milestones
+## 11. Roadmap after the PoC
 
-Group libraries · Pinecone and other vector stores · rerankers · hybrid /
-BM25 retrieval · windowed and hierarchical retrieval · agentic RAG · `--force`
-clean-slate reindex · version-aware incremental indexing · deletion sync · OCR ·
-HTML / EPUB / notes ingestion · custom system prompt from file · cost
-estimation · batched and concurrent embedding · interactive REPL with history ·
-streaming output · metadata filters at query time (year, author, tag) · CI
-running the test suite, `ruff`, and `mypy`.
+The PoC is complete and verified (§14). This section sequences the items deferred
+in §1.1, plus the improvements the implementation itself surfaced, into
+milestones. §11.9 maps every deferred item to the milestone that carries it, so
+nothing from the original design is silently dropped.
+
+**Ordering principle.** Correctness before coverage, coverage before tuning, and
+measurement before any retrieval experiment:
+
+1. **Correctness first (M4).** The index can currently go *wrong* rather than
+   merely incomplete. Nothing records which embedding model wrote a store
+   (verified: `vectorstore.py` stores no model identity), so swapping
+   `embedding_model` for another of the **same dimension** — `text-embedding-3-small`
+   for `ada-002`, both 1536 — mixes incompatible vectors and returns meaningless
+   neighbours with no error and no warning. A *different* dimension at least fails
+   loudly (`Collection expecting embedding with dimension of 3, got 1536`), which
+   is the same bug getting lucky. A confidently cited wrong answer is the worst
+   failure this tool has.
+2. **Coverage next (M5).** On the real `Networking` collection, 13 of 18 items
+   yielded a PDF; 10 attachments were skipped as unsupported and 1 as a linked
+   URL. Better retrieval over a corpus that excludes a third of the library is
+   worth less than indexing the rest of it.
+3. **Then measurement (M6), then tuning (M7).** Rerankers, hybrid search, and
+   `top_k` changes are all *hypotheses*. Without a scored golden set we would be
+   choosing them by how good one answer looked, which is how retrieval
+   regressions get shipped.
+
+Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer.
+
+| # | Milestone | Theme | Version | Size |
+|---|---|---|---|---|
+| 4 | Store integrity and true reindexing | correctness | 0.2.0 | M |
+| 5 | Cover more of the library | coverage | 0.3.0 | M–L |
+| 6 | Measurement before tuning | evaluation | 0.4.0 | S–M |
+| 7 | Retrieval quality | tuning | 0.5.0 | M |
+| 8 | Scale and cost | performance | 0.6.0 | S–M |
+| 9 | Daily use | ergonomics | 0.7.0 | M |
+| 10 | Reach: group libraries, other stores, MCP | breadth | 0.8.0 | M |
+| 11 | Engineering hygiene | infrastructure | any time | S |
+
+The cheapest items worth doing first, regardless of milestone: the store
+fingerprint (§11.1), naming *what* was skipped (§11.2), windowed retrieval and
+metadata filters (§11.4), and `status` (§11.6). Each is small and independently
+useful.
+
+### 11.1 Milestone 4 — Store integrity and true reindexing (0.2.0)
+
+**Goal:** make the index trustworthy when either the library or the settings
+change. Today the attachment key is the only incremental criterion (§7.3), so a
+replaced PDF is never re-read, a deleted item is never removed, and a changed
+embedding model is not noticed.
+
+- **Store fingerprint.** Record `embedding_model`, its vector dimension,
+  `chunk_size`, `chunk_overlap`, and a metadata schema version alongside the
+  store. `index` and `query` refuse to run on a mismatch, naming the setting that
+  changed and pointing at `--force` or a fresh folder. **This is the single
+  highest-value item in the roadmap per hour of work** — it converts a silent
+  wrong-answer mode into a clear error. Note that `chunk_size` and
+  `chunk_overlap` changes are *not* corrupting, only inconsistent: old chunks stay
+  as they were (README already says to rebuild). They belong in the fingerprint so
+  the mixture is visible, but they should warn where a model change refuses.
+- **`index --force`.** Drop the collection and re-embed from `cache/`, with no
+  re-download. `--force --refetch` also clears the cache.
+- **Version-aware incremental indexing.** Record the library version from
+  `zot.last_modified_version()` in `config.yaml`; later runs ask for
+  `zot.items(since=version)` and re-embed only what changed, deleting that
+  attachment's chunks first. Compare *attachment* versions, not just parent item
+  versions — the PDF is what gets replaced.
+- **Deletion sync.** `zot.deleted(since=version)` reports removed items and
+  collections; drop their chunks.
+- **`index --prune`.** Remove chunks whose attachment is no longer in the pinned
+  collection. Needed because an item *moved out* of a collection is not a
+  deletion and so never appears in `deleted()`.
+
+**Acceptance:** changing `embedding_model` and running `query` is refused with a
+message naming that setting; replacing one `Writing` PDF in Zotero re-embeds
+exactly that attachment; deleting an item removes its chunks and it stops being
+cited; `--force` on `Writing` reproduces 146 chunks with zero downloads.
+
+### 11.2 Milestone 5 — Cover more of the library (0.3.0)
+
+**Goal:** index what is actually in the collections, not only the PDFs.
+
+- **Say what was skipped.** The dry run and the run summary should name content
+  types and titles per skip reason. `10  unsupported content type` currently gives
+  the user nothing to act on. (S — do this first; it also tells us which of the
+  formats below is worth the effort.)
+- **HTML snapshots** (`text/html`): extract text from the stored snapshot with a
+  stdlib `html.parser`-based extractor, so no dependency is added. The page number
+  becomes a section or offset index.
+- **Zotero notes** (`note` items): index the note body with the parent item's
+  metadata; the page field records "note" rather than a number.
+- **EPUB**: `zipfile` plus the same HTML extractor, with chapters as the page
+  analogue.
+- **`linked_url` attachments**: opt-in only (`ingest_linked_urls: false` by
+  default). Fetching arbitrary URLs is a different risk class from reading files
+  Zotero already stores, so it must be a deliberate choice.
+- **OCR, optional and external.** Only via an external binary (`ocrmypdf` /
+  `tesseract`) detected on `PATH`, controlled by `ocr: auto|never|always`. A
+  Python ML OCR stack would violate §9, and that constraint stands.
+
+**Acceptance:** on `Networking`, the summary names each skipped content type;
+enabling snapshot ingestion raises the indexed-item count, and a question
+answerable only from a snapshot is answered with a citation to it.
+
+### 11.3 Milestone 6 — Measurement before tuning (0.4.0)
+
+**Goal:** stop judging retrieval by eye. §12.1 already defines three questions
+with expected points — make them executable.
+
+- **`questions.yaml`** in the index folder: question, expected points, and
+  optionally the item keys a correct answer must cite.
+- **`zotero-rag eval [--json]`**: runs every question and reports retrieval hit
+  rate (did any chunk from an expected item reach `top_k`), point coverage judged
+  by an LLM, tokens, cost, and latency — a table plus one summary line.
+- **Comparable runs:** temperature 0, and each run records the settings that
+  affect it (models, `top_k`, chunk size, retrieval mode) so two runs can be
+  compared honestly.
+- Reuse `ragbench`'s scoring shape (§13) rather than inventing one.
+
+**Acceptance:** `eval` on `Writing` reproduces the §12 judgement — all three
+questions covered, at least one correct citation each — and a deliberately poor
+setting (`top_k: 1`) scores measurably worse.
+
+### 11.4 Milestone 7 — Retrieval quality (0.5.0)
+
+**Depends on M6.** Each item below is a hypothesis to be accepted or rejected by
+`eval`, cheapest first.
+
+- **Windowed retrieval (S).** Chunk ids are `<attachment_key>:<page>:<chunk_index>`,
+  so fetching ±N neighbours of each hit is a `get()` by id — no new storage, and it
+  addresses the case where an answer is split across a chunk boundary.
+- **Query-time metadata filters (S).** `--year`, `--author`, `--collection`,
+  `--doi` mapped to Chroma `where` clauses. The metadata is already stored (§7.2);
+  `year` needs an integer companion field for range comparisons.
+- **Hybrid retrieval.** BM25 over the stored documents — `rank_bm25` is pure
+  Python and does not breach §9 — fused with the vector hits by reciprocal rank
+  fusion, behind `retrieval: vector|hybrid`. Helps exactly where embeddings are
+  weakest: acronyms, author names, and exact phrases.
+- **Reranking without heavy dependencies.** An LLM reranker (a cheap model scores
+  each candidate, keep the best `top_k`) behind `reranker: null|llm`, retrieving
+  `top_k × fanout` candidates first. A hosted rerank API is a possible second
+  provider; a local cross-encoder is not, under §9.
+- **Revisit the default `top_k`.** On `Networking`, 5 chunks over 13 papers
+  produced an answer drawn from a single survey. Whether the default should rise
+  with collection size is a question for M6's numbers, not for taste.
+
+### 11.5 Milestone 8 — Scale and cost (0.6.0)
+
+- **Batched and concurrent embedding.** Embedding is serial per attachment today.
+  Batch chunks per request and run a bounded worker pool across attachments, while
+  keeping the per-attachment failure isolation of §10.
+- **Cost estimation.** A pricing table in config (per 1M tokens, mirroring
+  `ragbench`), surfaced under `-v` and in `--json` usage — and, most useful,
+  `index --dry-run` estimating the spend *before* it happens.
+- **Progress that scales.** ETA plus running token and cost counters, for runs
+  much larger than the 13-PDF `Networking` case.
+
+**Acceptance:** a `--force` re-index of `Networking` from cache is materially
+faster in wall-clock than the serial path, and the dry-run estimate lands within
+~10% of the tokens actually spent.
+
+### 11.6 Milestone 9 — Daily use (0.7.0)
+
+- **`zotero-rag status` (S).** Pinned collection, attachment and chunk counts, the
+  models and fingerprint behind the store, cache size, library version, and when
+  it was last indexed. The first thing wanted when returning to a folder after a
+  month.
+- **`chat` / REPL** with history, keeping the last N turns as conversational
+  context while still citing every answer, plus `/sources` and `/topk`.
+- **Streaming output** for `query`, so a long answer starts appearing immediately.
+- **Custom system prompt from a file** — `prompt_file` in config, `--prompt-file`
+  to override (§8.1 currently fixes the prompt).
+- **Friendlier CLI errors.** A stray positional such as `zotero-rag index
+  Networking` should point at `--collection`; Typer's "Got unexpected extra
+  argument" does not.
+- **Cache management:** report cache size, and `--prune` files no longer
+  referenced by the pinned collection.
+
+### 11.7 Milestone 10 — Reach (0.8.0)
+
+- **Group libraries.** `zotero_library_type: group` is already in the schema and
+  entirely unused: plumb it through `build_client`, take a group id, and fix the
+  citation URL builder (group item URLs differ from user ones). Cheaper than it
+  looks.
+- **Pinecone and other stores.** `vectorstore.py` is the only chromadb
+  touchpoint, so this is a `VectorStore` protocol plus one new implementation,
+  selected by `vector_db: chroma|pinecone`.
+- **MCP server** exposing `query` as a tool, making an index usable from Claude
+  Code and other MCP clients — plausibly the highest-leverage integration here,
+  since it puts the citations where the writing happens.
+- **Multiple collections per index folder** (a list of pinned collections),
+  *if* one-folder-per-collection proves too rigid in practice. Worth deciding
+  deliberately rather than drifting into.
+
+### 11.8 Milestone 11 — Engineering hygiene (any time)
+
+- **CI** running pytest, `ruff`, and `mypy` on push and pull request — deliberately
+  deferred for now (§10), but the cost of adding it only rises.
+- **Release process:** tag, changelog, `uv tool install` from a tag, and a version
+  bump policy tied to these milestones.
+- **Config schema version and migration**, so settings introduced by later
+  milestones do not break folders created by earlier ones.
+
+### 11.9 Where every deferred item landed
+
+From §1.1 and the original §11 list:
+
+| Deferred item | Milestone |
+|---|---|
+| `--force` clean-slate reindex | M4 |
+| Version-aware incremental indexing | M4 |
+| Deletion sync | M4 |
+| OCR of scanned PDFs | M5 |
+| HTML snapshot / EPUB / notes ingestion | M5 |
+| Metadata filters at query time (year, author, tag) | M7 |
+| Rerankers | M7 |
+| Hybrid / BM25 retrieval | M7 |
+| Windowed retrieval | M7 |
+| Cost estimation and pricing tables | M8 |
+| Batched / concurrent embedding | M8 |
+| Custom system prompt from file | M9 |
+| Interactive REPL with history | M9 |
+| Streaming output | M9 |
+| Group libraries | M10 |
+| Pinecone and other vector stores | M10 |
+| MCP server | M10 |
+| CI (tests, `ruff`, `mypy`) | M11 |
+
+Surfaced while building the PoC, not in the original list:
+
+| Item | Milestone | Why |
+|---|---|---|
+| Store fingerprint / model-change guard | M4 | a changed `embedding_model` currently corrupts retrieval silently |
+| `--prune` for items moved out of a collection | M4 | not a deletion, so `deleted()` never reports it |
+| Name the skipped content types | M5 | `10 unsupported content type` is not actionable |
+| Evaluation harness | M6 | §12.1 defines a golden set that nothing executes |
+| `status` command | M9 | no way to inspect a folder's index |
+| Stray-positional error message | M9 | `index Networking` fails opaquely |
+| Cache size reporting and pruning | M9 | the cache only ever grows |
+| Config schema version and migration | M11 | later settings must not break existing folders |
+
+**Not scheduled** — deferred because their value for *this* corpus is unproven,
+not because they are uninteresting: agentic / multi-step RAG, hierarchical
+summarisation retrieval, a web UI, cross-collection federated query, and
+figure/table extraction from PDFs. Each should be reconsidered only with an M6
+number showing the simpler path has run out.
 
 ## 12. Acceptance criteria
 
@@ -472,7 +712,9 @@ Last updated: 2026-07-27. **182 tests passing; `ruff` and `mypy` clean.**
 | 3 | `query`: retrieve, prompt, answer, cite | ✅ verified live |
 
 **All eight acceptance criteria (§12) are verified against the real library.**
-Everything still open is a §11 future milestone, not PoC scope.
+Everything still open is a §11 roadmap milestone, not PoC scope. Next up is
+**M4, store integrity and true reindexing (§11.1)** — the only open item that can
+make the tool answer *wrongly* rather than merely partially.
 
 ### 14.2 `query` as built (§3.4, §8)
 
@@ -579,4 +821,11 @@ categories, and a store an order of magnitude larger than `Writing`.
   questions over English text** — no multilingual override was needed (§5.3). The
   answers do lean on whichever 5 chunks come back, so a question whose expected
   points are spread across four papers is answered from two or three of them; a
-  reranker or a larger `top_k` is the §11 lever if that matters.
+  reranker or a larger `top_k` is the §11.4 lever if that matters.
+- **Known defect, unguarded in the PoC: the store does not record which embedding
+  model wrote it.** Verified behaviour — swapping `embedding_model` for another of
+  the same dimension yields meaningless neighbours with no error, while a
+  different dimension raises `Collection expecting embedding with dimension of N`.
+  Editing `embedding_model` in a populated index folder is therefore unsafe today;
+  delete `chroma/` and re-index instead. Fixed by the fingerprint in §11.1, which
+  is why M4 leads the roadmap.
