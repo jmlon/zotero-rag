@@ -625,6 +625,7 @@ copies of documents already indexed — they would compete with the PDF chunks i
 retrieval and could yield two citations for one source. So format support needs a
 **per-item preference order** rather than "index everything readable":
 
+# TO FIX: Include markdown with precedence over txt
 ```yaml
   # First format found for an item wins; the rest are recorded as skipped.
   attachment_preference: [pdf, docx, odt, html, txt]
@@ -665,6 +666,7 @@ Scope, ordered by measured payoff:
   `tesseract`) detected on `PATH`, controlled by `ocr: auto|never|always`. A Python
   ML OCR stack would violate §9, and that constraint stands. Two images in the
   whole library, so this is about scanned PDFs, not about the `image/*` rows above.
+  Decision: OCR is not in the near future priorities.
 
 **The one hard design consequence: `page` must become a locator.** §7.2 stores a
 1-based PDF page, and §8.2 renders it as `p. 4`. HTML, Markdown, DOCX, and notes
@@ -694,7 +696,7 @@ regression (146 chunks, `p. N` citations) is unchanged. **All verified — §14.
   class — it makes the tool a web client, with redirects, paywalls, dead links and
   whatever a URL resolves to today. It stays behind the planned
   `ingest_linked_urls: false` and wants its own milestone rather than a corner of
-  this one.
+  this one. This is not a feature for the near future.
 
 Both remain listed in §11.9 rather than being quietly dropped.
 
