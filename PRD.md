@@ -1,10 +1,10 @@
 # RAG CLI interface for Zotero
 
-**Status:** PoC complete — `list-collections`, `init`, `index`, and `query` are
-all built and verified against the live library; every acceptance criterion in
+**Status:** PoC complete — `list-collections`, `init`, `index`, `query` and `eval`
+are all built and verified against the live library; every acceptance criterion in
 §12 passes. See **§14 Implementation status** for what was built and
 **§11 Roadmap** for the sequenced milestones that follow.
-**Version:** 0.3.0
+**Version:** 0.4.0
 
 ## 1. Goal
 
@@ -130,6 +130,28 @@ zotero-rag query "QUESTION" [--top-k N] [--show-sources] [--json] [-v]
 - `--json` emits a machine-readable object (`answer`, `sources[]`, `usage`).
 - `--top-k` overrides the configured value for this call.
 
+### 3.5 `eval`
+
+```
+zotero-rag eval [--questions FILE] [--top-k N] [--only ID]... [--assess-context]
+                [--json] [-v]
+```
+
+- Runs a golden set of questions (§11.3) against the index and scores it: a table
+  of one row per question, then a single summary line. Requires an index folder
+  that has been indexed, like `query`.
+- Reports, per question, the **grade** (a 5-level ordinal), **point coverage**,
+  whether an expected item **reached `top_k`** (hit) and whether the answer
+  actually **cited** it, plus tokens and elapsed time.
+- The run prints the settings behind it — models, `top_k`, chunk size,
+  temperature, retrieval mode, store size — so two runs can be compared honestly.
+- `--questions` overrides the configured `eval.questions_file`; `--only` runs a
+  single question by id and is repeatable; `--assess-context` adds one judge call
+  per question rating whether the retrieved passages could support the expected
+  answer at all, which separates a retrieval failure from a generation one.
+- `--json` emits the whole report (`settings`, `aggregate`, `results[]`) on
+  stdout, with progress diverted to stderr.
+
 ## 4. Zotero access
 
 - Online Zotero Web API via `pyzotero`, authenticated with an API token.
@@ -215,6 +237,12 @@ index:
   llm_model: null
   embedding_model: null
   vector_db: null
+
+eval:                       # M6, §11.3
+  questions_file: questions.yaml   # relative paths resolve inside the index folder
+  judge_model: null         # null => grade with the answering model
+  judge_temperature: 0.0
+  context_char_budget: 12000       # cap on the context handed to --assess-context
 ```
 
 Multilingual corpora are supported by overriding `embedding_model` with a
@@ -227,6 +255,7 @@ multilingual OpenRouter slug. No local embedding models (see §9).
   config.yaml        # marker + settings + pinned collection
   .env               # created by init as a template (never committed)
   .gitignore         # created by init: ignores .env, chroma/, cache/
+  questions.yaml     # optional golden set for `eval` (§11.3); worth committing
   chroma/            # Chroma persistent store (created on first index)
   cache/             # downloaded attachments, <attachment-key>.<pdf|html|docx|…>
 ```
@@ -473,7 +502,7 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 |---|---|---|---|---|
 | 4 | Store integrity and true reindexing | correctness | 0.2.0 | ✅ **done** |
 | 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | ✅ **done** |
-| 6 | Measurement before tuning | evaluation | 0.4.0 | S–M |
+| 6 | Measurement before tuning | evaluation | 0.4.0 | ✅ **done** |
 | 7 | Retrieval quality | tuning | 0.5.0 | M |
 | 8 | Scale and cost | performance | 0.6.0 | S–M |
 | 9 | Daily use | ergonomics | 0.7.0 | M |
@@ -700,24 +729,74 @@ regression (146 chunks, `p. N` citations) is unchanged. **All verified — §14.
 
 Both remain listed in §11.9 rather than being quietly dropped.
 
-### 11.3 Milestone 6 — Measurement before tuning (0.4.0)
+### 11.3 Milestone 6 — Measurement before tuning (0.4.0) — ✅ done
+
+**Status: implemented and verified live** (§14.8). Cost is the one listed item not
+delivered; it needs M8's pricing table and is recorded in §11.9 rather than
+quietly dropped.
 
 **Goal:** stop judging retrieval by eye. §12.1 already defines three questions
 with expected points — make them executable.
 
 - **`questions.yaml`** in the index folder: question, expected points, and
-  optionally the item keys a correct answer must cite.
-- **`zotero-rag eval [--json]`**: runs every question and reports retrieval hit
-  rate (did any chunk from an expected item reach `top_k`), point coverage judged
-  by an LLM, tokens, cost, and latency — a table plus one summary line.
+  optionally the item keys a correct answer must cite. Built as specified, with
+  one addition: a question may also carry a prose `answer:`. A reference answer
+  generated alongside a question is prose, not a bullet list, and forcing it into
+  points would discard the more precise statement — so points and prose are both
+  accepted, and both are handed to the judge. Points are what coverage counts.
+- **`zotero-rag eval [--json]`**: built as specified (§3.5). Reports retrieval hit
+  rate, point coverage judged by an LLM, tokens and latency — a table plus one
+  summary line.
 - **Comparable runs:** temperature 0, and each run records the settings that
-  affect it (models, `top_k`, chunk size, retrieval mode) so two runs can be
-  compared honestly.
-- Reuse `ragbench`'s scoring shape (§13) rather than inventing one.
+  affect it. See the caveat on determinism below: temperature 0 is necessary but
+  not sufficient.
+- Reuse `ragbench`'s scoring shape (§13) rather than inventing one. Done — the
+  5-level ordinal grade and its scores are `ragbench.models.GradeLabel`, and
+  `--assess-context` reuses its `ContextVerdict` labels. **One deliberate
+  divergence:** ragbench defaults a failed judge call to `wrong`, which reports a
+  grading outage as a retrieval regression. A seventh label, `error`, scores zero
+  but is counted separately, so a flaky provider cannot masquerade as a worse index.
+
+**Three metrics, measuring deliberately different things.** Hit rate is
+mechanical — did any chunk of an expected item reach `top_k` — so it cannot drift
+with a model revision, and it separates retrieval failure from generation failure.
+The citation rate is stricter and is what §12.7 actually asks for: a passage that
+reached `top_k` but went uncited did not support the answer. Point coverage needs
+the LLM, because "uno es tan bueno como su último paper" and "previous success
+does not guarantee future success" are the same point and no string match sees that.
 
 **Acceptance:** `eval` on `Writing` reproduces the §12 judgement — all three
 questions covered, at least one correct citation each — and a deliberately poor
 setting (`top_k: 1`) scores measurably worse.
+
+**Verdict: half of the first clause failed, and that is the milestone working.**
+The citation half holds — 100% of `Writing` questions cite a real `Writing` item.
+The "all three questions covered" half does not: measured coverage is 22–40% and
+one question grades `wrong` outright. §12.7's "covering most of the expected
+points" was an eyeball judgement, and the first thing measurement did was
+contradict it. Rather than tune the judge until it agreed, the number stands —
+§14.8 has the detail, including why the `publicacion` question genuinely fails.
+
+The `top_k: 1` clause passed, but only on the larger set: see §11.3.1.
+
+#### 11.3.1 What measurement immediately said about measurement
+
+Two findings that only appear once the harness exists, both of which change how
+§11.4 must be run:
+
+- **Three questions cannot measure anything.** On `Writing`, `top_k: 1` scored
+  *better* than `top_k: 5` (mean 2.00 vs 1.33), the opposite of the acceptance
+  criterion's prediction, and two identical `top_k: 5` runs disagreed by 14
+  coverage points. On the 21-question `Networking` set the same comparison is
+  unambiguous — mean 0.76 at `top_k: 1` against 1.81 at 5 and 2.38 at 10 — and
+  the repeat run reproduced every mechanical metric exactly. A 3-question set is
+  a smoke test; a tuning decision needs the larger one.
+- **Temperature 0 does not make an LLM judge deterministic.** Repeat runs
+  reproduced the *grade labels* and every mechanical metric bit-for-bit, while
+  point coverage moved by 2–3 points on 21 questions and up to 14 on 3. So the
+  ordinal grade and the hit/citation rates are the trustworthy comparators, and a
+  coverage difference smaller than a few points is noise. The mechanical metrics
+  are the ones worth regressing against, which is the argument for having them.
 
 ### 11.4 Milestone 7 — Retrieval quality (0.5.0)
 
@@ -738,9 +817,29 @@ setting (`top_k: 1`) scores measurably worse.
   each candidate, keep the best `top_k`) behind `reranker: null|llm`, retrieving
   `top_k × fanout` candidates first. A hosted rerank API is a possible second
   provider; a local cross-encoder is not, under §9.
-- **Revisit the default `top_k`.** On `Networking`, 5 chunks over 13 papers
-  produced an answer drawn from a single survey. Whether the default should rise
-  with collection size is a question for M6's numbers, not for taste.
+- **Revisit the default `top_k` — M6 has now answered this, and the answer is
+  yes.** On the 21-question `Networking` set every metric improves monotonically
+  with `top_k`, and the step from 5 to 10 is larger than the noise floor by an
+  order of magnitude:
+
+  | `top_k` | mean score | point coverage | retrieval hit | expected item cited | tokens |
+  |---|---|---|---|---|---|
+  | 1 | 0.76 | 22.7% | 71% | 29% | 32.6k |
+  | 5 (default) | 1.81 | 53.3% | 86% | 76% | 58.2k |
+  | 5 (repeat) | 1.81 | 56.0% | 86% | 76% | 58.2k |
+  | 10 | **2.38** | **67.9%** | **95%** | **81%** | 86.7k |
+
+  So on a 1,186-chunk store over 16 documents, `top_k: 10` buys +0.57 mean score
+  and +9 points of retrieval hit for ~1.5× the tokens. This is now a measured
+  trade-off rather than taste — but it is one store, and it is the *first* thing
+  §11.4 should re-run after any retrieval change, not a settled default. Raising
+  the shipped default is left to M7, where windowed retrieval and reranking
+  compete for the same context budget and should be compared against this table
+  rather than against each other in isolation.
+
+  Note the shape of the `top_k: 1` failure: 13 of 21 questions answered "I don't
+  know" rather than guessing from one chunk. The §12.8 abstention behaviour holds
+  up under starvation, which is the good half of a bad setting.
 
 ### 11.5 Milestone 8 — Scale and cost (0.6.0)
 
@@ -814,7 +913,7 @@ From §1.1 and the original §11 list:
 | Rerankers | M7 |
 | Hybrid / BM25 retrieval | M7 |
 | Windowed retrieval | M7 |
-| Cost estimation and pricing tables | M8 |
+| Cost estimation and pricing tables | M8 — also covers the `eval` cost column deferred from M6 |
 | Batched / concurrent embedding | M8 |
 | Custom system prompt from file | M9 |
 | Interactive REPL with history | M9 |
@@ -838,7 +937,8 @@ Surfaced while building the PoC, not in the original list:
 | Linked-URL ingestion | **deferred**, §11.2.1 | makes the tool a web client; wants its own milestone |
 | Wrap httpx transport errors | M5 ✅ | a Zotero timeout printed a traceback (§14.7) |
 | Per-chunk embedding-model tag, `index --repair` | M4 | repair the stale chunks instead of rebuilding the store |
-| Evaluation harness | M6 | §12.1 defines a golden set that nothing executes |
+| Evaluation harness | M6 ✅ | §12.1 defines a golden set that nothing executes |
+| Per-question source provenance in a golden set | M6 ✅ | one article per question is what makes hit rate discriminating (§12.2) |
 | `status` command | M9 | no way to inspect a folder's index |
 | Stray-positional error message | M9 | `index Networking` fails opaquely |
 | Cache size reporting and pruning | M9 | the cache only ever grows |
@@ -916,7 +1016,44 @@ item that really exists in `Writing`.
 
 The three questions and their expected points above are the source of truth; the
 `Writing` collection is small enough that they are maintained here rather than in
-a separate file.
+a separate file. Since M6 they are also **executable**, as
+`questions/Writing.yaml` — copy it into an index folder as `questions.yaml` and
+run `zotero-rag eval`. That file must stay faithful to this section; a test parses
+it on every run so a typo fails the suite rather than a live evaluation.
+
+`expected_items` there lists the four `Writing` items that actually have an
+indexed PDF, which encodes §12.7's criterion literally — "at least one correct
+citation resolving to a real item in `Writing`". It deliberately does **not**
+claim to know which of four overlapping how-to articles a given point came from,
+because for this set that provenance is genuinely unknown.
+
+### 12.2 The `Networking` golden set
+
+Test collection: **`Networking`**, key **`SHWKWYDD`** — a *tree* of 8
+collections, 18 items, 16 indexed documents (13 PDF + 3 HTML), 1,186 chunks. This
+is the set that can actually measure a retrieval change, and the one §11.4 should
+be run against.
+
+**21 questions over 7 articles, three per article**, in `questions/Networking.yaml`,
+generated from `questions/Networking.txt` (which remains the source of truth for
+the wording of every question and reference answer). Nine are in Spanish and
+twelve in English, over an English corpus, so the set exercises §5.3 both ways.
+
+Two properties make it stronger than the `Writing` set:
+
+- **One source article per question**, so `expected_items` names exactly the item a
+  correct answer must rest on, and retrieval hit rate becomes a real discrimination
+  test rather than a check that retrieval stayed inside the collection.
+- **A verbatim prose reference answer *and* distilled expected points** per
+  question. The prose is the more precise statement and is what the judge weighs;
+  the points are the units coverage is counted in. Nothing in the points asserts
+  anything the reference answer does not already say.
+
+One trap worth recording, because it is the kind of thing that silently inflates a
+score: the collection also holds `KJFG9YUE`, "Traffic engineering with
+reinforcement learning in SDN", which reads like the CFR-RL paper but is a saved
+Bing search page. It is deliberately not an expected item, so retrieving it is not
+a hit.
 
 ## 13. Reference material
 
@@ -934,7 +1071,7 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-27. **295 tests passing; `ruff`, `ruff format` and `mypy` clean.**
+Last updated: 2026-07-28. **348 tests passing; `ruff`, `ruff format` and `mypy` clean.**
 
 ### 14.1 Done
 
@@ -947,10 +1084,11 @@ Last updated: 2026-07-27. **295 tests passing; `ruff`, `ruff format` and `mypy` 
 | 3 | `query`: retrieve, prompt, answer, cite | ✅ verified live |
 | 4 | Store fingerprint, version-aware reindexing, repair, prune | ✅ verified live |
 | 5 | HTML / text / DOCX / ODT / EPUB / notes, locators, preference | ✅ verified live |
+| 6 | `eval`: golden sets, LLM judge, hit rate, coverage, comparable runs | ✅ verified live |
 
 **All eight acceptance criteria (§12) are verified against the real library**, as
-are M4 (§14.6) and M5 (§14.7). Next up is **M6, measurement (§11.3)** — an
-evaluation harness, before any retrieval tuning.
+are M4 (§14.6), M5 (§14.7) and M6 (§14.8). Next up is **M7, retrieval quality
+(§11.4)** — and it now has a baseline to be measured against rather than eyeballed.
 
 ### 14.2 `query` as built (§3.4, §8)
 
@@ -977,11 +1115,12 @@ evaluation harness, before any retrieval tuning.
 
 ```
 src/zotero_rag/
-  cli.py           typer app: list-collections, init, index, query
+  cli.py           typer app: list-collections, init, index, query, eval
   config.py        pydantic models, layered loading, pin_collection()
   scaffold.py      init: config.yaml + .env + .gitignore
   zotero_api.py    client, collection tree, path/key resolution, item fetch
   planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata()
+  evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
   documents.py     formats, content-type mapping, locator kinds
   html_text.py     stdlib HTML → sections (snapshots and notes)
   office.py        DOCX / ODT / EPUB via zipfile + xml.etree
@@ -1013,11 +1152,20 @@ mkdir /tmp/idx && cp .env /tmp/idx/ && cd /tmp/idx
 uv run zotero-rag init .
 uv run zotero-rag -v index --collection-key TGXVGXGP
 uv run zotero-rag -v query "¿Qué TIPs hay para escritores?"
+
+cp <repo>/questions/Writing.yaml questions.yaml    # M6, §11.3
+uv run zotero-rag eval
 ```
 
 Expected: 4 PDFs, 22 pages, 146 chunks, ~30,900 embedding tokens, ~7s. A second
 `index` reports 0 indexed / 4 skipped. The query answers in Spanish in ~3s,
 citing 2–3 real `Writing` items with working `zotero.org` URLs.
+
+Expected from `eval`: 3 questions, retrieval hit 100%, expected item cited 100%,
+mean score ~1.3/5 and point coverage 22–40% — the last two are *low on purpose*,
+and §14.8 explains why that is the correct reading of this collection rather than a
+misconfiguration. For a set large enough to compare settings, use
+`questions/Networking.yaml` against `Networking` (§12.2).
 
 **Second collection, verified from a global `uv tool install`:** `Networking`
 (`SHWKWYDD`), which is a *tree* rather than a single collection — 8 collections, 18
@@ -1131,3 +1279,47 @@ and those items are now answerable, but a snapshot of a paywalled article is an
 abstract, not the paper. This is the §11.2 prediction confirmed: a snapshot of an
 article that also has a PDF is usually the abstract page plus furniture, which is
 exactly why the PDF wins by default.
+
+### 14.8 M6 as built and verified
+
+Verified live against both collections, freshly indexed: `Writing` reproduced its
+recorded regression exactly (4 documents, 146 chunks from 22 pages, 30,863
+embedding tokens) and `Networking` reproduced M5's (16 documents, 1,186 chunks from
+211 pages and sections, 271,417 tokens).
+
+| Check | Result |
+|---|---|
+| `eval` on `Writing` (3 questions) | ran, graded and reported; **retrieval hit 100%, expected item cited 100%** — the §12.7 citation criterion reproduced |
+| `eval` on `Writing`, point coverage | **22–40% across runs, one question `wrong`** — §12.7's "covering most of the expected points" does *not* survive measurement (see below) |
+| `eval` on `Networking` (21 questions) | mean 1.81/5, hit 86%, cited 76%, coverage 53–56%, 2 good / 15 partial / 2 wrong / 2 no answer, ~58k tokens in ~100s |
+| `top_k: 1` scores measurably worse | **yes on `Networking`** — 0.76 vs 1.81 mean, 29% vs 76% citation rate. **No on `Writing`**, where it scored *better*: a 3-question set cannot resolve the difference (§11.3.1) |
+| Repeat run, identical settings | grade labels, hit rate and citation rate **bit-identical**; point coverage moved 53.3% → 56.0%. Temperature 0 is necessary, not sufficient |
+| `--json` | full report — `settings`, `aggregate`, `results[]` — on stdout, progress on stderr, so the payload is never contaminated |
+| `--only`, `--top-k`, `--assess-context` | all exercised; an unknown `--only` id lists the available ones |
+| Golden sets parse in CI | both shipped sets are loaded by the test suite, so a typo fails `pytest` rather than a paid run |
+| No new dependency | `pyyaml` and `langchain-openai` were already required; §9 holds |
+| Regression | 348 tests, `ruff`, `ruff format`, `mypy` all clean |
+
+**The `Writing` coverage result is a real finding, not a harness defect.** Reading
+the answers confirms the grades. The `publicacion` question — "¿Qué pasos involucra
+el proceso de publicación?" — retrieved three chunks *all from Driscoll & Aquilina*
+and answered with that paper's six-step **writing** process: read to write, select
+the journal, plan, contact the editorial team, use the journal as a template,
+prepare the manuscript. The expected points are about what happens *after*
+submission: peer-review revisions, the editor's acceptance letter, the galley
+proof. The answer is on-topic, fluent, correctly cited, and does not answer the
+question — which is precisely the failure mode an eyeball review passes and a
+golden set catches. The fix belongs to M7 (this looks like a retrieval-diversity
+problem), not to the judge.
+
+**What the `Networking` numbers point M7 at.** Of 21 questions, 3 never retrieved
+their source article at all (`jellyfish-3`, `wang-2`, `wang-3`) and 2 more
+retrieved it but never cited it (`cfr-rl-3`, `pathan-1`). That split is the whole
+argument for keeping a mechanical hit rate beside an LLM grade: the first three are
+retrieval failures and the second two are generation failures, and no single
+quality score would have told them apart.
+
+**Judge cost is not negligible and is reported separately.** The `Networking` run
+spent 31,097 prompt + 2,172 completion tokens answering and a further 24,234
+grading — grading is ~42% of the bill. Conflating the two under one "tokens"
+figure would have hidden that, which is why `judge_tokens` is its own field.

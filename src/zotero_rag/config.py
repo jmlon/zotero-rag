@@ -130,6 +130,23 @@ class IndexConfig(BaseModel):
         return self.collection_key is not None
 
 
+class EvalConfig(BaseModel):
+    """Settings for `zotero-rag eval` (PRD §11.3)."""
+
+    #: Golden set, resolved relative to the index folder unless absolute.
+    questions_file: str = "questions.yaml"
+    #: null => grade with the same model that answers. Naming a stronger model
+    #: here is the usual reason to set it.
+    judge_model: str | None = None
+    #: Keep at 0. Necessary but not sufficient for comparable runs: repeat runs
+    #: reproduce the grade labels and every mechanical metric, while point coverage
+    #: can still move a few points, so a small coverage delta is noise.
+    judge_temperature: float = Field(default=0.0, ge=0.0)
+    #: Context handed to the optional retrieval assessment is truncated to this
+    #: many characters, so a large `top_k` cannot overflow the judge's window.
+    context_char_budget: int = Field(default=12000, gt=0)
+
+
 class Config(BaseModel):
     """The merged configuration for a run."""
 
@@ -137,6 +154,7 @@ class Config(BaseModel):
 
     global_: GlobalConfig = Field(default_factory=GlobalConfig, alias="global")
     index: IndexConfig = Field(default_factory=IndexConfig)
+    eval: EvalConfig = Field(default_factory=EvalConfig)
 
     # Directory the index config was loaded from, when there was one.
     source_dir: Path | None = Field(default=None, exclude=True)
@@ -144,6 +162,11 @@ class Config(BaseModel):
     @property
     def llm_model(self) -> str:
         return self.index.llm_model or self.global_.defaults.llm_model
+
+    @property
+    def judge_model(self) -> str:
+        """The grading model: the configured one, else whatever answers."""
+        return self.eval.judge_model or self.llm_model
 
     @property
     def embedding_model(self) -> str:

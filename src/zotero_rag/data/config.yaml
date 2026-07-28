@@ -38,3 +38,18 @@ index:
     llm_model: null
     embedding_model: null
     vector_db: null
+
+eval:
+    # Golden set for `zotero-rag eval`: questions, expected points, and the items
+    # a correct answer should cite. Relative paths resolve inside this folder.
+    questions_file: questions.yaml
+    # null => grade with the same model that answers. Point a stronger model at
+    # the grading if you want a second opinion on a cheap answering model.
+    judge_model: null
+    # Keep this at 0. It does not make the judge fully deterministic — repeat runs
+    # reproduce the grades but can move point coverage by a few points — so treat a
+    # small coverage difference between two runs as noise, not as a result.
+    judge_temperature: 0.0
+    # Characters of retrieved context handed to the optional --assess-context
+    # pass, so a large top_k cannot overflow the judge's window.
+    context_char_budget: 12000

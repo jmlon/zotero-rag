@@ -1,0 +1,53 @@
+# Golden set for the `Writing` collection (key TGXVGXGP) — PRD §12.1.
+#
+# Copy this file into the index folder as `questions.yaml`, or run
+#   zotero-rag eval --questions /path/to/Writing.yaml
+#
+# The questions are asked in Spanish over an English corpus on purpose: that is
+# what exercises the multilingual concern in PRD §5.3. The expected points are
+# the ones recorded in §12.1, unchanged.
+#
+# `expected_items` lists the four `Writing` items that actually have an indexed
+# PDF. That encodes the acceptance criterion of §12.7 literally — "at least one
+# correct citation resolving to a real item in Writing" — rather than claiming to
+# know which of four overlapping how-to articles a given point came from. The
+# per-question provenance is genuinely unknown for this set; the `Networking` set
+# has one source article per question and is the discriminating test of retrieval.
+#
+#   J7M67LD6  Driscoll & Aquilina (2011)  Writing for publication: A practical Six Step Approach
+#   9WQIGHVE  Elserag (2012)              Writing and publishing scientific papers
+#   MZ4SZQV5  Ecarnot et al. (2015)       Writing a scientific article: a step-by-step guide
+#   JU3XRXRB  Powell (2010)               Publish like a pro
+
+questions:
+    - id: tips
+      question: >-
+          ¿Qué TIPs hay para escritores?
+      expected_points:
+          - uno es tan bueno como su último paper; el éxito previo no garantiza el futuro
+          - hay que enganchar al editor con el abstract
+          - no borrar archivos, guardar las versiones previas
+          - la curva de aprendizaje es larga
+          - el trabajo más significativo es eliminar excesos y simplificar
+          - escribir todos los días
+          - terminar cuando la idea ya se transmitió
+      expected_items: [J7M67LD6, 9WQIGHVE, MZ4SZQV5, JU3XRXRB]
+
+    - id: pre-escritura
+      question: >-
+          ¿Cuáles son las tareas previas a la escritura de un paper?
+      expected_points:
+          - revisar la bibliografía y las referencias, levantar el estado del arte
+          - tener los resultados de la investigación y su análisis estadístico
+          - preparar las figuras y representaciones
+          - identificar la revista objetivo
+      expected_items: [J7M67LD6, 9WQIGHVE, MZ4SZQV5, JU3XRXRB]
+
+    - id: publicacion
+      question: >-
+          ¿Qué pasos involucra el proceso de publicación?
+      expected_points:
+          - las revisiones solicitadas por los pares
+          - la carta de aceptación del editor
+          - la revisión del galley proof: contenido, tablas, organización y tipografía
+      expected_items: [J7M67LD6, 9WQIGHVE, MZ4SZQV5, JU3XRXRB]

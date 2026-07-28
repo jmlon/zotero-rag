@@ -29,6 +29,10 @@ Sources
 
 Questions may be asked in any language, whatever language the papers are in.
 
+There is also a `zotero-rag eval` command that scores the index against a set of
+questions you write, so "does a bigger `top_k` help?" has a number for an answer
+instead of an impression.
+
 ## Requirements
 
 - Python 3.12 or newer, and [uv](https://docs.astral.sh/uv/).
@@ -196,6 +200,48 @@ The source list shows only the sources the answer actually cited. When the
 collection has nothing relevant, the tool says it does not know rather than
 inventing an answer — that is the point of the citations.
 
+### 5. Measure it, before you tune it
+
+Whether a larger `top_k`, a different chunk size, or another embedding model
+actually helps is a question with a number for an answer. Write a `questions.yaml`
+beside your `config.yaml`:
+
+```yaml
+questions:
+    - id: fog-node
+      question: What distinguishes a fog node from a cloud node?
+      expected_points:
+          - it sits between the edge devices and the cloud
+          - it provides compute close to where the data is produced
+      # Optional: the Zotero item a correct answer should rest on. Titles work too
+      # (expected_titles), matched case-insensitively as substrings.
+      expected_items: [JSIBCSBW]
+```
+
+```bash
+zotero-rag eval                      # table of results plus one summary line
+zotero-rag eval --top-k 10           # same questions, more passages — compare
+zotero-rag eval --json > run.json    # the full report, for diffing two runs
+zotero-rag eval --only fog-node -v   # one question, with the judge's reasoning
+```
+
+Each run reports four things per question — the grade, how many expected points
+were covered, whether an expected item was **retrieved**, and whether the answer
+actually **cited** it — and prints the settings that produced them, so two runs are
+comparable. The retrieval and citation columns are mechanical rather than
+model-judged, which makes them the ones worth trusting when you compare runs:
+they separate "retrieval never found the paper" from "retrieval found it and the
+answer ignored it", and those have different fixes.
+
+Two ready-made sets live in `questions/` — a 3-question `Writing` smoke test and a
+21-question `Networking` set. On the latter, `top_k: 10` measurably beats the
+default of 5 (mean score 2.38 vs 1.81, retrieval hit 95% vs 86%) for about 1.5× the
+tokens. A 3-question set, by contrast, turned out too small to resolve any such
+difference — if you write your own, aim for twenty rather than three.
+
+Note that grading costs tokens too — roughly 40% of a run's bill — so `eval`
+reports the judge's usage as its own figure rather than folding it in.
+
 ## Configuring an index
 
 Edit the `config.yaml` in the index folder. Useful settings:
@@ -210,6 +256,8 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `temperature` | `0.0` | answer randomness; leave at 0 for factual work |
 | `llm_model` | `openai/gpt-4o-mini` | any OpenRouter chat model slug |
 | `embedding_model` | `openai/text-embedding-3-small` | any OpenRouter embedding slug |
+| `eval.questions_file` | `questions.yaml` | golden set used by `eval` |
+| `eval.judge_model` | `null` | grading model; `null` means the answering model |
 
 Changing `chunk_size` or `chunk_overlap` only affects newly indexed attachments —
 existing chunks keep the shape they were given. `index --force` rebuilds them all.
@@ -235,6 +283,7 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
 <index-folder>/
   config.yaml     settings and the pinned collection
   .env            your credentials (never committed)
+  questions.yaml  optional golden set for `eval` — worth committing
   chroma/         the vector store
   cache/          downloaded PDFs, kept so re-indexing does not re-download
 ```

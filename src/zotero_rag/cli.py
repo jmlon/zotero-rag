@@ -38,6 +38,21 @@ from zotero_rag.errors import (
     NotIndexedError,
     ZoteroRagError,
 )
+from zotero_rag.evaluation import (
+    MAX_SCORE,
+    EvalQuestion,
+    EvalReport,
+    Grade,
+    QuestionOutcome,
+    QuestionSetError,
+    aggregate,
+    build_context_assessor,
+    build_verdict_fn,
+    evaluate,
+    load_questions,
+    resolve_questions_path,
+    run_settings,
+)
 from zotero_rag.fingerprint import StoreFingerprint, advisory, blocking
 from zotero_rag.indexer import (
     IndexStats,
@@ -803,6 +818,217 @@ def query(
         print(_answer_as_json(result, show_sources))  # noqa: T201
         return
     _print_answer(result, show_sources, verbose=_is_verbose())
+
+
+_GRADE_STYLES: dict[Grade, str] = {
+    Grade.PERFECT: "bold green",
+    Grade.GOOD: "green",
+    Grade.PARTIAL: "yellow",
+    Grade.POOR: "red",
+    Grade.WRONG: "bold red",
+    Grade.NO_ANSWER: "dim",
+    Grade.ERROR: "bold magenta",
+}
+
+
+def _flag(value: bool | None) -> str:
+    """A tri-state cell: yes, no, or "the question did not say"."""
+    if value is None:
+        return "[dim]—[/dim]"
+    return "[green]yes[/green]" if value else "[red]no[/red]"
+
+
+def _percent(value: float | None) -> str:
+    return "[dim]n/a[/dim]" if value is None else f"{value * 100:.0f}%"
+
+
+def _select_questions(questions: list[EvalQuestion], only: list[str]) -> list[EvalQuestion]:
+    """Narrow the set to the requested ids, complaining about ids that do not exist."""
+    if not only:
+        return questions
+    wanted = list(dict.fromkeys(only))
+    by_id = {question.id: question for question in questions}
+    if missing := [name for name in wanted if name not in by_id]:
+        raise QuestionSetError(
+            f"No question with id {', '.join(repr(name) for name in missing)}. "
+            f"The set holds: {', '.join(by_id)}."
+        )
+    return [by_id[name] for name in wanted]
+
+
+def _eval_table(outcomes: list[QuestionOutcome]) -> Table:
+    """Per-question results, one row each."""
+    table = Table(title="Evaluation", title_justify="left")
+    table.add_column("Id", style="dim")
+    table.add_column("Question", overflow="ellipsis", max_width=44)
+    table.add_column("Grade")
+    table.add_column("Points", justify="right")
+    table.add_column("Hit", justify="center")
+    table.add_column("Cited", justify="center")
+    table.add_column("Tokens", justify="right", style="dim")
+    table.add_column("Time", justify="right", style="dim")
+
+    for outcome in outcomes:
+        coverage = outcome.coverage
+        points = (
+            f"{coverage.covered}+{coverage.partial}/{coverage.total}"
+            if coverage.total
+            else "[dim]—[/dim]"
+        )
+        style = _GRADE_STYLES[outcome.grade]
+        tokens = (
+            outcome.prompt_tokens
+            + outcome.completion_tokens
+            + outcome.embedding_tokens
+            + outcome.judge_tokens
+        )
+        table.add_row(
+            escape(outcome.id),
+            escape(outcome.question),
+            f"[{style}]{outcome.grade}[/]",
+            points,
+            _flag(outcome.hit),
+            _flag(outcome.cited_expected),
+            str(tokens),
+            f"{outcome.elapsed_s:.1f}s",
+        )
+    return table
+
+
+def _print_eval_report(report: EvalReport, verbose: bool) -> None:
+    """The table, the one-line summary, and the settings that produced them."""
+    summary = report.aggregate
+    console.print(_eval_table(report.results))
+
+    # PRD §11.3 asks for "a table plus one summary line". This is that line.
+    console.print(
+        f"\n[bold]{summary.mean_score:.2f}/{MAX_SCORE}[/bold] mean score over "
+        f"{_plural(summary.questions, 'question')}  ·  "
+        f"retrieval hit {_percent(summary.hit_rate)}  ·  "
+        f"expected item cited {_percent(summary.citation_rate)}  ·  "
+        f"point coverage {_percent(summary.mean_coverage)}  ·  "
+        f"{summary.total_tokens} tokens  ·  {summary.elapsed_s:.1f}s"
+    )
+
+    grades = "  ".join(
+        f"[{_GRADE_STYLES[Grade(label)]}]{count} {label}[/]"
+        for label, count in summary.grade_counts.items()
+    )
+    console.print(f"  {grades}")
+    if summary.context_counts:
+        listed = ", ".join(f"{count} {label}" for label, count in summary.context_counts.items())
+        console.print(f"  [dim]retrieved context:[/dim] {listed}")
+    if summary.errors:
+        console.print(
+            f"  [magenta]{_plural(summary.errors, 'question')} could not be graded[/magenta] "
+            f"[dim](counted apart from a genuine 'wrong'; rerun to retry)[/dim]"
+        )
+
+    settings = report.settings
+    console.print(
+        f"\n[dim]{settings.llm_model} answering, {settings.judge_model} grading, "
+        f"{settings.embedding_model} embedding · top_k {settings.top_k} · "
+        f"chunks {settings.chunk_size}/{settings.chunk_overlap} · "
+        f"temperature {settings.temperature} · {settings.retrieval} retrieval · "
+        f"{_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
+    )
+
+    if verbose:
+        for outcome in report.results:
+            console.print(f"\n[bold]{escape(outcome.id)}[/bold] {escape(outcome.question)}")
+            console.print(f"  [dim]{escape(outcome.rationale)}[/dim]")
+            if outcome.error:
+                console.print(f"  [red]{escape(outcome.error)}[/red]")
+
+
+@app.command("eval")
+def eval_command(
+    questions_file: Annotated[
+        Path | None,
+        typer.Option("--questions", help="Question set to run; defaults to the configured one."),
+    ] = None,
+    top_k: Annotated[
+        int | None,
+        typer.Option("--top-k", help="Chunks to retrieve; overrides the configured top_k.", min=1),
+    ] = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option("--only", help="Run just this question id; repeatable."),
+    ] = None,
+    assess_context: Annotated[
+        bool,
+        typer.Option(
+            "--assess-context",
+            help="Also ask the judge whether the retrieved passages could support "
+            "the expected answer. One extra call per question.",
+        ),
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit the full report as JSON instead of a table.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Score the index against a golden set of questions.
+
+    Reports retrieval hit rate, point coverage judged by an LLM, tokens and
+    latency, alongside the settings that produced them so two runs can be
+    compared. Must be run from an index folder that has been indexed.
+    """
+    _enable_verbose(verbose)
+
+    try:
+        config, store = _open_index()
+        questions_path = resolve_questions_path(config, questions_file)
+        questions = _select_questions(load_questions(questions_path), only or [])
+
+        chosen_top_k = top_k if top_k is not None else config.index.top_k
+        embeddings = build_embeddings(config)
+        chat = build_chat(config)
+        verdict_of = build_verdict_fn(config)
+        assessor = build_context_assessor(config) if assess_context else None
+
+        def ask(messages: list[BaseMessage]) -> AIMessage:
+            return cast(AIMessage, chat.invoke(messages))
+
+        def answer_one(question: str) -> QueryResult:
+            return answer_question(
+                question,
+                store=store,
+                embed_query=embeddings.embed_query,
+                answer=ask,
+                top_k=chosen_top_k,
+            )
+
+        # Progress on stderr, so --json on stdout is never contaminated.
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Evaluating...", total=len(questions))
+
+            def on_start(question: EvalQuestion) -> None:
+                progress.update(task, advance=1, description=escape(question.question[:48]))
+
+            outcomes = evaluate(questions, answer_one, verdict_of, assessor, on_start)
+
+        report = EvalReport(
+            settings=run_settings(config, store, chosen_top_k, questions_path),
+            aggregate=aggregate(outcomes),
+            results=outcomes,
+        )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    if as_json:
+        # Plain print: rich would wrap and highlight the JSON.
+        print(report.model_dump_json(indent=2))  # noqa: T201
+        return
+    _print_eval_report(report, verbose=_is_verbose())
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -1,0 +1,700 @@
+# Golden set for the `Networking` collection (key SHWKWYDD) — 21 questions over
+# the 7 articles in questions/Networking.txt, which is the source of truth for the
+# wording of every `question:` and `answer:` below.
+#
+# Copy into the index folder as `questions.yaml`, or:
+#   zotero-rag eval --questions /path/to/Networking.yaml
+#
+# Each question was generated from ONE article, so `expected_items` names exactly
+# the item a correct answer has to rest on. That makes retrieval hit rate a real
+# discrimination test here, unlike the `Writing` set where four overlapping how-to
+# articles cover the same ground (see the header of Writing.yaml).
+#
+# `answer:` is the reference answer verbatim; `expected_points:` distils the same
+# text into the units coverage is counted in. Nothing in the points is asserted
+# that the reference answer does not already say.
+#
+# Item keys, resolved against the live library:
+#
+#   TR6MHCJ2  Zhang et al. (2020)    CFR-RL: Traffic Engineering with Reinforcement Learning in SDN
+#   EIAG8GE3  ALzaid et al. (2020)   Multi-Path Routing on the Jellyfish Networks
+#   NNIMX36C  Vadluri et al. (2019)  A comprehensive review on SDN architecture, applications and benefits
+#   K267VCTQ  Kahil et al. (2025)    RL for data center energy efficiency optimization: a systematic review
+#   QCIWK4GF  Pathan et al. (2024)   Priority based energy and load aware routing algorithms for SDN DCN
+#   X4FACK5U  Wang et al. (2022)     Towards an energy-efficient Data Center Network based on deep RL
+#   MZS6HDXR  Zheng et al. (2022)    Research on energy-saving routing technology based on deep RL
+#
+# A caution about one near-miss: the collection also holds KJFG9YUE, "Traffic
+# engineering with reinforcement learning in SDN", which looks like the CFR-RL
+# paper but is a saved Bing search page. It is deliberately NOT an expected item —
+# retrieving it is not a hit.
+
+questions:
+    # --- Zhang et al. (2020) — CFR-RL -----------------------------------------
+
+    - id: cfr-rl-1
+      question: >-
+          ¿Cuál es el problema principal de las soluciones tradicionales de Ingeniería
+          de Tráfico (TE) y cómo lo aborda el esquema CFR-RL propuesto?
+      expected_items: TR6MHCJ2
+      expected_points:
+          - las soluciones tradicionales de TE logran un rendimiento óptimo o casi
+            óptimo reenrutando la mayor cantidad posible de flujos de tráfico
+          - >-
+              eso genera una gran perturbación en la red: paquetes fuera de orden,
+              pérdida de paquetes o interrupciones del servicio
+          - y una alta carga computacional en el controlador SDN
+          - CFR-RL usa aprendizaje por refuerzo para identificar y seleccionar
+            automáticamente un pequeño subconjunto de flujos críticos
+          - solo esos flujos críticos se reenrutan, usando programación lineal
+          - la gran mayoría del tráfico sigue usando el enrutamiento ECMP por defecto
+          - así se logra el equilibrio de carga con una perturbación mínima de la red
+      answer: |-
+          Las soluciones tradicionales de TE logran un rendimiento óptimo o casi óptimo
+          reenrutando la mayor cantidad posible de flujos de tráfico. Sin embargo, esto
+          genera una gran perturbación en la red (como paquetes fuera de orden, pérdida
+          de paquetes o interrupciones del servicio) y una alta carga computacional en el
+          controlador SDN. El esquema CFR-RL aborda este problema cambiando el paradigma:
+          en lugar de reenrutear todo, utiliza Aprendizaje por Refuerzo (RL) para
+          identificar y seleccionar automáticamente un pequeño subconjunto de "flujos
+          críticos". Solo estos flujos críticos son reenrutados (usando Programación
+          Lineal), mientras que la gran mayoría del tráfico continúa utilizando el
+          enrutamiento ECMP (Equal-Cost Multi-Path) por defecto, logrando así un
+          equilibrio de carga con una perturbación de la red mínima.
+
+    - id: cfr-rl-2
+      question: >-
+          ¿Cómo combina el esquema CFR-RL el Aprendizaje por Refuerzo (RL) y la
+          Programación Lineal (LP) para tomar decisiones de enrutamiento?
+      expected_items: TR6MHCJ2
+      expected_points:
+          - el componente de RL, basado en REINFORCE con regularización de entropía,
+            aprende la política que selecciona el conjunto pequeño de flujos críticos
+          - el estado es la matriz de tráfico actual y la acción es el conjunto de
+            flujos críticos seleccionados
+          - la programación lineal resuelve un problema de optimización simple y
+            determina las rutas explícitas óptimas para esos flujos
+          - el objetivo de la optimización LP es minimizar la utilización máxima de
+            los enlaces
+          - el inverso de la utilización máxima del enlace (1/U) se usa como señal de
+            recompensa para mejorar continuamente la política del agente de RL
+      answer: |-
+          CFR-RL integra ambas técnicas de forma sinérgica. El componente de RL (basado
+          en el algoritmo REINFORCE con regularización de entropía) actúa como el
+          "cerebro" que aprende una política para seleccionar un conjunto pequeño de
+          flujos críticos (la *acción*) a partir de la matriz de tráfico actual (el
+          *estado*). Una vez que el RL selecciona estos flujos, el componente de
+          Programación Lineal (LP) entra en acción para resolver un problema de
+          optimización simple y determinar las rutas explícitas óptimas para esos flujos
+          específicos, con el objetivo de minimizar la utilización máxima de los enlaces.
+          El resultado de esta optimización LP (específicamente, el inverso de la
+          utilización máxima del enlace, $1/U$) se utiliza como la *señal de recompensa*
+          para retroalimentar y mejorar continuamente la política de selección del agente
+          de RL.
+
+    - id: cfr-rl-3
+      question: >-
+          ¿Cuáles fueron los resultados clave de la evaluación de CFR-RL en comparación
+          con los esquemas heurísticos basados en reglas (como Top-K o Top-K Critical)?
+      expected_items: TR6MHCJ2
+      expected_points:
+          - >-
+              las evaluaciones se hicieron en topologías de red reales: Abilene, EBONE,
+              Sprintlink y Tiscali
+          - CFR-RL logra un equilibrio de carga casi óptimo reenrutando solo entre el
+            10% y el 21.3% del tráfico total
+          - superó el equilibrio de carga de las heurísticas basadas en reglas hasta
+            en un 12.2%
+          - reenrutaba en promedio entre un 11.4% y un 14.7% menos de tráfico,
+            reduciendo drásticamente la perturbación de la red
+          - >-
+              CFR-RL generaliza bien: mantiene alto rendimiento en matrices de tráfico no
+              vistas durante el entrenamiento
+          - las heurísticas de reglas fijas fallan cuando sus suposiciones de diseño no
+            se cumplen, por ejemplo con modelos de tráfico uniforme
+      answer: |-
+          Las evaluaciones extensivas realizadas en topologías de red reales (Abilene,
+          EBONE, Sprintlink y Tiscali) demostraron que CFR-RL logra un rendimiento de
+          equilibrio de carga casi óptimo reenrutando solo entre el **10% y el 21.3%**
+          del tráfico total. En comparación con las heurísticas basadas en reglas, CFR-RL
+          superó su rendimiento de equilibrio de carga hasta en un **12.2%**, mientras
+          que reenrutaba en promedio entre un **11.4% y un 14.7% menos de tráfico**,
+          reduciendo drásticamente la perturbación de la red. Además, el estudio destacó
+          que CFR-RL tiene una excelente capacidad de generalización, manteniendo un alto
+          rendimiento incluso en matrices de tráfico no vistas durante su fase de
+          entrenamiento, a diferencia de las heurísticas de reglas fijas que fallan
+          cuando sus suposiciones de diseño no se cumplen (por ejemplo, en modelos de
+          tráfico uniforme).
+
+    # --- ALzaid et al. (2020) — Jellyfish ------------------------------------
+
+    - id: jellyfish-1
+      question: >-
+          ¿Por qué los esquemas de enrutamiento tradicionales (como el camino más corto
+          o ECMP) no funcionan bien en las redes Jellyfish y qué solución proponen los
+          autores para la selección de caminos?
+      expected_items: EIAG8GE3
+      expected_points:
+          - la topología Jellyfish es un grafo regular aleatorio (RRG)
+          - su conectividad aleatoria hace que los algoritmos deterministas tiendan a
+            elegir siempre los mismos enlaces cortos
+          - eso provoca un grave desequilibrio de carga y saturación de esos enlaces
+          - los autores mejoran el algoritmo de k-caminos más cortos (KSP) con dos
+            heurísticas
+          - aleatorización (rKSP) rompe los empates de forma aleatoria en lugar de usar
+            un orden determinista, distribuyendo mejor el tráfico
+          - disjunción de aristas (EDKSP) garantiza que los caminos no compartan enlaces
+            físicos, maximizando el ancho de banda efectivo entre origen y destino
+          - la combinación de ambas, rEDKSP, da la mejor calidad de caminos sin aumentar
+            significativamente su longitud media
+      answer: |-
+          No funcionan bien debido a la naturaleza de la topología Jellyfish, que es un
+          grafo regular aleatorio (RRG). Esta conectividad aleatoria hace que los
+          algoritmos deterministas tiendan a elegir siempre los mismos enlaces "cortos",
+          provocando un grave desequilibrio de carga y saturación en esos enlaces
+          específicos.
+          Para solucionarlo, los autores proponen mejorar el algoritmo de *k-caminos más
+          cortos* (KSP) incorporando dos heurísticas:
+          - **Aleatorización (rKSP):** Rompe los empates de forma aleatoria en lugar de
+            usar un orden determinista (como el rango de los nodos), distribuyendo mejor
+            el tráfico.
+          - **Disjunción de aristas (EDKSP):** Garantiza que los caminos seleccionados no
+            compartan enlaces físicos, maximizando el ancho de banda efectivo entre
+            origen y destino.
+          La combinación de ambas (**rEDKSP**) ofrece la mejor calidad de caminos sin
+          aumentar significativamente la longitud media de los mismos.
+
+    - id: jellyfish-2
+      question: >-
+          ¿En qué consiste el mecanismo de enrutamiento "KSP-adaptive" propuesto y por
+          qué supera a esquemas como UGAL o KSP-UGAL en esta topología?
+      expected_items: EIAG8GE3
+      expected_points:
+          - KSP-adaptive selecciona aleatoriamente dos caminos candidatos entre los k
+            caminos más cortos precalculados para el par origen-destino
+          - elige el que tenga la menor latencia estimada, basada en la longitud de la
+            cola del router
+          - UGAL está diseñado para diferenciar caminos mínimos de no mínimos, que pasan
+            por un nodo intermedio aleatorio
+          - en Jellyfish la mayoría de los k caminos más cortos ya tienen longitudes muy
+            similares, así que esa diferenciación es innecesaria
+          - restringir la elección adaptativa únicamente a caminos cortos reduce el uso
+            innecesario de enlaces y mejora drásticamente el rendimiento y la latencia
+      answer: |-
+          El mecanismo **KSP-adaptive** es un esquema de enrutamiento adaptativo que
+          decide la ruta de cada paquete de la siguiente manera: selecciona aleatoriamente
+          dos caminos candidatos entre los $k$ caminos más cortos precalculados para el
+          par origen-destino, y elige el que tenga la menor latencia estimada (basada en
+          la longitud de la cola del router).
+          Supera a las variantes de *UGAL* (Universal Globally Adaptive Load-balance)
+          porque UGAL está diseñado para diferenciar entre caminos "mínimos" y "no
+          mínimos" (que pasan por un nodo intermedio aleatorio). En la topología
+          Jellyfish, la mayoría de los $k$ caminos más cortos ya tienen longitudes muy
+          similares, por lo que esa diferenciación es innecesaria. Restringir la elección
+          adaptativa únicamente a caminos "cortos" (como hace KSP-adaptive) reduce el uso
+          innecesario de enlaces y mejora drásticamente el rendimiento y la latencia.
+
+    - id: jellyfish-3
+      question: >-
+          ¿Qué metodologías de evaluación utilizaron los autores para validar sus
+          propuestas y cuál fue la conclusión principal de los experimentos?
+      expected_items: EIAG8GE3
+      expected_points:
+          - un modelo de rendimiento (throughput model) para estimar analíticamente el
+            rendimiento bajo tráfico sintético, como permutación aleatoria o shift
+          - el simulador Booksim 2.0, a nivel de ciclo, para medir el throughput de
+            saturación y la latencia de los paquetes
+          - el simulador CODES, para evaluar tiempos de comunicación en escenarios
+            realistas con trazas de aplicaciones HPC de patrón Stencil (2DNN, 3DNN)
+          - la conclusión principal es que rEDKSP junto con KSP-adaptive logra
+            sistemáticamente el mayor rendimiento y la menor latencia en todas las pruebas
+          - supera significativamente al KSP tradicional (vanilla) y a otros esquemas de
+            enrutamiento adaptativos y no adaptativos
+      answer: |-
+          Los autores validaron sus propuestas utilizando tres metodologías
+          complementarias:
+          1. **Modelo de rendimiento (Throughput model):** Para estimar analíticamente el
+             rendimiento bajo diferentes patrones de tráfico sintético (como permutación
+             aleatoria o *shift*).
+          2. **Simulador Booksim 2.0:** Un simulador a nivel de ciclo para medir con
+             precisión el rendimiento agregado (throughput de saturación) y la latencia
+             de los paquetes.
+          3. **Simulador CODES:** Para evaluar los tiempos de comunicación en escenarios
+             realistas, utilizando trazas de aplicaciones de computación de alto
+             rendimiento (HPC) con patrones de comunicación *Stencil* (2DNN, 3DNN, etc.).
+
+          **Conclusión principal:** La combinación de la selección de caminos **rEDKSP**
+          (aleatorizado y disjunto en aristas) junto con el mecanismo de enrutamiento
+          **KSP-adaptive** logra sistemáticamente el mayor rendimiento y la menor latencia
+          en todas las pruebas, superando de manera significativa al KSP tradicional
+          (vanilla) y a otros esquemas de enrutamiento adaptativo o no adaptativo.
+
+    # --- Vadluri et al. (2019) — SDN review ---------------------------------
+
+    - id: sdn-review-1
+      question: >-
+          ¿Cuál es la diferencia fundamental entre la arquitectura de red tradicional y
+          la arquitectura de Red Definida por Software (SDN)?
+      expected_items: NNIMX36C
+      expected_points:
+          - en las redes IP tradicionales los planos de control (toma de decisiones) y de
+            datos (reenvío) están estrechamente acoplados dentro de cada dispositivo
+          - eso obliga a los administradores a configurar manualmente cada equipo por
+            separado, con problemas de interoperabilidad y falta de flexibilidad
+          - en SDN esos dos planos están desacoplados
+          - la inteligencia y el estado de la red se centralizan lógicamente en un
+            controlador basado en software
+          - los dispositivos de infraestructura, switches y routers, se simplifican y
+            solo reenvían paquetes según las instrucciones del controlador
+      answer: |-
+          En las redes tradicionales de Protocolo de Internet (IP), los planos de control
+          (toma de decisiones) y de datos (reenvío) están estrechamente acoplados dentro
+          de cada dispositivo de red, lo que obliga a los administradores a configurar
+          manualmente cada equipo por separado, generando problemas de interoperabilidad
+          y falta de flexibilidad. En cambio, en la arquitectura SDN, estos dos planos
+          están **desacoplados**: la inteligencia y el estado de la red se centralizan
+          lógicamente en un controlador basado en software, mientras que los dispositivos
+          de infraestructura (switches/routers) se simplifican y solo se encargan de
+          reenviar los paquetes según las instrucciones que reciben de dicho controlador.
+
+    - id: sdn-review-2
+      question: >-
+          ¿Qué papel juega el protocolo OpenFlow en la arquitectura SDN y por qué es
+          considerado crucial?
+      expected_items: NNIMX36C
+      expected_points:
+          - OpenFlow es el primer interfaz o protocolo estándar diseñado específicamente
+            para SDN
+          - estandariza la comunicación entre el plano de control (el controlador SDN) y
+            el plano de datos (los dispositivos de red)
+          - permite a los operadores un control de tráfico de alto rendimiento a través de
+            equipos de red de múltiples proveedores
+          - resuelve los problemas de interoperabilidad y cierra la brecha de los entornos
+            de software propietarios y cerrados de las redes tradicionales
+      answer: |-
+          OpenFlow es el primer interfaz (o protocolo) estándar diseñado específicamente
+          para SDN. Es crucial porque estandariza la comunicación entre el plano de
+          control (el controlador SDN) y el plano de datos (los dispositivos de red). Esto
+          permite a los operadores tener un control de tráfico de alto rendimiento a
+          través de equipos de red de múltiples proveedores (multi-vendor), resolviendo
+          los problemas de interoperabilidad y cerrando la brecha de los entornos de
+          software propietarios y cerrados de las redes tradicionales.
+
+    - id: sdn-review-3
+      question: >-
+          Según el artículo, ¿cuáles son los cuatro beneficios principales que SDN ofrece
+          a las organizaciones?
+      expected_items: NNIMX36C
+      expected_points:
+          - >-
+              gestión eficiente de la red: los administradores pueden cambiar las
+              características y el comportamiento de la red de forma remota, dinámica y
+              confiable según la carga de trabajo
+          - >-
+              programabilidad: control y automatización de toda la red mediante software,
+              con lenguajes como Python, Java o C++, sin configurar cada dispositivo
+          - >-
+              reducción de costos: muchas soluciones son de código abierto y, al operar hasta
+              la capa 3, reducen la dependencia de hardware propietario costoso y el CAPEX
+          - >-
+              seguridad mejorada: protección más cohesiva y centralizada en todos los
+              dispositivos, difícil de lograr en entornos virtualizados tradicionales
+      answer: |-
+          El artículo destaca los siguientes beneficios clave:
+          1. **Gestión eficiente de la red:** Permite a los administradores cambiar las
+             características y el comportamiento de la red de forma remota, dinámica y
+             confiable, según la carga de trabajo.
+          2. **Programabilidad:** Facilita el control y la automatización de toda la red
+             mediante software (usando lenguajes como Python, Java o C++), sin necesidad
+             de implementar protocolos o configuraciones personalizadas en cada
+             dispositivo individualmente.
+          3. **Reducción de costos:** Muchas soluciones SDN son de código abierto y, al
+             operar hasta la capa 3, reducen la dependencia de hardware propietario
+             costoso, disminuyendo significativamente el gasto de capital (CAPEX).
+          4. **Seguridad mejorada:** Ofrece una protección más cohesiva y centralizada en
+             todos los dispositivos, lo cual es especialmente valioso y difícil de lograr
+             en entornos virtualizados tradicionales.
+
+    # --- Kahil et al. (2025) — RL for data center energy efficiency ----------
+
+    - id: kahil-1
+      question: >-
+          ¿Cuál es el objetivo principal de esta revisión sistemática y qué subsistemas
+          de los centros de datos analiza?
+      expected_items: K267VCTQ
+      expected_points:
+          - el objetivo es explorar, sintetizar y evaluar las aplicaciones recientes de
+            algoritmos de RL y DRL para optimizar la eficiencia energética en centros de
+            datos
+          - analiza el sistema de refrigeración (cooling system)
+          - analiza el sistema de tecnologías de la información y la comunicación (ICT),
+            que incluye programación de tareas, asignación de recursos y consolidación de
+            máquinas virtuales
+          - analiza la optimización conjunta de múltiples sistemas — refrigeración, TI y
+            suministro eléctrico — para objetivos multi-sistema
+      answer: |-
+          El objetivo principal de la revisión es explorar, sintetizar y evaluar las
+          aplicaciones recientes de los algoritmos de Aprendizaje por Refuerzo (RL) y
+          Aprendizaje por Refuerzo Profundo (DRL) para optimizar la eficiencia energética
+          en los centros de datos. El estudio analiza específicamente tres áreas o
+          subsistemas principales:
+          1. El **sistema de refrigeración** (Cooling system).
+          2. El **sistema de Tecnologías de la Información y la Comunicación** (ICT
+             system), que incluye programación de tareas, asignación de recursos y
+             consolidación de máquinas virtuales.
+          3. La **optimización conjunta** (Joint optimization) de múltiples sistemas
+             (refrigeración, TI y suministro eléctrico) para abordar objetivos
+             multi-sistema.
+
+    - id: kahil-2
+      question: >-
+          Según el artículo, ¿cuáles son las tres principales brechas de investigación o
+          desafíos abiertos identificados para el despliegue práctico de RL/DRL en
+          centros de datos?
+      expected_items: K267VCTQ
+      expected_points:
+          - >-
+              dependencia de entornos simulados: el 95% de los estudios evaluados carece de
+              validación en tiempo real, lo que limita demostrar la robustez y seguridad de
+              los algoritmos en condiciones dinámicas del mundo real
+          - >-
+              evaluación de los resultados de eficiencia energética: se reportan solo como
+              porcentaje de reducción respecto a una línea base
+          - se necesitan métricas más completas y multiescala como ERE, DCeP y DPPE,
+            además del tradicional PUE
+          - >-
+              algoritmos DRL multiagente (MADRL): optimizar cada sistema de forma
+              independiente es insuficiente
+          - se requiere MADRL para una optimización global que maneje la naturaleza
+            heterogénea de los centros de datos, combinando espacios de acción continuos
+            de la refrigeración con espacios discretos de los sistemas de TI
+      answer: |-
+          La revisión identifica tres desafíos críticos que deben abordarse en futuras
+          investigaciones:
+          1. **Dependencia de entornos simulados:** El 95% de los estudios evaluados
+             carecen de validación en tiempo real. Esto limita la demostración de la
+             robustez y seguridad de los algoritmos en condiciones dinámicas del mundo
+             real, donde un fallo podría causar interrupciones del servicio.
+          2. **Evaluación de los resultados de eficiencia energética:** Existe una
+             tendencia a reportar los resultados solo como un porcentaje de reducción
+             respecto a una línea base. Se necesitan métricas más completas y
+             multiescala, como la Efectividad de Reutilización de Energía (ERE), la
+             Productividad Energética del Centro de Datos (DCeP) y el Rendimiento del
+             Centro de Datos por Energía (DPPE), además del tradicional PUE.
+          3. **Algoritmos DRL multiagente (MADRL):** Optimizar cada sistema de forma
+             independiente es insuficiente. Se requiere avanzar en enfoques MADRL para
+             lograr una optimización global que pueda manejar la naturaleza heterogénea
+             de los centros de datos (combinando espacios de acción continuos de la
+             refrigeración con espacios discretos de los sistemas de TI).
+
+    - id: kahil-3
+      question: >-
+          ¿Cuáles fueron los algoritmos de RL/DRL más frecuentemente citados en los 65
+          estudios seleccionados y por qué se prefieren los métodos DRL para el sistema
+          de refrigeración?
+      expected_items: K267VCTQ
+      expected_points:
+          - los más citados fueron Q-learning y Deep Q-Network (DQN), presentes en el 60%
+            de los estudios
+          - les siguieron en frecuencia Soft Actor-Critic (SAC), Proximal Policy
+            Optimization (PPO), Deep Deterministic Policy Gradient (DDPG) y Actor-Critic
+            (AC/A3C)
+          - casi el 98% de los algoritmos usados son model-free y la mayoría DRL
+          - se prefiere DRL para la refrigeración y la optimización conjunta porque esos
+            entornos tienen un espacio de estados de alta dimensión y un espacio de
+            acciones continuo
+          - los métodos tradicionales de RL, como las tablas Q, no escalan bien en esos
+            escenarios
+          - las redes neuronales profundas del DRL permiten aprendizaje de extremo a
+            extremo y adaptabilidad en tiempo real mucho más efectiva
+      answer: |-
+          Los algoritmos más frecuentemente citados fueron **Q-learning** y **Deep
+          Q-Network (DQN)**, que aparecieron en el 60% de los estudios. Les siguieron en
+          frecuencia Soft Actor-Critic (SAC), Proximal Policy Optimization (PPO), Deep
+          Deterministic Policy Gradient (DDPG) y Actor-Critic (AC/A3C).
+
+          Los métodos de **DRL (Aprendizaje por Refuerzo Profundo)** se prefieren
+          abrumadoramente (casi el 98% de los algoritmos usados son *model-free* y la
+          mayoría DRL) para el **sistema de refrigeración** y la **optimización
+          conjunta**, debido a que estos entornos se caracterizan por tener un espacio de
+          estados de alta dimensión y un espacio de acciones continuo. Los métodos
+          tradicionales de RL (como las tablas Q) no escalan bien en estos escenarios,
+          mientras que las redes neuronales profundas del DRL permiten un aprendizaje de
+          extremo a extremo y una adaptabilidad en tiempo real mucho más efectiva.
+
+    # --- Pathan et al. (2024) — PEMA / PEDL ---------------------------------
+
+    - id: pathan-1
+      question: >-
+          What is the primary networking challenge addressed in this paper, and what
+          three key factors are jointly considered to solve it?
+      expected_items: QCIWK4GF
+      expected_points:
+          - the challenge is efficient route management in Software-Defined Network (SDN)
+            enabled Data Center Networks (DCN)
+          - as data centers expand, inefficient routing increases energy usage,
+            unbalances network loads, and decreases Quality of Service
+          - the routing strategy jointly considers flow priority, so high-importance
+            traffic is privileged
+          - it considers path energy consumption, minimising the power used by active
+            switches and links
+          - it considers routing path load, ensuring even load distribution and
+            preventing congestion
+      answer: |-
+          The primary challenge is efficient route management in Software-Defined Network
+          (SDN) enabled Data Center Networks (DCN). As data centers expand, inefficient
+          routing can lead to increased energy usage, unbalanced network loads, and
+          decreased Quality of Service (QoS). To solve this, the authors propose a routing
+          strategy that jointly considers three key factors: **flow priority** (to ensure
+          high-importance traffic is privileged), **path energy consumption** (to minimize
+          the power used by active switches and links), and **routing path load** (to
+          ensure even load distribution and prevent congestion).
+
+    - id: pathan-2
+      question: >-
+          Because the optimal Mixed Integer Linear Programming (MILP) formulation can be
+          too slow for large networks, what two alternative greedy algorithms did the
+          authors develop, and how do their objectives differ?
+      expected_items: QCIWK4GF
+      expected_points:
+          - two greedy algorithms were developed to find efficient routing paths swiftly
+          - PEMA, the Priority Based Energy Minimization Algorithm, sorts flows by
+            priority level and then selects routing paths that meet the bandwidth
+            requirements while consuming the least amount of energy
+          - PEDL, the Priority Based Evenly Load Distribution Algorithm, also sorts flows
+            by priority and finds energy-efficient paths
+          - PEDL differs in that it selects the path minimising the standard deviation, or
+            load variance, of the network, giving the most balanced load distribution
+            across links
+      answer: |-
+          The authors developed two alternative greedy algorithms to find efficient
+          routing paths swiftly:
+          1. **Priority Based Energy Minimization Algorithm (PEMA):** This algorithm
+             prioritizes sorting flows by their priority level and then selects routing
+             paths that meet the bandwidth requirements while consuming the *least amount
+             of energy*.
+          2. **Priority Based Evenly Load Distribution Algorithm (PEDL):** This algorithm
+             also sorts flows by priority and finds energy-efficient paths, but it
+             specifically selects the path that minimizes the *standard deviation (load
+             variance)* of the network, thereby ensuring the most balanced load
+             distribution across network links.
+
+    - id: pathan-3
+      question: >-
+          How did the proposed PEMA and PEDL algorithms perform in simulations compared
+          to existing state-of-the-art algorithms (such as CERA, PFMA, and JELA)?
+      expected_items: QCIWK4GF
+      expected_points:
+          - the simulations were conducted on a fat-tree network topology
+          - PEMA achieved significantly better energy savings than PEDL, PFMA and JELA
+          - CERA showed slightly higher energy savings but only by rejecting more flows
+            due to capacity constraints, whereas PEMA accommodated more flows
+          - PEDL achieved the lowest standard deviation among all tested algorithms, so it
+            is the most effective at evenly distributing network load
+          - both PEMA and PEDL showed a higher flow success rate for high-priority flows
+          - both showed a higher combined maximization value, the joint optimization score
+            of priority, energy and load, than the existing baselines
+      answer: |-
+          The simulation results (conducted on a fat-tree network topology) showed that
+          both proposed algorithms outperformed existing methods in overall network
+          efficiency:
+          * **Energy Savings:** PEMA achieved significantly better energy savings than
+            PEDL, PFMA, and JELA. (While CERA showed slightly higher energy savings, it
+            did so by rejecting more flows due to capacity constraints, whereas PEMA
+            successfully accommodated more flows).
+          * **Load Balancing:** PEDL achieved the lowest standard deviation among all
+            tested algorithms, proving it is the most effective at evenly distributing
+            network load.
+          * **Overall Performance:** Both PEMA and PEDL demonstrated a higher **flow
+            success rate** (successfully routing high-priority flows) and a higher
+            **combined maximization value** (the joint optimization score of priority,
+            energy, and load) than the existing baseline algorithms.
+
+    # --- Wang et al. (2022) — LSTM + DDPG DCN -------------------------------
+
+    - id: wang-1
+      question: >-
+          What is the primary energy efficiency problem in Data Center Networks (DCNs)
+          addressed in this paper, and what two-part framework do the authors propose to
+          solve it?
+      expected_items: X4FACK5U
+      expected_points:
+          - DCNs are typically over-provisioned to handle peak workloads and traffic
+            bursts
+          - this results in low average link utilization, between 5% and 25%, and
+            significant energy waste from idle or low-loaded network devices
+          - >-
+              the first part is flow prediction: a Long Short-Term Memory (LSTM) neural
+              network predicts short-term network flow demands for the next time window
+          - >-
+              the second part is traffic optimization: a Deep Reinforcement Learning
+              approach, a tailored Deep Deterministic Policy Gradient (DDPG) algorithm,
+              solves bandwidth allocation and routing optimization dynamically
+          - this lets the system power off or put unused switches, ports or linecards into
+            sleep mode to save energy
+      answer: |-
+          The primary problem is that DCNs are typically over-provisioned to handle peak
+          workloads and traffic bursts, resulting in low average link utilization (between
+          5% and 25%) and significant energy waste from idle or low-loaded network
+          devices. To solve this, the authors propose an intelligent, two-part framework:
+          1. **Flow Prediction:** A Long Short-Term Memory (LSTM) neural network is used
+             to predict short-term network flow demands for the next time window.
+          2. **Traffic Optimization:** A Deep Reinforcement Learning (DRL) approach,
+             specifically a tailored Deep Deterministic Policy Gradient (DDPG) algorithm,
+             is used to solve the bandwidth allocation and routing optimization problem
+             dynamically. This allows the system to power off or put unused switches,
+             ports, or linecards into sleep mode to save energy.
+
+    - id: wang-2
+      question: >-
+          How do the authors mathematically formulate the traffic optimization problem,
+          and what is its computational complexity?
+      expected_items: X4FACK5U
+      expected_points:
+          - bandwidth allocation and routing optimization are formulated as a
+            Multi-Commodity Flow (MCF) problem, modelled as an Integer Linear Programming
+            problem
+          - the objective is to minimize the total power consumption of active switch
+            nodes and link ports
+          - >-
+              it satisfies three constraints: demand completion, link capacity with a
+              dynamic safety margin based on prediction confidence, and flow conservation
+          - the decision version of the problem, DMCF, is proved NP-hard
+          - the proof is a mathematical reduction from the classic 0-1 knapsack problem to
+            an instance of DMCF
+      answer: |-
+          The authors formulate the bandwidth allocation and routing optimization as a
+          **Multi-Commodity Flow (MCF)** problem, modeled as an Integer Linear Programming
+          (ILP) problem. The objective is to minimize the total power consumption of
+          active switch nodes and link ports while strictly satisfying three constraints:
+          demand completion, link capacity constraints (incorporating a dynamic safety
+          margin based on prediction confidence), and flow conservation. The authors prove
+          that the decision version of this problem (DMCF) is **NP-hard** by providing a
+          mathematical reduction from the classic 0–1 knapsack problem to an instance of
+          the DMCF problem.
+
+    - id: wang-3
+      question: >-
+          What are the key experimental results when comparing the proposed DRL-based
+          solution to heuristic baselines and traditional optimization solvers?
+      expected_items: X4FACK5U
+      expected_points:
+          - against the designed heuristic baseline, the DRL agent improves power
+            consumption optimality by up to 7.8%, and 4% on average
+          - it does so by better exploring the trade-off between effectiveness and
+            efficiency
+          - commercial solvers such as Gurobi find optimal solutions for small-scale
+            networks
+          - their convergence time becomes unacceptable as the network grows, for example
+            beyond 70 nodes
+          - the DRL method leverages learned experience to give near-optimal solutions
+            much faster
+          - it scales effectively to large-scale instances where traditional solvers fail
+            to converge in reasonable time
+      answer: |-
+          The experimental evaluations demonstrate two main advantages of the proposed DRL
+          (DDPG) solution:
+          1. **Against Heuristic Baselines:** The DRL agent outperforms the designed
+             heuristic baseline in power consumption optimality by up to 7.8% (and 4% on
+             average), as it better explores the trade-off between effectiveness and
+             efficiency.
+          2. **Against Traditional Optimizers (e.g., Gurobi):** While commercial solvers
+             like Gurobi can find optimal solutions for small-scale networks, their
+             convergence time becomes unacceptable as the network size grows (e.g.,
+             exceeding 70 nodes). In contrast, the DRL method leverages learned experience
+             to consistently provide near-optimal solutions much faster and scales
+             effectively to large-scale problem instances where traditional solvers fail
+             to converge in a reasonable time.
+
+    # --- Zheng et al. (2022) — Ee-Routing ------------------------------------
+
+    - id: zheng-1
+      question: >-
+          What is the primary limitation of existing routing algorithms in data center
+          networks that this paper aims to address?
+      expected_items: MZS6HDXR
+      expected_points:
+          - existing routing algorithms focus on optimizing network Quality of Service and
+            Quality of Experience
+          - they largely ignore the rapidly increasing energy consumption of data center
+            network infrastructure
+          - current intelligent routing algorithms optimize either network performance or
+            simple energy saving separately, rather than establishing joint optimization
+            goals
+          - they struggle to formulate specific, efficient traffic optimization strategies
+            for different traffic types, elephant flows and mice flows
+          - their use of traditional neural networks results in slow processing of
+            high-dimensional data and poor algorithm convergence
+      answer: |-
+          Existing routing algorithms primarily focus on optimizing network Quality of
+          Service (QoS) and Quality of Experience (QoE), largely ignoring the rapidly
+          increasing energy consumption of data center network infrastructure.
+          Furthermore, current intelligent routing algorithms typically optimize for
+          either network performance or simple energy-saving separately, rather than
+          establishing joint optimization goals. They also struggle to formulate specific,
+          efficient traffic optimization strategies for different types of traffic
+          (elephant flows and mice flows), and their use of traditional neural networks
+          often results in slow processing of high-dimensional data and poor algorithm
+          convergence.
+
+    - id: zheng-2
+      question: >-
+          What are the core technologies and strategies used in the proposed Ee-Routing
+          algorithm to achieve joint optimization of energy saving and network
+          performance?
+      expected_items: MZS6HDXR
+      expected_points:
+          - a joint optimization goal taking both the energy consumption and the network
+            performance of the SDN data plane
+          - >-
+              flow differentiation: traffic is dynamically classified into elephant flows
+              (large, long-lasting) and mice flows (small, short-lived), each with its own
+              energy-efficient scheduling scheme
+          - a deep reinforcement learning framework using Deep Deterministic Policy
+            Gradient (DDPG), suited to continuous action spaces, for stable and continuous
+            energy-efficient traffic scheduling
+          - a Convolutional Neural Network processes high-dimensional state features such
+            as link transmission rate, utilization and energy consumption
+          - the CNN's local perception and parameter sharing significantly accelerate the
+            algorithm's convergence efficiency
+      answer: |-
+          The Ee-Routing algorithm employs several core strategies:
+          1. **Joint Optimization Goal:** It takes both the energy consumption and network
+             performance of the data plane in a Software-Defined Network (SDN) as a joint
+             optimization goal.
+          2. **Flow Differentiation:** It dynamically classifies network traffic into
+             "elephant flows" (large, long-lasting data transfers) and "mice flows" (small,
+             short-lived transfers) and establishes specific energy-efficient traffic
+             scheduling schemes for each.
+          3. **Deep Reinforcement Learning Framework:** It utilizes the Deep Deterministic
+             Policy Gradient (DDPG) algorithm, which is well-suited for continuous action
+             spaces, to achieve stable and continuous energy-efficient traffic scheduling.
+          4. **Convolutional Neural Network (CNN):** The training process integrates a CNN
+             to process high-dimensional state features (like link transmission rate,
+             utilization, and energy consumption). This leverages CNN's local perception
+             and parameter sharing to significantly accelerate the algorithm's convergence
+             efficiency.
+
+    - id: zheng-3
+      question: >-
+          According to the experimental evaluation, how does the Ee-Routing algorithm
+          quantitatively outperform existing routing algorithms in terms of energy saving
+          and network performance?
+      expected_items: MZS6HDXR
+      expected_points:
+          - Ee-Routing has excellent convergence and stability
+          - compared to the DQN-EER algorithm it improves the energy-saving percentage by
+            13.93%
+          - compared to the EARS algorithm it reduces the average end-to-end delay by
+            13.73%
+          - compared to EARS it increases the network throughput by 10.91%
+          - compared to EARS it reduces the packet loss rate by 13.51%, under varying
+            traffic intensities
+      answer: |-
+          The experimental results demonstrate that Ee-Routing has excellent convergence
+          and stability, with specific quantitative improvements over baseline algorithms:
+          * **Compared to the DQN-EER algorithm:** Ee-Routing improves the energy-saving
+            percentage by **13.93%**.
+          * **Compared to the EARS algorithm:** Ee-Routing reduces the average end-to-end
+            delay by **13.73%**, increases the network throughput by **10.91%**, and
+            reduces the packet loss rate by **13.51%** under varying traffic intensities.

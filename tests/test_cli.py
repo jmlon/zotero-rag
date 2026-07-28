@@ -12,11 +12,13 @@ from io import StringIO
 from pathlib import Path
 
 import pytest
+from langchain_core.messages import AIMessage
 from rich.console import Console
 from typer.testing import CliRunner
 
 from zotero_rag import __version__, cli
 from zotero_rag.config import Config
+from zotero_rag.evaluation import JudgeVerdict, RawVerdict
 from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.indexer import IndexStats
 from zotero_rag.planning import IndexPlan, PlannedAttachment
@@ -40,7 +42,7 @@ def _isolate_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_help_lists_every_planned_command() -> None:
     result = runner.invoke(cli.app, ["--help"])
     assert result.exit_code == 0
-    for command in ("list-collections", "init", "index", "query"):
+    for command in ("list-collections", "init", "index", "query", "eval"):
         assert command in result.output
 
 
@@ -476,3 +478,199 @@ def test_depth_limit_hides_deeper_levels_and_says_how_many() -> None:
     assert "Research" in shallow
     assert "Alpha" not in shallow
     assert "+2 subcollections" in shallow
+
+
+# --- `eval` (PRD §11.3) --------------------------------------------------
+
+
+def _eval_index_folder(tmp_path: Path, questions: str) -> None:
+    """An index folder holding one indexed chunk and a golden set."""
+    store = VectorStore(tmp_path / "chroma")
+    config = Config()
+    store.add(
+        ids=["ATT1:1:0"],
+        embeddings=[[1.0, 0.0, 0.5]],
+        documents=["A fog node sits between the edge devices and the cloud."],
+        metadatas=[
+            {
+                "attachment_key": "ATT1",
+                "item_key": "ITEM1",
+                "title": "What is a Fog Node",
+                "authors": "Tordera, Eva",
+                "year": "2016",
+                "page": 3,
+                "embedding_model": config.embedding_model,
+            }
+        ],
+    )
+    store.write_fingerprint(StoreFingerprint.intended(config, embedding_dim=3))
+    (tmp_path / "config.yaml").write_text("index:\n  top_k: 3\n", encoding="utf-8")
+    (tmp_path / "questions.yaml").write_text(questions, encoding="utf-8")
+
+
+ONE_QUESTION = """
+questions:
+  - id: fog
+    question: What is a fog node?
+    expected_points:
+      - it sits between the edge devices and the cloud
+      - it provides compute closer to the data source
+    expected_items: [ITEM1]
+"""
+
+
+def _stub_seams(monkeypatch: pytest.MonkeyPatch, grade: str = "good") -> None:
+    """Replace the three network seams `eval` builds, leaving retrieval real."""
+
+    class Embeddings:
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0, 0.0, 0.5]
+
+    class Chat:
+        def invoke(self, messages: object) -> AIMessage:
+            return AIMessage(content="A fog node sits between the edge and the cloud [1].")
+
+    def verdict_of(question: str, ground_truth: str, answer: str) -> RawVerdict:
+        return RawVerdict(
+            verdict=JudgeVerdict(
+                grade=grade,  # type: ignore[arg-type]
+                covered_points=[1],
+                partial_points=[2],
+                rationale="States the position but not the compute benefit.",
+            ),
+            prompt_tokens=310,
+            completion_tokens=25,
+        )
+
+    monkeypatch.setattr(cli, "build_embeddings", lambda config: Embeddings())
+    monkeypatch.setattr(cli, "build_chat", lambda config: Chat())
+    monkeypatch.setattr(cli, "build_verdict_fn", lambda config: verdict_of)
+
+
+def test_eval_is_listed_in_the_help() -> None:
+    result = runner.invoke(cli.app, ["--help"])
+    assert "eval" in result.output
+
+
+def test_eval_outside_an_index_folder_points_at_init(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = runner.invoke(cli.app, ["eval"])
+    assert result.exit_code == 1
+    assert "config.yaml" in result.output
+
+
+def test_eval_without_a_question_set_says_where_it_looked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "questions.yaml").unlink()
+    monkeypatch.chdir(tmp_path)
+
+    result = runner.invoke(cli.app, ["eval"])
+
+    assert result.exit_code == 1
+    assert "No question set at" in result.output
+    assert "questions.yaml" in result.output
+
+
+def test_eval_reports_the_table_and_one_summary_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval"])
+
+    assert result.exit_code == 0
+    assert "fog" in result.output
+    assert "good" in result.output
+    # One point covered, one partial, of two: 1.5/2 = 75%.
+    assert "1+1/2" in result.output
+    assert "mean score" in result.output
+    assert "retrieval hit 100%" in result.output
+    assert "point coverage 75%" in result.output
+    # The settings that produced the numbers, so two runs can be compared.
+    assert "top_k 3" in result.output
+    assert Config().embedding_model in result.output
+
+
+def test_eval_json_is_machine_readable_and_uncontaminated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.stdout)
+    assert payload["settings"]["top_k"] == 3
+    assert payload["aggregate"]["hit_rate"] == 1.0
+    assert payload["aggregate"]["questions"] == 1
+    row = payload["results"][0]
+    assert row["id"] == "fog"
+    assert row["grade"] == "good"
+    assert row["cited_expected"] is True
+    # The fraction travels with the counts rather than being re-derived.
+    assert row["coverage"]["score"] == 0.75
+
+
+def test_eval_top_k_override_is_recorded_in_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deliberately poor top_k must be visible in what the run reports."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--top-k", "1", "--json"])
+
+    assert json.loads(result.stdout)["settings"]["top_k"] == 1
+
+
+def test_eval_only_runs_the_named_question(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _eval_index_folder(
+        tmp_path, ONE_QUESTION + "  - id: other\n    question: Why?\n    answer: x\n"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--only", "other", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert [row["id"] for row in payload["results"]] == ["other"]
+
+
+def test_eval_only_with_an_unknown_id_lists_what_is_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--only", "nope"])
+
+    assert result.exit_code == 1
+    assert "nope" in result.output
+    assert "fog" in result.output
+
+
+def test_eval_assess_context_adds_the_retrieval_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+    monkeypatch.setattr(
+        cli, "build_context_assessor", lambda config: lambda q, truth, context: "partial"
+    )
+
+    result = runner.invoke(cli.app, ["eval", "--assess-context", "--json"])
+
+    payload = json.loads(result.stdout)
+    assert payload["results"][0]["context_sufficiency"] == "partial"
+    assert payload["aggregate"]["context_counts"] == {"partial": 1}
