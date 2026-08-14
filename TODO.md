@@ -1,0 +1,3 @@
+
+Upload folder to NotebookLM
+
