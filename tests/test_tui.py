@@ -15,16 +15,24 @@ from typing import Any
 import pytest
 from langchain_core.messages import AIMessageChunk, BaseMessage
 from textual.pilot import Pilot
-from textual.widgets import Markdown, Static
+from textual.widgets import Input, Markdown, Static
 
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.index_folder import Notice
 from zotero_rag.querying import NO_CONTEXT_ANSWER
 from zotero_rag.snapshot import CollectionSnapshot
+from zotero_rag.tui import app as app_module
 from zotero_rag.tui.app import UNAVAILABLE_NOTICE, ZoteroRagApp
 from zotero_rag.tui.history import PromptHistory
 from zotero_rag.tui.session import QuerySession, QuerySettings
-from zotero_rag.tui.widgets import Entry, HelpScreen, PromptArea, ScopeTree, Transcript
+from zotero_rag.tui.widgets import (
+    Entry,
+    ExportScreen,
+    HelpScreen,
+    PromptArea,
+    ScopeTree,
+    Transcript,
+)
 from zotero_rag.vectorstore import VectorStore
 from zotero_rag.zotero_api import CollectionNode
 
@@ -451,3 +459,105 @@ def test_history_survives_a_restart_and_a_recalled_prompt_can_be_edited(
 
     run(second, steps)
     assert PromptHistory.load(path).entries == ["first", "first again"]
+
+
+# --- export and copy --------------------------------------------------------
+
+
+def test_ctrl_l_copies_the_latest_answer_with_its_sources(
+    store: VectorStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = ZoteroRagApp(session(store, Model()), PromptHistory())
+    copied: list[str] = []
+    monkeypatch.setattr(app_module, "copy_with_system_tool", lambda text: copied.append(text))
+    sent: list[str] = []
+    monkeypatch.setattr(app, "copy_to_clipboard", sent.append)
+
+    async def steps(pilot: Pilot[None]) -> None:
+        await pilot.press("ctrl+l")
+        assert copied == [] and sent == []  # nothing to copy yet
+        await ask(pilot, "first?")
+        model_two = Model("Second answer [1].")
+        app.session._stream = model_two
+        await ask(pilot, "second?")
+        await pilot.press("ctrl+l")
+
+    run(app, steps)
+    assert copied == sent
+    (text,) = copied
+    assert text.startswith("Second answer [1].\n\n**Sources**")
+    assert "Paper A" in text
+
+
+def test_ctrl_s_saves_the_transcript_where_the_user_says(
+    store: VectorStore, tmp_path: Path
+) -> None:
+    app = ZoteroRagApp(session(store, Model(), index_dir=tmp_path), PromptHistory())
+
+    async def steps(pilot: Pilot[None]) -> None:
+        await ask(pilot, "What is flap damping?")
+        await pilot.press("ctrl+s")
+        assert isinstance(app.screen, ExportScreen)
+        field = app.screen.query_one(Input)
+        assert field.value.startswith("transcripts/zotero-rag-") and field.value.endswith(".md")
+        field.value = "notes/session.md"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, ExportScreen)
+
+    run(app, steps)
+    text = (tmp_path / "notes" / "session.md").read_text(encoding="utf-8")
+    assert text.startswith("# zotero-rag transcript\n\n- Collection: Networking\n")
+    assert "> What is flap damping?" in text and "Paper A" in text
+
+
+def test_an_existing_file_is_replaced_only_on_a_second_enter(
+    store: VectorStore, tmp_path: Path
+) -> None:
+    existing = tmp_path / "keep.md"
+    existing.write_text("precious", encoding="utf-8")
+    app = ZoteroRagApp(session(store, Model(), index_dir=tmp_path), PromptHistory())
+
+    async def steps(pilot: Pilot[None]) -> None:
+        await ask(pilot, "q?")
+        await pilot.press("ctrl+s")
+        assert isinstance(app.screen, ExportScreen)
+        app.screen.query_one(Input).value = "keep.md"
+        await pilot.press("enter")
+        assert isinstance(app.screen, ExportScreen)
+        assert "already exists" in text_of(app.screen.query_one("#export-status", Static))
+        assert existing.read_text(encoding="utf-8") == "precious"
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, ExportScreen)
+
+    run(app, steps)
+    assert existing.read_text(encoding="utf-8").startswith("# zotero-rag transcript")
+
+
+def test_an_unwritable_path_is_reported_in_the_dialog(store: VectorStore, tmp_path: Path) -> None:
+    (tmp_path / "file").write_text("", encoding="utf-8")
+    app = ZoteroRagApp(session(store, Model(), index_dir=tmp_path), PromptHistory())
+
+    async def steps(pilot: Pilot[None]) -> None:
+        await ask(pilot, "q?")
+        await pilot.press("ctrl+s")
+        assert isinstance(app.screen, ExportScreen)
+        app.screen.query_one(Input).value = "file/under/a/file.md"
+        await pilot.press("enter")
+        assert isinstance(app.screen, ExportScreen)
+        assert "Cannot save" in text_of(app.screen.query_one("#export-status", Static))
+        await pilot.press("escape")
+        assert not isinstance(app.screen, ExportScreen)
+
+    run(app, steps)
+
+
+def test_nothing_to_save_before_the_first_question(store: VectorStore) -> None:
+    app = ZoteroRagApp(session(store, Model()), PromptHistory())
+
+    async def steps(pilot: Pilot[None]) -> None:
+        await pilot.press("ctrl+s")
+        assert not isinstance(app.screen, ExportScreen)
+
+    run(app, steps)

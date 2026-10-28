@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
+from pathlib import Path
 from typing import ClassVar
 
 from rich.text import Text
@@ -13,10 +15,11 @@ from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
-from textual.widgets import Markdown, Static, TextArea, Tree
+from textual.widgets import Input, Label, Markdown, Static, TextArea, Tree
 from textual.widgets.tree import TreeNode
 
 from zotero_rag.querying import QueryResult
+from zotero_rag.tui.export import Exchange
 from zotero_rag.tui.history import PromptHistory
 from zotero_rag.tui.scopes import ScopeChoice, ScopeNode
 
@@ -141,22 +144,32 @@ class Entry(Vertical):
     Answer text arrives from the query's worker thread through `feed`, and is drawn
     by `flush` on the UI thread, which the app calls on a timer. Rendering in
     batches like this keeps a fast stream from redrawing the Markdown per token.
+
+    Alongside the widgets it keeps an `Exchange`, the plain record that export and
+    copy work from, so neither has to read text back out of the screen.
     """
 
-    def __init__(self, scope_path: str, question: str) -> None:
+    def __init__(self, scope_path: str, question: str, scoped: bool = False) -> None:
         super().__init__(classes="entry")
-        self.scope_path = scope_path
-        self.question = question
+        self.exchange = Exchange(scope_path, question, scoped=scoped)
         self._pending: list[str] = []
         self._pending_lock = threading.Lock()
         self._render_lock = asyncio.Lock()
         self._streamed = False
 
     def compose(self) -> ComposeResult:
-        yield Static(Text(f"[{self.scope_path}]"), classes="scope-tag")
-        yield Static(Text(f"> {self.question}"), classes="question")
+        yield Static(Text(f"[{self.exchange.scope_path}]"), classes="scope-tag")
+        yield Static(Text(f"> {self.exchange.question}"), classes="question")
         yield Markdown("", classes="answer")
         yield Static("", classes="footnote")
+
+    @property
+    def scope_path(self) -> str:
+        return self.exchange.scope_path
+
+    @property
+    def question(self) -> str:
+        return self.exchange.question
 
     def feed(self, delta: str) -> None:
         """Queue answer text. Safe to call from any thread."""
@@ -172,19 +185,24 @@ class Entry(Vertical):
             if not text:
                 return False
             self._streamed = True
+            self.exchange.answer += text
             await self.query_one(Markdown).append(text)
             return True
 
-    async def finish(self, result: QueryResult, narrow_scope: bool) -> None:
+    async def finish(self, result: QueryResult) -> None:
         """Complete the entry once the stream has ended: final text, then sources."""
         await self.flush()
         if not self._streamed and result.answer:
             await self.query_one(Markdown).update(result.answer)
-        self.query_one(".footnote", Static).update(_footnote(result, narrow_scope))
+        self.exchange.answer = result.answer
+        self.exchange.result = result
+        footnote = _footnote(result, self.exchange.scoped)
+        self.query_one(".footnote", Static).update(footnote)
 
     async def fail(self, message: str) -> None:
         """Show the error under whatever part of the answer did arrive."""
         await self.flush()
+        self.exchange.error = message
         footnote = self.query_one(".footnote", Static)
         footnote.add_class("error")
         footnote.update(Text.assemble(("Error: ", "bold"), message))
@@ -291,6 +309,8 @@ HELP_TEXT = """\
 [b]Keys[/b]
   Tab / Shift+Tab        move between the prompt, the folders and the results
   F1 or ?                this help (? only outside the prompt)
+  Ctrl+S                 save the transcript as Markdown
+  Ctrl+L                 copy the latest answer and its sources
   Ctrl+Q                 quit
 
 [b]Prompt[/b]
@@ -321,3 +341,69 @@ class HelpScreen(ModalScreen[None]):
 
     def on_click(self) -> None:
         self.dismiss()
+
+
+# --- export ---------------------------------------------------------------
+
+
+class ExportScreen(ModalScreen[Path | None]):
+    """Ask where to save the transcript, then save it; dismisses with the path.
+
+    The dialog does the writing itself, so a path that cannot be written is
+    reported where it can be corrected, rather than after the dialog has gone. An
+    existing file is only replaced on a second Enter, after a warning.
+    """
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+
+    def __init__(self, default: Path, base: Path, save: Callable[[Path], None]) -> None:
+        super().__init__()
+        self.default = default
+        self.base = base
+        self.save = save
+        self._confirmed: Path | None = None
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="export"):
+            yield Label("Save the transcript as Markdown", id="export-title")
+            yield Static(Text(f"Relative paths are inside {self.base}"), id="export-base")
+            yield Input(str(self.default), id="export-path")
+            yield Static("Enter to save, Esc to cancel.", id="export-status")
+
+    def on_mount(self) -> None:
+        self.query_one(Input).focus()
+
+    def target(self) -> Path:
+        path = Path(self.query_one(Input).value.strip()).expanduser()
+        return path if path.is_absolute() else self.base / path
+
+    def on_input_changed(self) -> None:
+        self._confirmed = None
+        self._say("Enter to save, Esc to cancel.")
+
+    def on_input_submitted(self) -> None:
+        if not self.query_one(Input).value.strip():
+            self._say("Type a file name.", error=True)
+            return
+        path = self.target()
+        if path.is_dir():
+            self._say(f"{path} is a folder; add a file name.", error=True)
+            return
+        if path.exists() and self._confirmed != path:
+            self._confirmed = path
+            self._say(f"{path.name} already exists. Press Enter again to replace it.", error=True)
+            return
+        try:
+            self.save(path)
+        except OSError as exc:
+            self._say(f"Cannot save: {exc}", error=True)
+            return
+        self.dismiss(path)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _say(self, message: str, error: bool = False) -> None:
+        status = self.query_one("#export-status", Static)
+        status.set_class(error, "error")
+        status.update(Text(message))

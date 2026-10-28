@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Coroutine
+from datetime import datetime
+from pathlib import Path
 from typing import Any, ClassVar
 
 from rich.text import Text
@@ -15,11 +17,20 @@ from textual.widgets import Footer, Static, Tree
 
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.querying import QueryResult
+from zotero_rag.tui.clipboard import copy_with_system_tool
+from zotero_rag.tui.export import (
+    Exchange,
+    answer_markdown,
+    default_export_path,
+    transcript_markdown,
+    write_transcript,
+)
 from zotero_rag.tui.history import PromptHistory
 from zotero_rag.tui.scopes import ScopeChoice, build_scope_tree
 from zotero_rag.tui.session import Phase, QuerySession
 from zotero_rag.tui.widgets import (
     Entry,
+    ExportScreen,
     HelpScreen,
     PromptArea,
     ScopeTree,
@@ -53,6 +64,8 @@ class ZoteroRagApp(App[None]):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("ctrl+s", "export", "Save transcript"),
+        Binding("ctrl+l", "copy_answer", "Copy answer"),
         Binding("f1", "help", "Help", priority=True),
         # Not a priority binding, so `?` still types into the prompt.
         Binding("question_mark", "help", "Help", show=False),
@@ -64,6 +77,8 @@ class ZoteroRagApp(App[None]):
         self.history = history
         self.filtering = session.snapshot is not None
         self.scope: ScopeChoice = build_scope_tree(session.snapshot, session.root_name).choice
+        #: The root's name, which titles an exported transcript.
+        self.collection = self.scope.path
         self.phase: Phase | None = None
         self.active_entry: Entry | None = None
         self._spin = 0
@@ -153,7 +168,7 @@ class ZoteroRagApp(App[None]):
             return
         self.history.add(question)
         self.query_one(PromptArea).clear()
-        entry = Entry(self.scope.path, question.strip())
+        entry = Entry(self.scope.path, question.strip(), scoped=self.scope.keys is not None)
         self.query_one(Transcript).add(entry)
         self.active_entry = entry
         self._ask(question.strip(), self.scope, entry)
@@ -174,7 +189,7 @@ class ZoteroRagApp(App[None]):
             logger.exception("query failed")
             self._on_ui(self._failed(entry, f"Unexpected error: {exc}"))
         else:
-            self._on_ui(self._answered(entry, result, scope.keys is not None))
+            self._on_ui(self._answered(entry, result))
 
     def _on_ui(self, step: Coroutine[Any, Any, None]) -> None:
         """Run `step` on the UI thread and wait for it, from a worker thread."""
@@ -189,8 +204,8 @@ class ZoteroRagApp(App[None]):
         self.phase = phase
         self._show_status()
 
-    async def _answered(self, entry: Entry, result: QueryResult, scoped: bool) -> None:
-        await entry.finish(result, narrow_scope=scoped)
+    async def _answered(self, entry: Entry, result: QueryResult) -> None:
+        await entry.finish(result)
         self._done()
 
     async def _failed(self, entry: Entry, message: str) -> None:
@@ -208,8 +223,61 @@ class ZoteroRagApp(App[None]):
         self.session.build_keyword_index()
         self.call_from_thread(self._show_status)
 
+    # --- export and copy ----------------------------------------------------
+
+    def exchanges(self) -> list[Exchange]:
+        return [entry.exchange for entry in self.query(Entry)]
+
+    def action_export(self) -> None:
+        """Ctrl+S: save the whole transcript as Markdown, to a path the user confirms."""
+        if not isinstance(self.screen, (ExportScreen, HelpScreen)):
+            if not self.exchanges():
+                self.notify("Nothing to save yet: ask a question first.")
+                return
+            now = datetime.now()
+            base = self.session.index_dir or Path.cwd()
+            self.push_screen(
+                ExportScreen(default_export_path(now), base, self._save_transcript),
+                self._saved,
+            )
+
+    def _save_transcript(self, path: Path) -> None:
+        """Render at the moment of saving, so an answer finished meanwhile is included."""
+        text = transcript_markdown(
+            self.exchanges(),
+            collection=self.collection,
+            settings=self.session.settings.summary(),
+            exported_at=datetime.now(),
+        )
+        write_transcript(path, text)
+
+    def _saved(self, path: Path | None) -> None:
+        if path is not None:
+            self.notify(f"Saved the transcript to {path}")
+
+    def action_copy_answer(self) -> None:
+        """Ctrl+L: copy the newest finished answer, with its sources."""
+        answered = [exchange for exchange in self.exchanges() if exchange.result is not None]
+        if not answered:
+            self.notify("No answer to copy yet.")
+            return
+        latest = answered[-1]
+        assert latest.result is not None
+        text = answer_markdown(latest.result, latest.scoped)
+        tool = copy_with_system_tool(text)
+        # Sent as well when a tool worked: it is what reaches the clipboard over SSH.
+        self.copy_to_clipboard(text)
+        if tool is not None:
+            self.notify("Copied the latest answer and its sources.")
+        else:
+            self.notify(
+                "Sent the latest answer to the terminal's clipboard. If nothing pastes, "
+                "this terminal does not support that: install xclip, xsel or wl-clipboard.",
+                timeout=8,
+            )
+
     # --- help ---------------------------------------------------------------
 
     def action_help(self) -> None:
-        if not isinstance(self.screen, HelpScreen):
+        if not isinstance(self.screen, (HelpScreen, ExportScreen)):
             self.push_screen(HelpScreen())

@@ -22,8 +22,9 @@ ask a series of questions, and read cited answers as they stream in, without run
 ### 1.2 Deferred to v2
 
 - Cancelling an in-flight query without quitting.
-- Exporting the session transcript as Markdown.
-- Copying an answer to the clipboard.
+
+Exporting the transcript and copying an answer were also deferred here, and are now
+built (§8.1).
 
 ### 1.3 Future consideration
 
@@ -302,6 +303,8 @@ sending another question is disabled (the prompt stays editable). Cancelling is 
 | ↑ ↓ ← → / Enter / Space (tree) | move / collapse / expand / select scope |
 | PgUp PgDn Home End (results) | scroll |
 | F1 (anywhere) / ? (outside the prompt) | help overlay listing every binding |
+| Ctrl+S | save the transcript as Markdown (§8.1) |
+| Ctrl+L | copy the latest answer and its sources (§8.1) |
 | Ctrl+Q | quit |
 
 - Focus starts on the **prompt**.
@@ -311,6 +314,46 @@ sending another question is disabled (the prompt stays editable). Cancelling is 
 - `-v` writes logs to `<index-folder>/.zotero-rag-ui/ui.log`, because stderr can't be
   used while the screen is drawn. Noisy third-party loggers are quietened as
   `_set_noisy_logger_level` does.
+
+### 8.1 Saving the transcript and copying an answer
+
+**Ctrl+S, save the transcript.**
+
+- Opens a dialog asking for a file name. It is pre-filled with
+  `transcripts/zotero-rag-YYYYMMDD-HHMMSS.md`, and relative paths are taken from the
+  index folder.
+- Missing folders are created.
+- An existing file is replaced only after a warning and a second Enter.
+- A path that cannot be written is reported in the dialog, which stays open so the
+  name can be corrected. Esc cancels.
+- With nothing asked yet, it says so instead of opening the dialog.
+
+The file (`tui/export.py`) starts with a header giving the collection, the export
+time and the settings summary. Then each exchange follows, separated by `---`:
+
+- the folder tag and time;
+- the question as a `>` quote;
+- the answer;
+- the cited sources as a list, with Zotero links.
+
+A failed exchange keeps its partial answer and the error. One still streaming is
+marked as such. The transcript is rendered when Enter is pressed, so an answer
+that finished while the dialog was open is included.
+
+**Ctrl+L, copy the latest answer.**
+
+- Copies the newest finished answer as Markdown, followed by its cited **Sources**
+  list, so the `[n]` markers still resolve when pasted.
+- **Clipboard route** (`tui/clipboard.py`): a local tool is tried first (`wl-copy` on
+  Wayland, then `xclip` or `xsel` on X11, `pbcopy` on macOS). Textual's OSC 52 escape
+  is then sent as well. OSC 52 alone is not enough, because VTE terminals such as
+  GNOME Terminal ignore it.
+- **Over SSH** (`SSH_CONNECTION` or `SSH_TTY` set) no local tool is used, because it
+  would fill the remote machine's clipboard. Only OSC 52 is sent.
+- The notification says which route was used. When no tool was found, it suggests
+  installing one.
+- Ctrl+Y would be the natural key, but it is the prompt's redo, so the binding is
+  Ctrl+L.
 
 ## 9. Non-functional requirements
 

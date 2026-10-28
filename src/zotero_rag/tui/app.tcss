@@ -97,3 +97,31 @@ HelpScreen {
     border: round $accent;
     background: $surface;
 }
+
+ExportScreen {
+    align: center middle;
+}
+
+#export {
+    width: 80%;
+    height: auto;
+    padding: 1 2;
+    border: round $accent;
+    background: $surface;
+}
+
+#export-title {
+    text-style: bold;
+}
+
+#export-base {
+    color: $text-muted;
+}
+
+#export-status {
+    color: $text-muted;
+}
+
+#export-status.error {
+    color: $warning;
+}

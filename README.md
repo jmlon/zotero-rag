@@ -245,6 +245,13 @@ right, and a prompt under them.
   the sources it cited.
 - **Earlier questions.** **↑** and **↓** step through earlier questions, and they are
   kept per index folder across sessions.
+- **Keep what you found.**
+  - **Ctrl+S** saves the whole session as Markdown. It asks for a file name,
+    suggesting `transcripts/zotero-rag-<date>-<time>.md` in the index folder.
+  - **Ctrl+L** copies the latest answer, with its sources, to the clipboard. On
+    Linux this works most reliably with `xclip`, `xsel` or `wl-clipboard`
+    installed. Without one, the copy relies on your terminal supporting it, and some
+    (GNOME Terminal, for instance) do not.
 - **Moving around.** **Tab** moves between panes. **F1** lists every key. **Ctrl+Q**
   quits.
 
