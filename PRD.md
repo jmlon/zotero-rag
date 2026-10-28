@@ -145,6 +145,18 @@ zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
   `COHERE_API_KEY`; recommended where that key exists, since `top_k: 5` with
   reranking beat `top_k: 10` without it on half the context.
 
+### 3.4.1 `zotero-rag-ui`
+
+```
+zotero-rag-ui [--top-k N] [--window N] [--retrieval MODE] [--reranker none|cohere] [-v]
+```
+
+A separate console script with a full-screen terminal UI over the same pipeline as
+`query`. It adds a folder tree for limiting a question to a sub-folder, streamed
+Markdown answers and a persistent prompt history. Its flags mean what they mean for
+`query`, and outside an index folder it fails with the same error and exit code.
+Specified in `PRD-CursesUI.md`.
+
 ### 3.5 `eval`
 
 ```
@@ -316,10 +328,14 @@ multilingual OpenRouter slug. No local embedding models (see §9).
 <index-folder>/
   config.yaml        # marker + settings + pinned collection
   .env               # created by init as a template (never committed)
-  .gitignore         # created by init: ignores .env, chroma/, cache/
+  .gitignore         # created by init: ignores .env, chroma/, cache/, .zotero-rag-ui/
   questions.yaml     # optional golden set for `eval` (§11.3); worth committing
   chroma/            # Chroma persistent store (created on first index)
   cache/             # downloaded attachments, <attachment-key>.<pdf|html|docx|…>
+  collections.json   # the indexed collection tree, written by every `index` run
+                     # once membership is current (PRD-CursesUI §4.1)
+  .zotero-rag-ui/    # zotero-rag-ui state: `history` (one JSON string per line,
+                     # last 1000 prompts) and `ui.log` under -v (PRD-CursesUI §7, §8)
 ```
 
 The cache is retained so re-indexing does not re-download files. PDFs keep the
@@ -358,6 +374,16 @@ For the pinned collection, recursively:
   ODT, EPUB, and Zotero notes. `linked_url` attachments and anything else
   (images, video, archives) are skipped and counted in the run summary **with
   their content type**, so the count is actionable.
+- **Only files Zotero can serve are candidates.** Zotero sends `md5: null` for a
+  file that was never uploaded (file sync off, storage quota full, WebDAV storage,
+  or a sync still in progress), and the Web API answers 404 for it. Such attachments
+  are skipped as `file not uploaded to Zotero storage`, and `linked_file`
+  attachments, which live only on the user's disk, as `linked file`. Both are listed
+  by paper title in the summary, with how to fix them in Zotero. A payload with no
+  `md5` key is still tried. The check runs **before** the format preference, so an
+  unsynced PDF gives way to a synced snapshot instead of winning and failing to
+  download. An item left with nothing downloadable is not also reported as "no
+  readable attachment".
 - **One format per item.** When an item offers several readable attachments, the
   first format in `attachment_preference` wins and the rest are recorded as
   skipped. This exists because ~100 items in the target library hold both a PDF
@@ -399,7 +425,7 @@ markup is furniture.
 
 ### 7.2 Chunk metadata
 
-Stored per chunk, used for both citation and future filtering:
+Stored per chunk, used for citation and for the terminal UI's folder filter:
 
 | field | source |
 |---|---|
@@ -411,6 +437,7 @@ Stored per chunk, used for both citation and future filtering:
 | `doi` | item `DOI`, `""` if absent |
 | `zotero_url` | `https://www.zotero.org/<user>/collections/<col>/items/<key>/collection` |
 | `collection_name` | the (sub)collection the item was found in |
+| `collection_keys` | every indexed collection holding the parent item, as a list of strings. Refreshed on every run, with no re-embedding, because a move between folders does not bump the attachment version. Filter with `$contains`, never `$in` (PRD-CursesUI §4.3.1) |
 | `page` | the locator ordinal: a 1-based page for a PDF, a section number otherwise. The key keeps its name so chunks written before M5 are not stranded |
 | `chunk_index` | index of the chunk within that segment |
 | `locator_kind` | `page` \| `section` \| `paragraph` \| `note` \| `chunk` (M5) |
@@ -1321,6 +1348,8 @@ faster in wall-clock than the serial path, and the dry-run estimate lands within
 - **`chat` / REPL** with history, keeping the last N turns as conversational
   context while still citing every answer, plus `/sources` and `/topk`.
 - **Streaming output** for `query`, so a long answer starts appearing immediately.
+  `querying.stream_answer_question` already exists for `zotero-rag-ui` and returns
+  the same `QueryResult`, so this is CLI wiring only.
 - **Custom system prompt from a file** — `prompt_file` in config, `--prompt-file`
   to override (§8.1 currently fixes the prompt).
 - **Friendlier CLI errors.** A stray positional such as `zotero-rag index

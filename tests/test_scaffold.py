@@ -105,6 +105,7 @@ def test_gitignore_covers_secrets_and_rebuildable_state(
     assert ".env" in content
     assert "chroma/" in content
     assert "cache/" in content
+    assert ".zotero-rag-ui/" in content
 
 
 def test_env_template_lists_every_variable_with_empty_secrets(

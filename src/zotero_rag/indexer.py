@@ -248,6 +248,29 @@ def prune_orphans(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
     return len(orphans), chunks
 
 
+def refresh_collection_keys(store: VectorStore, plan: IndexPlan) -> int:
+    """Bring each stored attachment's `collection_keys` in line with the plan.
+
+    Moving an item between folders in Zotero does not bump its attachment's version,
+    so the incremental skip would leave stale membership behind. Comparing every
+    planned attachment against the store catches that. It also backfills stores
+    written before the field existed, at the cost of metadata updates only.
+    Returns how many attachments were updated.
+    """
+    stored = store.collection_keys_by_attachment()
+    updated = 0
+    for attachment in plan.attachments:
+        wanted = sorted(attachment.collection_keys)
+        if not wanted or attachment.attachment_key not in stored:
+            continue
+        if stored[attachment.attachment_key] != wanted:
+            store.set_collection_keys(attachment.attachment_key, wanted)
+            updated += 1
+    if updated:
+        logger.info("updated collection membership of %d attachment(s)", updated)
+    return updated
+
+
 def repair_embeddings(
     store: VectorStore,
     embed: Embedder,

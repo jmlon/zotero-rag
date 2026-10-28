@@ -197,6 +197,11 @@ def collection_scope(node: CollectionNode, recursive: bool) -> list[CollectionNo
     return [descendant for descendant, _depth in node.walk()]
 
 
+def scope_tree(node: CollectionNode, recursive: bool) -> CollectionNode:
+    """`node` as `collection_scope` indexes it: with its subtree, or alone."""
+    return node if recursive else node.model_copy(update={"children": []})
+
+
 def library_scope(roots: list[CollectionNode]) -> list[CollectionNode]:
     """Every collection in the library, for the whole-library root target."""
     return [node for root in roots for node, _depth in root.walk()]

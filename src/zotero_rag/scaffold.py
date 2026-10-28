@@ -29,6 +29,7 @@ GITIGNORE_CONTENT = """\
 .env
 chroma/
 cache/
+.zotero-rag-ui/
 """
 
 

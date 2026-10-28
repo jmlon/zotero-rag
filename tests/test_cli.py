@@ -16,14 +16,15 @@ from langchain_core.messages import AIMessage
 from rich.console import Console
 from typer.testing import CliRunner
 
-from zotero_rag import __version__, cli
+from zotero_rag import __version__, cli, index_folder
 from zotero_rag.config import Config
 from zotero_rag.evaluation import JudgeVerdict, RawVerdict, load_questions
 from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.generation import DocumentText, GeneratedQuestion, RawGeneration
 from zotero_rag.indexer import IndexStats
-from zotero_rag.planning import IndexPlan, PlannedAttachment
+from zotero_rag.planning import IndexPlan, PlannedAttachment, SkippedEntry, SkipReason
 from zotero_rag.querying import QueryResult, Source, Usage
+from zotero_rag.snapshot import read_snapshot
 from zotero_rag.vectorstore import VectorStore
 from zotero_rag.zotero_api import CollectionNode
 
@@ -205,20 +206,26 @@ def test_check_fingerprint_adopts_a_store_that_predates_it(tmp_path: Path) -> No
     store = _populated_store(tmp_path, "some/model", fingerprint=False)
     assert store.read_fingerprint() is None
 
-    cli._check_fingerprint(store, Config(), remedy="...")
+    notices: list[index_folder.Notice] = []
+    index_folder.check_fingerprint(store, Config(), "...", notices.append)
 
     recorded = store.read_fingerprint()
     assert recorded is not None
     assert recorded.embedding_model == Config().embedding_model
     assert recorded.embedding_dim == 3  # derived from the data, not assumed
+    # Adopting is not silent: the user is told what the record cannot vouch for.
+    assert [notice.level for notice in notices] == ["note"]
+    assert "--repair" in notices[0].text
 
 
 def test_check_fingerprint_only_warns_about_changed_chunking(tmp_path: Path) -> None:
     store = _populated_store(tmp_path, Config().embedding_model)
     config = Config()
     config.index.chunk_size = 400
+    notices: list[index_folder.Notice] = []
     # Must not raise: every stored vector is still valid, merely shaped differently.
-    cli._check_fingerprint(store, config, remedy="...")
+    index_folder.check_fingerprint(store, config, "...", notices.append)
+    assert notices and all(notice.level == "warning" for notice in notices)
 
 
 def test_refetch_requires_force() -> None:
@@ -1130,7 +1137,7 @@ def test_reranking_is_off_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyP
     def must_not_build(config: object) -> object:
         raise AssertionError("a reranker was built without being asked for")
 
-    monkeypatch.setattr(cli, "build_reranker", must_not_build)
+    monkeypatch.setattr(index_folder, "build_reranker", must_not_build)
 
     payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
 
@@ -1187,7 +1194,9 @@ def test_a_configured_reranker_is_recorded_in_the_report(
     _eval_index_folder(tmp_path, ONE_QUESTION)
     monkeypatch.chdir(tmp_path)
     _stub_seams(monkeypatch)
-    monkeypatch.setattr(cli, "build_reranker", lambda config: lambda q, docs, n: [(0, 0.9)])
+    monkeypatch.setattr(
+        index_folder, "build_reranker", lambda config: lambda q, docs, n: [(0, 0.9)]
+    )
 
     result = runner.invoke(cli.app, ["eval", "--reranker", "cohere", "--json"])
 
@@ -1209,9 +1218,140 @@ def test_a_reranker_that_silently_fell_back_is_reported(
     def flaky(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         raise RuntimeError("503")
 
-    monkeypatch.setattr(cli, "build_reranker", lambda config: flaky)
+    monkeypatch.setattr(index_folder, "build_reranker", lambda config: flaky)
 
     result = runner.invoke(cli.app, ["eval", "--reranker", "cohere"])
 
     assert result.exit_code == 0
     assert "reranking applied to only 0 of 1 questions" in result.output
+
+
+# --- folder membership and the collection snapshot (PRD-CursesUI §4) ---------
+
+
+def _collection(key: str, name: str, parent: str | None = None) -> dict[str, object]:
+    return {"key": key, "data": {"key": key, "name": name, "parentCollection": parent or False}}
+
+
+def _paper_with_note(key: str) -> list[dict[str, object]]:
+    """An item plus a child note: indexable with no download at all."""
+    return [
+        {"key": key, "data": {"key": key, "itemType": "journalArticle", "title": f"Paper {key}"}},
+        {
+            "key": f"N{key}",
+            "data": {
+                "key": f"N{key}",
+                "itemType": "note",
+                "parentItem": key,
+                "note": f"<p>Notes on paper {key}.</p>",
+                "version": 5,
+            },
+        },
+    ]
+
+
+def _fake_library(
+    monkeypatch: pytest.MonkeyPatch, contents: dict[str, list[dict[str, object]]]
+) -> None:
+    """A pinned tree NET > {ROUTING, TRANSPORT > QUIC}, holding `contents`."""
+
+    class Embeddings:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            return [[float(len(text)), 1.0, 0.5] for text in texts]
+
+    collections = [
+        _collection("NET", "Networking"),
+        _collection("ROUTING", "Routing", "NET"),
+        _collection("TRANSPORT", "Transport", "NET"),
+        _collection("QUIC", "QUIC", "TRANSPORT"),
+        _collection("OTHER", "Unrelated"),
+    ]
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(cli, "build_client", lambda config: object())
+    monkeypatch.setattr(cli, "fetch_collections", lambda zot: collections)
+    monkeypatch.setattr(cli, "fetch_username", lambda zot: "someone")
+    monkeypatch.setattr(cli, "fetch_collection_items", lambda zot, key: contents.get(key, []))
+    monkeypatch.setattr(cli, "build_embeddings", lambda config: Embeddings())
+
+
+def test_index_records_folder_membership_and_writes_the_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.yaml").write_text("index:\n  collection_key: NET\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    shared = _paper_with_note("P1")
+    _fake_library(
+        monkeypatch,
+        {"NET": [], "ROUTING": shared, "QUIC": [*shared, *_paper_with_note("P2")]},
+    )
+
+    result = runner.invoke(cli.app, ["index"])
+    assert result.exit_code == 0, result.output
+
+    store = VectorStore(tmp_path / "chroma")
+    assert store.collection_keys_by_attachment() == {
+        "NP1": ["QUIC", "ROUTING"],  # one item, two folders
+        "NP2": ["QUIC"],
+    }
+    snapshot = read_snapshot(tmp_path)
+    assert snapshot is not None
+    assert [root.key for root in snapshot.roots] == ["NET"]  # the pinned tree only
+    assert snapshot.all_keys() == {"NET", "ROUTING", "TRANSPORT", "QUIC"}
+    # Written with the chunks, so there was nothing to bring up to date.
+    assert "folder membership" not in result.output
+
+
+def test_index_backfills_a_store_written_before_membership_existed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "config.yaml").write_text("index:\n  collection_key: NET\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _fake_library(monkeypatch, {"ROUTING": _paper_with_note("P1")})
+    assert runner.invoke(cli.app, ["index"]).exit_code == 0
+
+    # Make the store look like one indexed by 0.4.x: chunks, no keys, no snapshot.
+    store = VectorStore(tmp_path / "chroma")
+    old = store.all_chunks()
+    store.delete_ids([chunk.id for chunk in old])
+    store.add(
+        ids=[chunk.id for chunk in old],
+        embeddings=[[1.0, 1.0, 1.0]] * len(old),
+        documents=[chunk.text for chunk in old],
+        metadatas=[
+            {k: v for k, v in chunk.metadata.items() if k != "collection_keys"} for chunk in old
+        ],
+    )
+    (tmp_path / "collections.json").unlink()
+
+    result = runner.invoke(cli.app, ["index"])
+
+    assert result.exit_code == 0, result.output
+    assert "Updated the folder membership of 1 attachment (no re-embedding)" in result.output
+    assert VectorStore(tmp_path / "chroma").collection_keys_by_attachment() == {"NP1": ["ROUTING"]}
+    assert read_snapshot(tmp_path) is not None
+
+
+def test_a_dry_run_writes_no_snapshot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "config.yaml").write_text("index:\n  collection_key: NET\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _fake_library(monkeypatch, {"ROUTING": _paper_with_note("P1")})
+    assert runner.invoke(cli.app, ["index", "--dry-run"]).exit_code == 0
+    assert read_snapshot(tmp_path) is None
+
+
+def test_skips_the_user_can_fix_name_the_items_and_say_how() -> None:
+    plan = IndexPlan(
+        skipped=[
+            SkippedEntry(key="F6CRQDYK", title="Exploring LLMs", reason=SkipReason.NOT_IN_STORAGE),
+            SkippedEntry(key="L1", title="A local file", reason=SkipReason.LINKED_FILE),
+        ]
+    )
+    out = StringIO()
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(cli, "console", Console(file=out, width=200, no_color=True))
+        cli._print_skips(plan)
+    text = out.getvalue()
+    assert "file not uploaded to Zotero storage" in text
+    assert "Exploring LLMs (F6CRQDYK)" in text
+    assert "Settings → Sync" in text
+    assert "Convert Linked Files to Stored Files" in text

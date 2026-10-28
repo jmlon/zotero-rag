@@ -10,9 +10,16 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 
-from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+)
 from pydantic import BaseModel, Field
 
 from zotero_rag.documents import LocatorKind
@@ -20,12 +27,14 @@ from zotero_rag.embedding import count_tokens
 from zotero_rag.llm import LLMError, message_text, usage_from_message
 from zotero_rag.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore
 
 logger = logging.getLogger(__name__)
 
 QuestionEmbedder = Callable[[str], list[float]]
 Answerer = Callable[[list[BaseMessage]], AIMessage]
+StreamingAnswerer = Callable[[list[BaseMessage]], Iterator[AIMessageChunk]]
+TokenSink = Callable[[str], None]
 
 # PRD §8.1. Fixed in the PoC; loading a custom prompt from a file is a future
 # option. The language instruction matters because the test corpus is queried in
@@ -278,6 +287,87 @@ def build_messages(question: str, context: str) -> list[BaseMessage]:
     ]
 
 
+@dataclass
+class _Prepared:
+    """Everything decided before the model is called, shared by both variants."""
+
+    question: str
+    start: float
+    candidates: list[StoredChunk]
+    hits: list[StoredChunk]
+    reranked: bool
+    chunks: list[StoredChunk]
+    sources: list[Source]
+    usage: Usage
+    #: `None` when nothing was retrieved, so there is nothing to ask the model.
+    messages: list[BaseMessage] | None
+
+
+def _prepare(
+    question: str,
+    store: VectorStore,
+    embed_query: QuestionEmbedder,
+    top_k: int,
+    window: int,
+    mode: RetrievalMode,
+    keyword_index: KeywordIndex | None,
+    rerank: RerankFn | None,
+    rerank_fanout: int,
+    scope: Scope,
+) -> _Prepared:
+    """Retrieve wide → rerank → window → number the sources → build the prompt."""
+    start = time.perf_counter()
+
+    embedding = embed_query(question)
+    depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
+    candidates = retrieve(store, embedding, question, depth, mode, keyword_index, scope)
+    hits, reranked = apply_rerank(candidates, question, top_k, rerank)
+    chunks = expand_window(store, hits, window)
+    sources, numbers = collect_sources(chunks)
+    usage = Usage(embedding_tokens=count_tokens([question]))
+
+    messages = None
+    if hits:
+        messages = build_messages(question, build_context(chunks, numbers, sources))
+    else:
+        logger.info("no chunks retrieved for %r", question)
+    return _Prepared(question, start, candidates, hits, reranked, chunks, sources, usage, messages)
+
+
+def _no_context(prepared: _Prepared) -> QueryResult:
+    prepared.usage.elapsed_s = time.perf_counter() - prepared.start
+    return QueryResult(question=prepared.question, answer=NO_CONTEXT_ANSWER, usage=prepared.usage)
+
+
+def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
+    """Turn the model's reply into the result: citations, usage, counts."""
+    usage = prepared.usage
+    usage.prompt_tokens, usage.completion_tokens = usage_from_message(message)
+    usage.elapsed_s = time.perf_counter() - prepared.start
+    text = message_text(message).strip()
+
+    cited = cited_numbers(text)
+    for source in prepared.sources:
+        source.cited = source.number in cited
+    logger.info(
+        "answered from %d chunk(s) across %d source(s), %d cited",
+        len(prepared.chunks),
+        len(prepared.sources),
+        len(cited),
+    )
+
+    return QueryResult(
+        question=prepared.question,
+        answer=text,
+        sources=prepared.sources,
+        usage=usage,
+        chunks_retrieved=len(prepared.hits),
+        chunks_in_context=len(prepared.chunks),
+        candidates_considered=len(prepared.candidates),
+        reranked=prepared.reranked,
+    )
+
+
 def answer_question(
     question: str,
     store: VectorStore,
@@ -289,6 +379,7 @@ def answer_question(
     keyword_index: KeywordIndex | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
+    scope: Scope = None,
 ) -> QueryResult:
     """Retrieve `top_k` chunks for the question and have the LLM answer from them.
 
@@ -308,53 +399,100 @@ def answer_question(
     candidates, and reranking before the cut is what lets it discard rather than
     merely reorder.
 
+    With a `scope`, only chunks held by those collection keys are retrieved, so the
+    reranker chooses among them and windowing then stays inside their attachments
+    (PRD-CursesUI §4.3.1). `None`, the default, searches the whole store.
+
     With nothing retrieved, no LLM call is made: an empty context can only
     produce "I don't know", and saying so costs nothing.
     """
-    start = time.perf_counter()
-
-    embedding = embed_query(question)
-    depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
-    candidates = retrieve(store, embedding, question, depth, mode, keyword_index)
-    hits, reranked = apply_rerank(candidates, question, top_k, rerank)
-    chunks = expand_window(store, hits, window)
-    sources, numbers = collect_sources(chunks)
-    usage = Usage(embedding_tokens=count_tokens([question]))
-
-    if not hits:
-        logger.info("no chunks retrieved for %r", question)
-        usage.elapsed_s = time.perf_counter() - start
-        return QueryResult(question=question, answer=NO_CONTEXT_ANSWER, usage=usage)
-
-    context = build_context(chunks, numbers, sources)
-    messages = build_messages(question, context)
+    prepared = _prepare(
+        question,
+        store,
+        embed_query,
+        top_k=top_k,
+        window=window,
+        mode=mode,
+        keyword_index=keyword_index,
+        rerank=rerank,
+        rerank_fanout=rerank_fanout,
+        scope=scope,
+    )
+    if prepared.messages is None:
+        return _no_context(prepared)
 
     try:
-        message = answer(messages)
+        message = answer(prepared.messages)
+    except Exception as exc:  # noqa: BLE001 - the client raises assorted API errors
+        raise LLMError(f"The language model call failed: {exc}") from exc
+    return _finish(prepared, message)
+
+
+def _guarded(stream: StreamingAnswerer, messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
+    """The model's chunks, with a provider failure at any point raised as `LLMError`.
+
+    A stream can fail after it has started, mid-answer, not only on the first call.
+    The guard wraps the provider alone: an exception from the caller's `on_token`
+    is raised in the caller's loop, outside this generator, so it is never
+    mislabelled as a model failure.
+    """
+    try:
+        yield from stream(messages)
     except Exception as exc:  # noqa: BLE001 - the client raises assorted API errors
         raise LLMError(f"The language model call failed: {exc}") from exc
 
-    usage.prompt_tokens, usage.completion_tokens = usage_from_message(message)
-    usage.elapsed_s = time.perf_counter() - start
-    text = message_text(message).strip()
 
-    cited = cited_numbers(text)
-    for source in sources:
-        source.cited = source.number in cited
-    logger.info(
-        "answered from %d chunk(s) across %d source(s), %d cited",
-        len(chunks),
-        len(sources),
-        len(cited),
-    )
+def stream_answer_question(
+    question: str,
+    store: VectorStore,
+    embed_query: QuestionEmbedder,
+    stream: StreamingAnswerer,
+    on_token: TokenSink,
+    top_k: int,
+    window: int = 0,
+    mode: RetrievalMode = "vector",
+    keyword_index: KeywordIndex | None = None,
+    rerank: RerankFn | None = None,
+    rerank_fanout: int = 4,
+    scope: Scope = None,
+) -> QueryResult:
+    """`answer_question`, with the answer's text sent to `on_token` as it arrives.
 
-    return QueryResult(
-        question=question,
-        answer=text,
-        sources=sources,
-        usage=usage,
-        chunks_retrieved=len(hits),
-        chunks_in_context=len(chunks),
-        candidates_considered=len(candidates),
-        reranked=reranked,
+    Retrieval, the prompt and the returned `QueryResult` are exactly those of
+    `answer_question`, because both run the same `_prepare` and `_finish`; only how
+    the reply is obtained differs (PRD-CursesUI §6.1). Citations are parsed only
+    once the stream ends, so `cited` is known only from the returned result.
+
+    The chunks are summed into one message, which merges their text and the usage
+    the provider sends on the last chunk. That chunk arrives only when the client
+    asks for it, which `build_chat` does with `stream_usage`; without it the token
+    counts are zero, as with any provider that omits usage.
+
+    `on_token` receives the raw deltas, so their concatenation can differ from
+    `result.answer` by surrounding whitespace, which the result strips. When nothing
+    is retrieved, `NO_CONTEXT_ANSWER` is sent as one delta, so a caller that renders
+    only the deltas still shows it.
+    """
+    prepared = _prepare(
+        question,
+        store,
+        embed_query,
+        top_k=top_k,
+        window=window,
+        mode=mode,
+        keyword_index=keyword_index,
+        rerank=rerank,
+        rerank_fanout=rerank_fanout,
+        scope=scope,
     )
+    if prepared.messages is None:
+        on_token(NO_CONTEXT_ANSWER)
+        return _no_context(prepared)
+
+    merged: AIMessageChunk | None = None
+    for chunk in _guarded(stream, prepared.messages):
+        merged = chunk if merged is None else merged + chunk
+        delta = message_text(chunk)
+        if delta:
+            on_token(delta)
+    return _finish(prepared, merged if merged is not None else AIMessageChunk(content=""))

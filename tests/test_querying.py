@@ -6,21 +6,25 @@ The store is a real on-disk Chroma instance; only the two network seams
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
-from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
-from zotero_rag.llm import LLMError, message_text, usage_from_message
+from zotero_rag.config import Config, packaged_defaults
+from zotero_rag.llm import LLMError, build_chat, message_text, usage_from_message
 from zotero_rag.querying import (
     NO_CONTEXT_ANSWER,
     SYSTEM_PROMPT,
+    QueryResult,
     answer_question,
     build_context,
     cited_numbers,
     collect_sources,
     expand_window,
+    stream_answer_question,
 )
 from zotero_rag.vectorstore import StoredChunk, VectorStore
 
@@ -416,3 +420,182 @@ def test_a_neighbour_on_another_page_becomes_its_own_source(store: VectorStore) 
 
 def test_windowing_leaves_an_empty_retrieval_alone(store: VectorStore) -> None:
     assert expand_window(store, [], window=2) == []
+
+
+# --- streaming (PRD-CursesUI §6.1) ---------------------------------------
+
+
+USAGE = {"input_tokens": 120, "output_tokens": 30, "total_tokens": 150}
+
+
+def chunks_of(text: str, usage: bool = True) -> list[AIMessageChunk]:
+    """The reply as a provider streams it: text deltas, then a usage-only chunk."""
+    pieces = [AIMessageChunk(content=text[i : i + 4]) for i in range(0, len(text), 4)]
+    if usage:
+        pieces.append(AIMessageChunk(content="", usage_metadata=USAGE))  # type: ignore[arg-type]
+    return pieces
+
+
+def streamed(
+    store: VectorStore,
+    stream: Callable[[list[BaseMessage]], Iterator[AIMessageChunk]],
+    tokens: list[str],
+    question: str = "why?",
+    **kwargs: Any,
+) -> QueryResult:
+    return stream_answer_question(
+        question,
+        store=store,
+        embed_query=lambda question: [1.0, 1.0, 0.5],
+        stream=stream,
+        on_token=tokens.append,
+        top_k=kwargs.pop("top_k", 2),
+        **kwargs,
+    )
+
+
+def without_timing(result: QueryResult) -> dict[str, Any]:
+    dumped = result.model_dump()
+    del dumped["usage"]["elapsed_s"]
+    return dumped
+
+
+@pytest.mark.parametrize("window", [0, 1])
+def test_streaming_gives_the_same_result_as_the_blocking_call(
+    store: VectorStore, window: int
+) -> None:
+    """The two variants share every step but the call, so they must agree exactly."""
+    populate(store, ["Writers should write every day.", "Keep previous versions of files."])
+    text = "Write daily [1], and keep versions [2]."
+    blocking = answer_question(
+        "What should writers do?",
+        store=store,
+        embed_query=lambda question: [1.0, 1.0, 0.5],
+        answer=lambda messages: reply(text),
+        top_k=2,
+        window=window,
+    )
+    tokens: list[str] = []
+    streaming = streamed(
+        store,
+        lambda messages: iter(chunks_of(text)),
+        tokens,
+        "What should writers do?",
+        window=window,
+    )
+
+    assert without_timing(streaming) == without_timing(blocking)
+    assert "".join(tokens) == text
+
+
+def test_the_deltas_arrive_before_the_stream_ends(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    tokens: list[str] = []
+
+    def stream(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
+        for chunk in chunks_of("Because [1]."):
+            yield chunk
+            seen_so_far.append(len(tokens))
+
+    seen_so_far: list[int] = []
+    streamed(store, stream, tokens)
+    assert seen_so_far[:3] == [1, 2, 3]  # each delta was delivered as it came
+
+
+def test_the_stream_is_given_the_same_prompt(store: VectorStore) -> None:
+    populate(store, ["Writers should write every day."])
+    prompts: list[list[BaseMessage]] = []
+
+    def stream(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
+        prompts.append(messages)
+        return iter(chunks_of("Yes [1]."))
+
+    streamed(store, stream, [], "What should writers do?")
+    system, human = prompts[0]
+    assert str(system.content) == SYSTEM_PROMPT
+    assert "write every day" in str(human.content)
+
+
+def test_streamed_usage_comes_from_the_final_chunk(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    result = streamed(store, lambda messages: iter(chunks_of("Because [1].")), [])
+    assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (120, 30)
+
+
+def test_a_stream_without_usage_reports_zeros(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    result = streamed(store, lambda messages: iter(chunks_of("Because [1].", usage=False)), [])
+    assert result.usage.total_tokens == 0
+    assert result.answer == "Because [1]."
+
+
+def test_an_empty_stream_is_an_empty_answer_not_a_crash(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    tokens: list[str] = []
+    result = streamed(store, lambda messages: iter([]), tokens)
+    assert result.answer == ""
+    assert tokens == []
+    assert not any(source.cited for source in result.sources)
+
+
+def test_streaming_with_nothing_retrieved_skips_the_model(store: VectorStore) -> None:
+    calls: list[int] = []
+
+    def stream(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
+        calls.append(1)
+        return iter(chunks_of("unused"))
+
+    tokens: list[str] = []
+    result = streamed(store, stream, tokens)
+    assert calls == []
+    assert result.answer == NO_CONTEXT_ANSWER
+    assert tokens == [NO_CONTEXT_ANSWER]  # a deltas-only renderer still shows it
+
+
+def test_a_stream_that_fails_midway_becomes_a_user_facing_error(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    tokens: list[str] = []
+
+    def stream(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
+        yield AIMessageChunk(content="Partial ")
+        raise RuntimeError("connection reset")
+
+    with pytest.raises(LLMError, match="connection reset"):
+        streamed(store, stream, tokens)
+    assert tokens == ["Partial "]
+
+
+def test_a_failing_token_sink_is_not_blamed_on_the_model(store: VectorStore) -> None:
+    populate(store, ["some text"])
+
+    def sink(delta: str) -> None:
+        raise KeyError("ui gone")
+
+    with pytest.raises(KeyError):
+        stream_answer_question(
+            "why?",
+            store=store,
+            embed_query=lambda question: [1.0, 1.0, 0.5],
+            stream=lambda messages: iter(chunks_of("Because [1].")),
+            on_token=sink,
+            top_k=1,
+        )
+
+
+def test_block_style_deltas_are_streamed_as_text(store: VectorStore) -> None:
+    populate(store, ["some text"])
+    tokens: list[str] = []
+    pieces = [
+        AIMessageChunk(content=[{"type": "text", "text": "Because ", "index": 0}]),
+        AIMessageChunk(content=[{"type": "text", "text": "[1].", "index": 0}]),
+    ]
+    result = streamed(store, lambda messages: iter(pieces), tokens)
+    assert tokens == ["Because ", "[1]."]
+    assert result.answer == "Because [1]."
+
+
+def test_the_chat_client_asks_for_usage_when_streaming() -> None:
+    """Without it, OpenAI-compatible streams carry no token counts at all."""
+    config = Config.model_validate(packaged_defaults())
+    config.global_.api_key = "sk-test"  # never sent: building the client calls nothing
+    assert build_chat(config).stream_usage is True

@@ -20,12 +20,14 @@ dependencies = [
     "pyzotero>=1.13.2",
     "rank-bm25>=0.2.2",
     "rich>=15.0.0",
+    "textual>=8.2.8",
     "tiktoken>=0.13.0",
     "typer>=0.27.0",
 ]
 
 [project.scripts]
 zotero-rag = "zotero_rag.cli:app"
+zotero-rag-ui = "zotero_rag.tui.main:app"
 
 [dependency-groups]
 dev = [

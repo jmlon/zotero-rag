@@ -33,8 +33,6 @@ from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
 from zotero_rag.errors import (
     CollectionMismatchError,
-    ConfigError,
-    FingerprintMismatchError,
     NotAnIndexFolderError,
     NotIndexedError,
     ZoteroRagError,
@@ -54,7 +52,7 @@ from zotero_rag.evaluation import (
     resolve_questions_path,
     run_settings,
 )
-from zotero_rag.fingerprint import StoreFingerprint, advisory, blocking
+from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.generation import (
     MATCH_DOCUMENT,
     DocumentText,
@@ -65,19 +63,34 @@ from zotero_rag.generation import (
     generate_questions,
     write_questions,
 )
+from zotero_rag.index_folder import (
+    REINDEX_REMEDY,
+    Notice,
+    build_keyword_index,
+    check_fingerprint,
+    open_index,
+    resolve_reranker,
+)
 from zotero_rag.indexer import (
     IndexStats,
     find_orphans,
     index_plan,
     prune_orphans,
+    refresh_collection_keys,
     repair_embeddings,
 )
 from zotero_rag.llm import build_chat
-from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason, build_plan
+from zotero_rag.planning import (
+    IndexPlan,
+    PlannedAttachment,
+    SkipReason,
+    build_plan,
+    item_membership,
+)
 from zotero_rag.querying import QueryResult, answer_question
-from zotero_rag.reranking import RerankFn, build_reranker
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.scaffold import init_index_folder
+from zotero_rag.snapshot import write_snapshot
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
     CollectionNode,
@@ -91,6 +104,7 @@ from zotero_rag.zotero_api import (
     find_collection_by_key,
     library_scope,
     resolve_collection_path,
+    scope_tree,
 )
 
 console = Console()
@@ -341,32 +355,9 @@ def _resolve_target(
     return scope, "the whole library", None
 
 
-def _check_fingerprint(store: VectorStore, config: Config, remedy: str) -> None:
-    """Compare what the store was built with against what the config now asks for.
-
-    A store with no fingerprint predates M4: it is *adopted* rather than rejected,
-    recording the current config as fact, because re-embedding a perfectly good
-    store just to gain a guard would be a poor trade. The warning says plainly what
-    that adoption cannot know.
-    """
-    intended = StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
-    recorded = store.read_fingerprint()
-
-    if recorded is None:
-        store.write_fingerprint(intended)
-        if store.count():
-            err_console.print(
-                f"[yellow]Note:[/yellow] this store predates fingerprinting; recording "
-                f"[bold]{escape(intended.embedding_model)}[/bold] as the model that built it. "
-                "If you changed embedding_model since indexing, run `index --repair`."
-            )
-        return
-
-    mismatches = recorded.compare(intended)
-    if fatal := blocking(mismatches):
-        raise FingerprintMismatchError([str(mismatch) for mismatch in fatal], remedy)
-    for mismatch in advisory(mismatches):
-        err_console.print(f"[yellow]Warning:[/yellow] {escape(str(mismatch))}.")
+def _print_notice(notice: Notice) -> None:
+    """Show a non-fatal notice from opening the index on stderr, beside the progress."""
+    err_console.print(f"[yellow]{notice.level.capitalize()}:[/yellow] {escape(notice.text)}")
 
 
 def _run_index(
@@ -474,9 +465,28 @@ def _print_skips(plan: IndexPlan) -> None:
         if reason in _DETAILED_SKIPS:
             for content_type, subcount in plan.content_types_for(reason).items():
                 console.print(f"       [dim]{subcount:>3}  {escape(content_type)}[/dim]")
+        if reason in _FIXABLE_SKIPS:
+            # The user has to find these in Zotero, so name them.
+            for entry in plan.skipped_for(reason):
+                console.print(f"       [dim]{escape(entry.title)} ({entry.key})[/dim]")
+            console.print(f"       [yellow]{_FIXABLE_SKIPS[reason]}[/yellow]")
 
 
 _DETAILED_SKIPS = frozenset({SkipReason.UNSUPPORTED_TYPE, SkipReason.NOT_PREFERRED})
+
+#: Skips the user can fix in Zotero, and how.
+_FIXABLE_SKIPS: dict[SkipReason, str] = {
+    SkipReason.NOT_IN_STORAGE: (
+        "Zotero holds no file for these. In Zotero desktop, check Settings → Sync: "
+        "file syncing on, using Zotero storage (not WebDAV), quota not full. Then sync "
+        "and index again."
+    ),
+    SkipReason.LINKED_FILE: (
+        "These files live only on your computer. Convert them to stored files in "
+        "Zotero (Tools → Manage Attachments → Convert Linked Files to Stored Files), "
+        "sync, and index again."
+    ),
+}
 
 
 def _print_plan(plan: IndexPlan, target: str) -> None:
@@ -596,20 +606,21 @@ def index(
         # The citation URL needs the library owner's username; a dry run skips it.
         username = "" if dry_run else fetch_username(zot)
 
-        items: list[tuple[str, list[dict[str, object]]]] = []
+        fetched: list[tuple[CollectionNode, list[dict[str, object]]]] = []
         with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
             for collection_node in scope:
                 status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
-                items.append(
-                    (collection_node.name, fetch_collection_items(zot, collection_node.key))
-                )
+                fetched.append((collection_node, fetch_collection_items(zot, collection_node.key)))
 
         plan = build_plan(
-            items,
+            [(collection_node.name, items) for collection_node, items in fetched],
             username,
             preference=config.index.attachment_preference,
             index_all_attachments=config.index.index_all_attachments,
             index_notes=config.index.index_notes,
+            membership=item_membership(
+                (collection_node.key, items) for collection_node, items in fetched
+            ),
         )
 
         if dry_run:
@@ -643,7 +654,7 @@ def index(
             # --repair is the remedy for a model change, so it must not be blocked
             # by the very mismatch it exists to fix.
             if not repair:
-                _check_fingerprint(store, config, remedy=_REINDEX_REMEDY)
+                check_fingerprint(store, config, REINDEX_REMEDY, _print_notice)
             if repair:
                 _run_repair(store, config, embeddings)
 
@@ -652,19 +663,24 @@ def index(
             StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
         )
         orphans = prune_orphans(store, plan) if prune else (len(find_orphans(store, plan)), 0)
+        # Folders can change without any attachment changing, so membership is
+        # checked on every run, and the snapshot is written only once it is current.
+        refreshed = refresh_collection_keys(store, plan)
+        write_snapshot(
+            index_dir,
+            [scope_tree(node, config.index.recursive)] if node is not None else roots,
+        )
     except ZoteroRagError as exc:
         _fail(exc)
         return
 
     _print_index_summary(plan, stats, store, verbose=_is_verbose())
     _print_orphans(orphans, pruned=prune)
-
-
-_REINDEX_REMEDY = (
-    "Run `zotero-rag index --repair` to re-embed the affected chunks with the "
-    "configured model (no downloads), or `index --force` to rebuild from scratch. "
-    "Reverting the config change also resolves it."
-)
+    if refreshed:
+        console.print(
+            f"Updated the folder membership of {_plural(refreshed, 'attachment')} "
+            "(no re-embedding)."
+        )
 
 
 def _run_repair(store: VectorStore, config: Config, embeddings: Any) -> None:
@@ -723,55 +739,12 @@ RerankerOption = Annotated[
 ]
 
 
-def _resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | None, str | None]:
-    """The reranker to use and its name, honouring `--reranker none` as "off".
-
-    Returns `(None, None)` when disabled. Building it asserts the Cohere credential,
-    so a folder that asks for reranking without a key fails immediately.
-    """
-    name = config.reranker if override is None else (None if override == "none" else override)
-    if name is None:
-        return None, None
-    if name != "cohere":
-        raise ConfigError(f"Unknown reranker {name!r}. Use `cohere`, or `none` to disable it.")
-    return build_reranker(config), name
-
-
 def _build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:
-    """The BM25 index, built once, or `None` for plain vector retrieval.
-
-    Built here rather than inside the query so a run over many questions pays for it
-    once; it is a tokenize pass over every chunk in the store.
-    """
+    """`build_keyword_index` behind a spinner, since it can take a moment."""
     if mode != "hybrid":
         return None
     with err_console.status("[dim]Building the keyword index...[/dim]"):
-        return KeywordIndex.from_store(store)
-
-
-def _open_index() -> tuple[Config, VectorStore]:
-    """Load the index config and open its store, or explain what is missing."""
-    config = load_config()
-    if config.source_dir is None:
-        raise NotAnIndexFolderError(
-            f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
-            "or change to an index folder."
-        )
-    chroma_dir = config.source_dir / CHROMA_DIRNAME
-    if not VectorStore.exists(chroma_dir):
-        raise NotIndexedError(
-            f"This index folder has no vector store yet ({chroma_dir} is empty). "
-            'Run `zotero-rag index --collection "NAME"` (or `--collection-key KEY`) first.'
-        )
-    store = VectorStore(chroma_dir)
-    if store.count() == 0:
-        raise NotIndexedError(
-            "The vector store holds no chunks. Run `zotero-rag index` to populate it."
-        )
-    # A question embedded by a different model than the store was built with cannot
-    # retrieve meaningfully, so refuse rather than answer from nonsense neighbours.
-    _check_fingerprint(store, config, remedy=_REINDEX_REMEDY)
-    return config, store
+        return build_keyword_index(store, mode)
 
 
 def _print_answer(result: QueryResult, show_sources: bool, verbose: bool) -> None:
@@ -871,9 +844,9 @@ def query(
     _enable_verbose(verbose)
 
     try:
-        config, store = _open_index()
+        config, store = open_index(_print_notice)
         mode = retrieval if retrieval is not None else config.index.retrieval
-        rerank, _ = _resolve_reranker(config, reranker)
+        rerank, _ = resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
@@ -1090,14 +1063,14 @@ def eval_command(
     _enable_verbose(verbose)
 
     try:
-        config, store = _open_index()
+        config, store = open_index(_print_notice)
         questions_path = resolve_questions_path(config, questions_file)
         questions = _select_questions(load_questions(questions_path), only or [])
 
         chosen_top_k = top_k if top_k is not None else config.index.top_k
         chosen_window = window if window is not None else config.index.retrieval_window
         mode = retrieval if retrieval is not None else config.index.retrieval
-        rerank, rerank_name = _resolve_reranker(config, reranker)
+        rerank, rerank_name = resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
@@ -1300,7 +1273,7 @@ def generate_questions_command(
     _enable_verbose(verbose)
 
     try:
-        config, store = _open_index()
+        config, store = open_index(_print_notice)
         count = per_document if per_document is not None else config.eval.questions_per_document
         documents = _select_documents(
             collect_documents(store, config.eval.document_char_budget),

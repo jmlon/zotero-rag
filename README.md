@@ -29,6 +29,10 @@ Sources
 
 Questions may be asked in any language, whatever language the papers are in.
 
+For a series of questions there is also **`zotero-rag-ui`**, a full-screen terminal
+UI. You pick a sub-folder of the collection to search, and the answers stream in as
+you read them (see [The terminal UI](#the-terminal-ui)).
+
 There is also a `zotero-rag eval` command that scores the index against a set of
 questions, so "does a bigger `top_k` help?" has a number for an answer instead of
 an impression — and `zotero-rag generate-questions` will draft that set from the
@@ -56,8 +60,11 @@ uv sync
 To get a `zotero-rag` command available everywhere, install it as a tool:
 
 ```bash
-uv tool install .          # puts `zotero-rag` in ~/.local/bin
+uv tool install .          # puts `zotero-rag` and `zotero-rag-ui` in ~/.local/bin
 ```
+
+If the tool was installed before, add `--reinstall` so uv rebuilds it instead of
+reusing the cached build.
 
 That copies the current source, so re-run it after pulling or editing the code —
 or install with `uv tool install --editable .` to have the command track your
@@ -143,6 +150,8 @@ zotero-rag index -v            # add timings and token counts
 
 Re-running `index` is cheap and safe: attachments already indexed and unchanged are
 skipped, and downloaded files stay in `cache/`, so only new work costs anything.
+Each run also records which collections every indexed item belongs to. When an item
+has moved between subcollections, the run updates that record without re-embedding.
 
 ### What gets indexed
 
@@ -174,6 +183,12 @@ content types it skipped so you can see what you are missing:
      1  linked URL (no file)
 ```
 
+Only files Zotero itself holds can be indexed. An attachment whose file never
+finished **syncing** to zotero.org, or a **linked file** that lives only on your
+computer, is skipped and listed by paper title, with how to fix it. Turn on file
+syncing in Zotero's Settings → Sync, or use Tools → Manage Attachments → Convert
+Linked Files to Stored Files, then run `index` again.
+
 ### Keeping an index in step with Zotero
 
 ```bash
@@ -189,6 +204,10 @@ Items **deleted** in Zotero, or moved out of this collection, are reported but k
 until you ask: every run tells you how many chunks belong to attachments the
 collection no longer has, and `--prune` removes them. Deleting data during an
 ordinary index run would be a poor surprise.
+
+Every run also records which sub-folders each item is filed in, which is what the
+terminal UI's folder filter uses. Moving an item between folders in Zotero is picked
+up by the next `index` without re-embedding anything.
 
 ### 4. Ask questions
 
@@ -206,6 +225,37 @@ zotero-rag query "..." -v                # prompt and completion token counts
 The source list shows only the sources the answer actually cited. When the
 collection has nothing relevant, the tool says it does not know rather than
 inventing an answer — that is the point of the citations.
+
+#### The terminal UI
+
+```bash
+zotero-rag-ui                     # from inside an index folder
+zotero-rag-ui --top-k 5 --reranker cohere   # same flags as `query`
+```
+
+The screen has three panes: the collection's folders on the left, the answers on the
+right, and a prompt under them.
+
+- **Choose where to search.** Select a folder (Enter, Space or a click) to search it
+  and every folder below it. The root, the collection itself, searches everything,
+  exactly as `query` does. The status bar shows the current folder, and each answer
+  is tagged with the folder it was asked in.
+- **Ask.** Type and press **Enter**. **Alt+Enter** (or Shift+Enter, where your
+  terminal sends it) starts a new line. The answer streams in as Markdown, followed by
+  the sources it cited.
+- **Earlier questions.** **↑** and **↓** step through earlier questions, and they are
+  kept per index folder across sessions.
+- **Moving around.** **Tab** moves between panes. **F1** lists every key. **Ctrl+Q**
+  quits.
+
+The folder tree comes from the last `index` run, so the UI makes no Zotero call and
+starts instantly. In a folder last indexed by an older version, it searches the
+whole collection and asks you to run `zotero-rag index` once to enable folder
+filtering. That run updates the stored folder information without re-embedding
+anything.
+
+Each question is answered on its own; earlier questions are not sent as context.
+`-v` writes diagnostics to `.zotero-rag-ui/ui.log`, because the screen is in use.
 
 ### 5. Measure it, before you tune it
 
@@ -384,8 +434,10 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   config.yaml     settings and the pinned collection
   .env            your credentials (never committed)
   questions.yaml  optional golden set for `eval` — worth committing
-  chroma/         the vector store
-  cache/          downloaded PDFs, kept so re-indexing does not re-download
+  chroma/            the vector store
+  cache/             downloaded PDFs, kept so re-indexing does not re-download
+  collections.json   the indexed collection tree, rewritten by every `index` run
+  .zotero-rag-ui/    the terminal UI's prompt history (and its -v log)
 ```
 
 One folder serves one collection. For a second collection, make a second folder.
@@ -400,9 +452,10 @@ This is a proof of concept, and deliberately narrow:
 - **A saved web page is only as good as what was saved.** Snapshots of paywalled
   articles are usually the abstract page, not the full text.
 - **Your own library only** — group libraries are not supported yet.
-- Retrieval combines vector similarity with BM25 keywords, and optional reranking, but
-  there is **no metadata filtering** at query time yet and no diversity constraint, so
-  a single well-matched paper can occupy every slot and crowd out the one you wanted.
+- Retrieval combines vector similarity with BM25 keywords, and optional reranking.
+  The terminal UI can limit a question to a folder, but there is no other metadata
+  filtering (by year, author, tag) and no diversity constraint. A single well-matched
+  paper can therefore occupy every slot and crowd out the one you wanted.
   A question with no distinctive wording ("what methodology did the authors use?") can
   miss its paper no matter how many passages you retrieve — deeper retrieval, keyword
   search and reranking were all measured against one such question and none of them

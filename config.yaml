@@ -10,7 +10,7 @@ global:
     zotero_api_key_env: ZOTERO_API_KEY
     zotero_library_type: user
     defaults:
-        llm_model: openai/gpt-4o-mini
+        llm_model: openai/gpt-6-luna
         embedding_model: openai/text-embedding-3-small
         vector_db: chroma
         reranker: null

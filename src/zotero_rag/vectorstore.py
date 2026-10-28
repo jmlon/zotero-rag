@@ -8,6 +8,7 @@ function at all — that keeps Chroma's bundled ONNX model from ever loading.
 from __future__ import annotations
 
 import logging
+from collections.abc import Collection, Mapping
 from pathlib import Path
 from typing import Any, cast
 
@@ -52,6 +53,37 @@ def reading_order_key(chunk: StoredChunk) -> tuple[str, int, int]:
             return 0
 
     return str(chunk.metadata.get("attachment_key") or ""), number("page"), number("chunk_index")
+
+
+#: Collection keys a search is limited to; `None` searches the whole store.
+Scope = Collection[str] | None
+
+
+def scope_where(scope: Collection[str]) -> dict[str, Any]:
+    """The Chroma filter for chunks held by any collection in `scope`.
+
+    Verified against chromadb 1.5.9 (PRD-CursesUI §4.3.1): only `$contains` matches
+    inside a list value. `$in` and plain equality silently match nothing, and `$or`
+    refuses fewer than two clauses, so a single key needs the bare form. Keys are
+    sorted so that one scope always yields one filter.
+    """
+    keys = sorted(set(scope))
+    if not keys:
+        raise ValueError("An empty scope selects nothing; check for it before filtering")
+    clauses = [{"collection_keys": {"$contains": key}} for key in keys]
+    return clauses[0] if len(clauses) == 1 else {"$or": clauses}
+
+
+def in_scope(metadata: Mapping[str, Any], scope: Scope) -> bool:
+    """Whether a chunk belongs to `scope`. The same rule as `scope_where`, in Python.
+
+    A chunk with no `collection_keys` (written before they existed) is outside every
+    scope, but inside an unscoped search.
+    """
+    if scope is None:
+        return True
+    keys = metadata.get("collection_keys")
+    return isinstance(keys, list) and not set(scope).isdisjoint(keys)
 
 
 class VectorStore:
@@ -111,13 +143,22 @@ class VectorStore:
         found = self._collection.get(where={"attachment_key": attachment_key})
         return sorted(self._to_chunks(found), key=reading_order_key)
 
-    def query(self, embedding: list[float], top_k: int) -> list[StoredChunk]:
-        """The `top_k` nearest chunks to an embedded question."""
+    def query(self, embedding: list[float], top_k: int, scope: Scope = None) -> list[StoredChunk]:
+        """The `top_k` nearest chunks to an embedded question, within `scope`.
+
+        Fewer come back when the scope holds fewer chunks. An empty scope matches
+        nothing and makes no call at all.
+        """
+        if scope is not None and not scope:
+            return []
+        # Passed only when scoped, so an unscoped query is exactly the call it was.
+        where = {"where": cast(Any, scope_where(scope))} if scope is not None else {}
         try:
             result = self._collection.query(
                 query_embeddings=cast(Any, [embedding]),
                 n_results=top_k,
                 include=cast(Any, ["documents", "metadatas", "distances"]),
+                **where,
             )
         except Exception as exc:  # noqa: BLE001 - chromadb raises assorted types
             raise VectorStoreError(f"Cannot query the vector store: {exc}") from exc
@@ -248,6 +289,46 @@ class VectorStore:
             for metadata in metadatas
             if metadata and metadata.get("attachment_key")
         }
+
+    def collection_keys_by_attachment(self) -> dict[str, list[str] | None]:
+        """Each stored attachment's `collection_keys`, in one read of the store.
+
+        `None` when the attachment's chunks carry none, or disagree with one another,
+        for example after an interrupted backfill. Either way it needs rewriting.
+        """
+        metadatas = self._collection.get(include=cast(Any, ["metadatas"]))["metadatas"] or []
+        found: dict[str, list[str] | None] = {}
+        for metadata in metadatas:
+            if not metadata or not metadata.get("attachment_key"):
+                continue
+            key = str(metadata["attachment_key"])
+            raw = metadata.get("collection_keys")
+            keys = sorted(str(value) for value in raw) if isinstance(raw, list) else None
+            if key in found and found[key] != keys:
+                keys = None
+            found[key] = keys
+        return found
+
+    def set_collection_keys(self, attachment_key: str, collection_keys: list[str]) -> int:
+        """Rewrite `collection_keys` on every chunk of one attachment.
+
+        Verified against chromadb 1.5.9: `update` merges the given metadata keys into
+        what is stored and leaves the text and vector alone, so nothing is re-embedded.
+        Returns how many chunks were updated.
+        """
+        if not collection_keys:
+            raise ValueError("Chroma rejects an empty list; give at least one collection key")
+        ids = list(self._collection.get(where={"attachment_key": attachment_key})["ids"])
+        if not ids:
+            return 0
+        try:
+            self._collection.update(
+                ids=ids,
+                metadatas=cast(Any, [{"collection_keys": list(collection_keys)}] * len(ids)),
+            )
+        except Exception as exc:  # noqa: BLE001 - chromadb raises assorted types
+            raise VectorStoreError(f"Cannot update the vector store: {exc}") from exc
+        return len(ids)
 
     def attachment_version(self, attachment_key: str) -> int | None:
         """The Zotero version of the attachment as stored, or `None` if unknown.

@@ -1,0 +1,99 @@
+/* Layout from PRD-CursesUI §3: tree 1/3 on the left; results 3/4 over prompt 1/4. */
+
+#too-small {
+    display: none;
+    height: 1fr;
+    content-align: center middle;
+    color: $warning;
+}
+
+#main {
+    height: 1fr;
+}
+
+#tree {
+    width: 1fr;
+    border: round $panel-lighten-2;
+}
+
+#right {
+    width: 2fr;
+}
+
+#results {
+    height: 3fr;
+    border: round $panel-lighten-2;
+    padding: 0 1;
+}
+
+#prompt {
+    height: 1fr;
+    border: round $panel-lighten-2;
+}
+
+#tree:focus, #results:focus, #prompt:focus {
+    border: round $accent;
+}
+
+#status {
+    height: 1;
+    padding: 0 1;
+    background: $panel;
+}
+
+#new-output {
+    dock: bottom;
+    display: none;
+    width: auto;
+    padding: 0 1;
+    background: $accent;
+    color: $text;
+}
+
+.entry {
+    height: auto;
+    margin-bottom: 1;
+}
+
+.scope-tag {
+    color: $accent;
+    text-style: bold;
+}
+
+.question {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.answer {
+    margin: 0;
+    padding: 0;
+}
+
+.footnote.error {
+    color: $error;
+}
+
+.notice {
+    margin-bottom: 1;
+}
+
+.notice.warning {
+    color: $warning;
+}
+
+.notice.note {
+    color: $text-muted;
+}
+
+HelpScreen {
+    align: center middle;
+}
+
+#help {
+    width: auto;
+    height: auto;
+    padding: 1 2;
+    border: round $accent;
+    background: $surface;
+}

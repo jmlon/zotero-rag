@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from zotero_rag.documents import DocumentFormat
-from zotero_rag.planning import SkipReason, build_plan
+from zotero_rag.planning import SkipReason, build_plan, item_membership
 
 
 def item(
@@ -227,3 +227,128 @@ def test_empty_collection_yields_an_empty_plan() -> None:
     assert plan.skipped == []
     assert plan.items_seen == 0
     assert plan.item_count == 0
+
+
+# --- collection membership (PRD-CursesUI §4.3) ----------------------------
+
+
+def test_membership_lists_every_fetched_collection_holding_the_item() -> None:
+    membership = item_membership(
+        [
+            ("KPARENT", [item("ITEM1"), attachment("ATT1")]),
+            ("KCHILD", [item("ITEM1"), item("ITEM2"), attachment("ATT2", parent="ITEM2")]),
+        ]
+    )
+    assert membership == {"ITEM1": ["KCHILD", "KPARENT"], "ITEM2": ["KCHILD"]}
+
+
+def test_membership_ignores_attachments_and_notes() -> None:
+    """They inherit their parent's folders; listing them would only add noise."""
+    note = item("NOTE1", item_type="note", parentItem="ITEM1", note="<p>x</p>")
+    membership = item_membership([("K", [item("ITEM1"), attachment("ATT1"), note])])
+    assert set(membership) == {"ITEM1"}
+
+
+def test_planned_attachments_and_notes_carry_their_parents_keys() -> None:
+    note = item("NOTE1", item_type="note", parentItem="ITEM1", note="<p>Read this</p>")
+    collections = [("Parent", [item("ITEM1"), attachment("ATT1"), note])]
+    plan = build_plan(collections, membership={"ITEM1": ["K1", "K2"]})
+    assert {a.attachment_key: a.collection_keys for a in plan.attachments} == {
+        "ATT1": ["K1", "K2"],
+        "NOTE1": ["K1", "K2"],
+    }
+
+
+def test_chunk_metadata_holds_the_keys_as_a_list() -> None:
+    plan = build_plan([("P", [item("ITEM1"), attachment("ATT1")])], membership={"ITEM1": ["K1"]})
+    assert plan.attachments[0].chunk_metadata(1, 0)["collection_keys"] == ["K1"]
+
+
+def test_chunk_metadata_omits_the_keys_rather_than_writing_an_empty_list() -> None:
+    """Chroma rejects an empty list, so writing one would fail the whole batch."""
+    plan = build_plan([("P", [item("ITEM1"), attachment("ATT1")])])
+    assert "collection_keys" not in plan.attachments[0].chunk_metadata(1, 0)
+
+
+# --- files Zotero cannot serve ---------------------------------------------
+
+
+def unsynced(entry: dict[str, Any]) -> dict[str, Any]:
+    """What Zotero sends for a file that was never uploaded: `md5` present and null."""
+    entry["data"].update(md5=None, mtime=None)
+    return entry
+
+
+def synced(entry: dict[str, Any]) -> dict[str, Any]:
+    entry["data"].update(md5="3def8598b7cced1cecc18e243292d829", mtime=1730672731201)
+    return entry
+
+
+def test_an_unuploaded_file_is_skipped_instead_of_downloaded() -> None:
+    plan = build_plan([("C", [item("ITEM1", "Graph RAG"), unsynced(attachment("ATT1"))])])
+    assert plan.attachments == []
+    assert [entry.reason for entry in plan.skipped] == [SkipReason.NOT_IN_STORAGE]
+    # Named by the paper, which is what the user can find in Zotero.
+    assert plan.skipped[0].title == "Graph RAG — Full Text PDF"
+
+
+def test_an_uploaded_file_is_planned() -> None:
+    plan = build_plan([("C", [item("ITEM1"), synced(attachment("ATT1"))])])
+    assert [a.attachment_key for a in plan.attachments] == ["ATT1"]
+
+
+def test_a_payload_without_md5_is_still_tried() -> None:
+    """No `md5` key says nothing about storage, unlike `md5: null`."""
+    plan = build_plan([("C", [item("ITEM1"), attachment("ATT1")])])
+    assert [a.attachment_key for a in plan.attachments] == ["ATT1"]
+
+
+def test_an_unsynced_pdf_gives_way_to_a_synced_snapshot() -> None:
+    """The preference picks among files that exist, not files that would 404."""
+    collections = [
+        (
+            "C",
+            [
+                item("ITEM1"),
+                unsynced(attachment("PDF1")),
+                synced(attachment("HTML1", content_type="text/html", title="Snapshot")),
+            ],
+        )
+    ]
+    plan = build_plan(collections)
+    assert [(a.attachment_key, a.document_format) for a in plan.attachments] == [
+        ("HTML1", DocumentFormat.HTML)
+    ]
+    assert {entry.key: entry.reason for entry in plan.skipped} == {
+        "PDF1": SkipReason.NOT_IN_STORAGE
+    }
+
+
+def test_an_item_with_nothing_uploaded_is_not_also_called_unreadable() -> None:
+    """'No readable attachment' would send the user looking for the wrong problem."""
+    collections = [
+        (
+            "C",
+            [
+                item("ITEM1"),
+                unsynced(attachment("PDF1")),
+                unsynced(attachment("HTML1", content_type="text/html")),
+            ],
+        )
+    ]
+    plan = build_plan(collections)
+    assert sorted(entry.reason for entry in plan.skipped) == [
+        SkipReason.NOT_IN_STORAGE,
+        SkipReason.NOT_IN_STORAGE,
+    ]
+
+
+def test_a_linked_file_is_skipped_with_its_own_reason() -> None:
+    plan = build_plan([("C", [item("ITEM1"), attachment("ATT1", link_mode="linked_file")])])
+    assert [entry.reason for entry in plan.skipped] == [SkipReason.LINKED_FILE]
+
+
+def test_notes_are_unaffected_by_an_unsynced_file() -> None:
+    note = item("NOTE1", item_type="note", parentItem="ITEM1", note="<p>My notes</p>")
+    plan = build_plan([("C", [item("ITEM1"), unsynced(attachment("ATT1")), note])])
+    assert [a.attachment_key for a in plan.attachments] == ["NOTE1"]

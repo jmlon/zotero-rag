@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
+from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Any
 
@@ -26,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 PDF_CONTENT_TYPE = "application/pdf"
 LINKED_URL_MODE = "linked_url"
+LINKED_FILE_MODE = "linked_file"
 
 # Order used when config gives none. PDFs first because a published PDF is the
 # authoritative copy; a snapshot of the same article is usually the abstract page
@@ -45,6 +47,8 @@ class SkipReason(StrEnum):
 
     NO_CONTENT = "no readable attachment"
     LINKED_URL = "linked URL (no file)"
+    LINKED_FILE = "linked file (kept only on your computer)"
+    NOT_IN_STORAGE = "file not uploaded to Zotero storage"
     UNSUPPORTED_TYPE = "unsupported content type"
     NOT_PREFERRED = "another attachment of this item is preferred"
     NOTE = "note (index_notes is off)"
@@ -63,6 +67,10 @@ class PlannedAttachment(BaseModel):
     year: str
     doi: str = ""
     collection_name: str
+    # Every indexed collection holding the parent item, so a search can be limited
+    # to a subtree (PRD-CursesUI §4.3). Empty only for plans built without
+    # membership, such as in tests; such chunks are simply left out of a scoped search.
+    collection_keys: list[str] = Field(default_factory=list)
     zotero_url: str = ""
     # Zotero's own version counter, bumped whenever the file or its metadata
     # changes. Compared against the stored copy to decide whether an
@@ -84,16 +92,18 @@ class PlannedAttachment(BaseModel):
         embedding_model: str = "",
         locator_kind: LocatorKind = LocatorKind.PAGE,
         locator_label: str = "",
-    ) -> dict[str, str | int]:
+    ) -> dict[str, str | int | list[str]]:
         """Per-chunk metadata for the vector store (PRD §7.2).
 
-        Chroma rejects `None`, so every value is a string or an int.
+        Chroma rejects `None`, so every value is a string or an int, except
+        `collection_keys`, a list of strings. Chroma also rejects an empty list, so
+        that key is left out rather than written empty.
 
         `page` keeps its name for the locator ordinal: chunks written before M5 are
         all pages, and renaming the key would strand them. `locator_kind` says what
         the ordinal counts, and `locator_label` carries a heading when there is one.
         """
-        return {
+        metadata: dict[str, str | int | list[str]] = {
             "item_key": self.item_key,
             "attachment_key": self.attachment_key,
             "title": self.title,
@@ -110,6 +120,9 @@ class PlannedAttachment(BaseModel):
             "embedding_model": embedding_model,
             "attachment_version": self.version,
         }
+        if self.collection_keys:
+            metadata["collection_keys"] = list(self.collection_keys)
+        return metadata
 
 
 class SkippedEntry(BaseModel):
@@ -192,12 +205,34 @@ def resolve_preference(names: list[str] | None) -> tuple[DocumentFormat, ...]:
     return tuple(order)
 
 
+def item_membership(
+    collections: Iterable[tuple[str, list[dict[str, Any]]]],
+) -> dict[str, list[str]]:
+    """Map each parent item key to the keys of the fetched collections holding it.
+
+    `collections` pairs a collection *key* with its raw item payloads. Fetching a
+    collection returns every item in it, so this is exact within the indexed scope.
+    The item's own `collections` field would also list collections outside the scope,
+    which a search could never select. Attachments and notes are left out because
+    they inherit their parent's membership.
+    """
+    membership: dict[str, set[str]] = {}
+    for collection_key, items in collections:
+        for entry in items:
+            data = entry.get("data") or {}
+            key = data.get("key") or entry.get("key")
+            if key and data.get("itemType") not in ("attachment", "note"):
+                membership.setdefault(str(key), set()).add(collection_key)
+    return {item_key: sorted(keys) for item_key, keys in membership.items()}
+
+
 def build_plan(
     collections: list[tuple[str, list[dict[str, Any]]]],
     username: str = "",
     preference: list[str] | None = None,
     index_all_attachments: bool = False,
     index_notes: bool = True,
+    membership: Mapping[str, list[str]] | None = None,
 ) -> IndexPlan:
     """Classify every item in the given collections into planned vs skipped.
 
@@ -209,9 +244,13 @@ def build_plan(
 
     `username` is only needed to build citation URLs; an empty one yields empty
     `zotero_url` values, which keeps `--dry-run` free of an extra API call.
+
+    `membership`, from `item_membership`, gives each planned attachment the
+    `collection_keys` of its parent item.
     """
     plan = IndexPlan(collections=[name for name, _ in collections])
     order = resolve_preference(preference)
+    membership = membership or {}
 
     parents: dict[str, tuple[dict[str, Any], str]] = {}
     attachments: list[tuple[dict[str, Any], str]] = []
@@ -234,13 +273,16 @@ def build_plan(
                 plan.items_seen += 1
                 parents.setdefault(key, (data, collection_name))
 
-    candidates = _collect_candidates(plan, attachments, parents)
-    _plan_candidates(plan, candidates, parents, order, username, index_all_attachments)
-    _plan_notes(plan, notes, parents, username, index_notes)
+    candidates, unavailable = _collect_candidates(plan, attachments, parents)
+    _plan_candidates(plan, candidates, parents, order, username, index_all_attachments, membership)
+    _plan_notes(plan, notes, parents, username, index_notes, membership)
 
     planned_parents = {attachment.item_key for attachment in plan.attachments}
     for parent_key, (parent_data, collection_name) in parents.items():
-        if parent_key in planned_parents:
+        # An item whose files exist but cannot be downloaded is already reported,
+        # with its fix, under the attachment's own reason. Calling it "no readable
+        # attachment" as well would send the user looking for the wrong problem.
+        if parent_key in planned_parents or parent_key in unavailable:
             continue
         title = parent_data.get("title") or "(untitled)"
         logger.warning("No readable attachment for %r (%s); not indexed", title, parent_key)
@@ -256,13 +298,31 @@ def build_plan(
     return plan
 
 
+def is_in_storage(data: dict[str, Any]) -> bool:
+    """Whether Zotero holds this attachment's file, so the Web API can serve it.
+
+    Zotero sends `md5: null` (and `mtime: null`) for a file that was never uploaded:
+    file sync off, the storage quota full, files kept on WebDAV, or a sync that has
+    not finished yet. Downloading such a file only gets a 404. A payload with no
+    `md5` key at all says nothing either way, so it is still tried.
+    """
+    return "md5" not in data or bool(data["md5"])
+
+
 def _collect_candidates(
     plan: IndexPlan,
     attachments: list[tuple[dict[str, Any], str]],
     parents: dict[str, tuple[dict[str, Any], str]],
-) -> dict[str, list[_Candidate]]:
-    """Group readable attachments by parent, recording every rejection."""
+) -> tuple[dict[str, list[_Candidate]], set[str]]:
+    """Group downloadable, readable attachments by parent, recording every rejection.
+
+    Also returns the parents that had a readable attachment Zotero cannot serve.
+    Leaving those out *before* the format preference runs means that an unsynced
+    PDF gives way to a snapshot that was synced, instead of winning and then failing
+    to download.
+    """
     candidates: dict[str, list[_Candidate]] = {}
+    unavailable: set[str] = set()
     seen: set[str] = set()
 
     for data, collection_name in attachments:
@@ -281,7 +341,8 @@ def _collect_candidates(
             continue
         seen.add(key)
 
-        if data.get("linkMode") == LINKED_URL_MODE:
+        link_mode = data.get("linkMode")
+        if link_mode == LINKED_URL_MODE:
             plan.skipped.append(entry.model_copy(update={"reason": SkipReason.LINKED_URL}))
             continue
 
@@ -305,6 +366,21 @@ def _collect_candidates(
             plan.skipped.append(entry.model_copy(update={"reason": SkipReason.PARENT_OUT_OF_SCOPE}))
             continue
 
+        if link_mode == LINKED_FILE_MODE or not is_in_storage(data):
+            reason = (
+                SkipReason.LINKED_FILE
+                if link_mode == LINKED_FILE_MODE
+                else (SkipReason.NOT_IN_STORAGE)
+            )
+            # "Snapshot" or "Preprint PDF" alone cannot be found in Zotero; the
+            # paper's title can, and the user has to go and fix it there.
+            paper = parents[parent_key][0].get("title") or "(untitled)"
+            plan.skipped.append(
+                entry.model_copy(update={"reason": reason, "title": f"{paper} — {entry.title}"})
+            )
+            unavailable.add(parent_key)
+            continue
+
         candidates.setdefault(parent_key, []).append(
             _Candidate(
                 data=data,
@@ -314,7 +390,7 @@ def _collect_candidates(
             )
         )
 
-    return candidates
+    return candidates, unavailable
 
 
 def _plan_candidates(
@@ -324,6 +400,7 @@ def _plan_candidates(
     order: tuple[DocumentFormat, ...],
     username: str,
     index_all_attachments: bool,
+    membership: Mapping[str, list[str]],
 ) -> None:
     """Pick which of an item's readable attachments to index.
 
@@ -347,7 +424,9 @@ def _plan_candidates(
             rejected = [item for item in group if item.document_format is not best_format]
 
         for candidate in chosen:
-            plan.attachments.append(_planned(candidate, parent_key, parent_data, username))
+            plan.attachments.append(
+                _planned(candidate, parent_key, parent_data, username, membership)
+            )
         for candidate in rejected:
             plan.skipped.append(
                 SkippedEntry(
@@ -369,6 +448,7 @@ def _planned(
     parent_key: str,
     parent_data: dict[str, Any],
     username: str,
+    membership: Mapping[str, list[str]],
 ) -> PlannedAttachment:
     return PlannedAttachment(
         attachment_key=candidate.data["key"],
@@ -378,6 +458,7 @@ def _planned(
         year=parse_year(parent_data.get("date")),
         doi=parent_data.get("DOI") or "",
         collection_name=candidate.collection_name,
+        collection_keys=list(membership.get(parent_key, [])),
         zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
         version=_version(candidate.data),
         content_type=candidate.content_type,
@@ -391,6 +472,7 @@ def _plan_notes(
     parents: dict[str, tuple[dict[str, Any], str]],
     username: str,
     index_notes: bool,
+    membership: Mapping[str, list[str]],
 ) -> None:
     """Index Zotero notes alongside their item's file, not instead of it.
 
@@ -432,6 +514,7 @@ def _plan_notes(
                 year=parse_year(parent_data.get("date")),
                 doi=parent_data.get("DOI") or "",
                 collection_name=collection_name,
+                collection_keys=list(membership.get(str(parent_key), [])),
                 zotero_url=zotero_url(username, str(parent_key), parent_data.get("collections")),
                 version=_version(data),
                 content_type="note",

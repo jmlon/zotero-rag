@@ -21,7 +21,7 @@ from typing import Literal
 
 from rank_bm25 import BM25Okapi
 
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore, in_scope
 
 logger = logging.getLogger(__name__)
 
@@ -94,8 +94,14 @@ class KeywordIndex:
     def __len__(self) -> int:
         return len(self._chunks)
 
-    def search(self, question: str, limit: int) -> list[StoredChunk]:
-        """The `limit` best-matching chunks, best first.
+    def search(self, question: str, limit: int, scope: Scope = None) -> list[StoredChunk]:
+        """The `limit` best-matching chunks within `scope`, best first.
+
+        The scope is applied before ranking, so a narrow folder still gets its full
+        `limit` rather than whatever survived a whole-store cut. The BM25 statistics
+        stay those of the whole store: the index is built once per session, and IDF
+        over the whole library is, if anything, the better estimate of how rare a
+        term is.
 
         Chunks containing none of the query's tokens are dropped rather than padded
         in: ranking them would hand fusion a confident-looking position for a
@@ -109,7 +115,7 @@ class KeywordIndex:
         `df = N/2` is easy to hit — and filtering on the score silently returns
         nothing. A four-chunk collection found this before a user did.
         """
-        if self._bm25 is None or limit <= 0:
+        if self._bm25 is None or limit <= 0 or (scope is not None and not scope):
             return []
         tokens = tokenize(question)
         if not tokens:
@@ -117,7 +123,9 @@ class KeywordIndex:
 
         wanted = set(tokens)
         matched = [
-            index for index, present in enumerate(self._tokens) if not wanted.isdisjoint(present)
+            index
+            for index, present in enumerate(self._tokens)
+            if not wanted.isdisjoint(present) and in_scope(self._chunks[index].metadata, scope)
         ]
         if not matched:
             return []
@@ -161,19 +169,23 @@ def retrieve(
     top_k: int,
     mode: RetrievalMode = "vector",
     keyword_index: KeywordIndex | None = None,
+    scope: Scope = None,
 ) -> list[StoredChunk]:
-    """The `top_k` chunks for a question, by the configured strategy.
+    """The `top_k` chunks for a question within `scope`, by the configured strategy.
+
+    Both retrievers apply the scope themselves, before their own cut, so fusion only
+    ever sees in-scope candidates.
 
     Falls back to plain vector retrieval when hybrid is asked for but no keyword
     index was supplied, or when BM25 matched nothing at all: a question sharing no
     token with the corpus should return the vector result, not an empty list.
     """
     if mode != "hybrid" or keyword_index is None:
-        return store.query(embedding, top_k)
+        return store.query(embedding, top_k, scope)
 
     depth = candidate_depth(top_k)
-    vector_hits = store.query(embedding, depth)
-    keyword_hits = keyword_index.search(question, depth)
+    vector_hits = store.query(embedding, depth, scope)
+    keyword_hits = keyword_index.search(question, depth, scope)
 
     if not keyword_hits:
         logger.info("hybrid: BM25 matched nothing, using vector results alone")

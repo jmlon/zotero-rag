@@ -32,6 +32,9 @@ def build_chat(config: Config) -> ChatOpenAI:
         # Canonical field names; `base_url`/`api_key` are their aliases.
         openai_api_base=config.global_.endpoint,
         openai_api_key=SecretStr(config.global_.api_key),
+        # Ask for token usage on the final chunk of a stream; `invoke` reports it
+        # regardless. Without this a streamed answer would report zero tokens.
+        stream_usage=True,
     )
 
 
