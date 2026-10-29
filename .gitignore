@@ -220,3 +220,6 @@ __marimo__/
 
 # Claude files
 .claude
+
+# Throwaway Zotero test-account credentials (Phase 0 write tests)
+test_account.txt
