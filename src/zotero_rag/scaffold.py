@@ -64,6 +64,11 @@ def render_env_template(global_config: GlobalConfig) -> str:
 # Reranking measurably improves answers and sends less text to the LLM, but it is a
 # second provider: https://dashboard.cohere.com/api-keys
 {global_config.cohere_api_key_env}=
+
+# Firecrawl — OPTIONAL, only for `convert --ocr hosted`, which sends scanned PDF
+# pages to Firecrawl Parse. It works without a key, at lower limits.
+# https://www.firecrawl.dev/app/api-keys
+{global_config.firecrawl_api_key_env}=
 """
 
 

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import StrEnum
 from typing import Any
 
@@ -55,6 +55,8 @@ class SkipReason(StrEnum):
     DUPLICATE = "already planned (in another collection)"
     ORPHAN_ATTACHMENT = "attachment with no parent item"
     PARENT_OUT_OF_SCOPE = "parent item not in the indexed collections"
+    # `convert` only: plain text, Markdown and CSV need no transcript.
+    ALREADY_TEXT = "already plain text"
 
 
 class PlannedAttachment(BaseModel):
@@ -136,11 +138,13 @@ class SkippedEntry(BaseModel):
     content_type: str = ""
 
 
-class IndexPlan(BaseModel):
-    """What a run would do, before any file is fetched."""
+class SkipReport(BaseModel):
+    """What a plan deliberately left out, summarised for the run report.
+
+    Shared by `index` and `convert` plans, so one printer serves both.
+    """
 
     collections: list[str] = Field(default_factory=list)
-    attachments: list[PlannedAttachment] = Field(default_factory=list)
     skipped: list[SkippedEntry] = Field(default_factory=list)
     items_seen: int = 0
 
@@ -148,17 +152,6 @@ class IndexPlan(BaseModel):
     def skip_counts(self) -> dict[SkipReason, int]:
         """Skip totals per reason, ordered most frequent first."""
         counter = Counter(entry.reason for entry in self.skipped)
-        return dict(counter.most_common())
-
-    @property
-    def item_count(self) -> int:
-        """Distinct parent items contributing at least one planned attachment."""
-        return len({attachment.item_key for attachment in self.attachments})
-
-    @property
-    def format_counts(self) -> dict[DocumentFormat, int]:
-        """Planned attachments per format, most frequent first."""
-        counter = Counter(attachment.document_format for attachment in self.attachments)
         return dict(counter.most_common())
 
     def content_types_for(self, reason: SkipReason) -> dict[str, int]:
@@ -172,13 +165,46 @@ class IndexPlan(BaseModel):
         return [entry for entry in self.skipped if entry.reason is reason]
 
 
-class _Candidate(BaseModel):
-    """A readable attachment competing to represent its parent item."""
+class IndexPlan(SkipReport):
+    """What a run would do, before any file is fetched."""
+
+    attachments: list[PlannedAttachment] = Field(default_factory=list)
+
+    @property
+    def item_count(self) -> int:
+        """Distinct parent items contributing at least one planned attachment."""
+        return len({attachment.item_key for attachment in self.attachments})
+
+    @property
+    def format_counts(self) -> dict[DocumentFormat, int]:
+        """Planned attachments per format, most frequent first."""
+        counter = Counter(attachment.document_format for attachment in self.attachments)
+        return dict(counter.most_common())
+
+
+class Candidate(BaseModel):
+    """A readable attachment competing to represent its parent item.
+
+    `format` is whatever the caller's format function returned: a `DocumentFormat`
+    value for indexing, or also a conversion-only format for `convert`.
+    """
 
     data: dict[str, Any]
     collection_name: str
-    document_format: DocumentFormat
+    format: str
     content_type: str
+
+
+class Candidates(BaseModel):
+    """Attachments grouped by parent, with every rejection recorded."""
+
+    by_parent: dict[str, list[Candidate]] = Field(default_factory=dict)
+    # Parents with a readable attachment Zotero cannot serve (linked or unsynced).
+    unavailable: set[str] = Field(default_factory=set)
+    skipped: list[SkippedEntry] = Field(default_factory=list)
+
+
+FormatFn = Callable[[str | None], str | None]
 
 
 def resolve_preference(names: list[str] | None) -> tuple[DocumentFormat, ...]:
@@ -273,8 +299,12 @@ def build_plan(
                 plan.items_seen += 1
                 parents.setdefault(key, (data, collection_name))
 
-    candidates, unavailable = _collect_candidates(plan, attachments, parents)
-    _plan_candidates(plan, candidates, parents, order, username, index_all_attachments, membership)
+    collected = collect_candidates(attachments, parents, _index_format)
+    plan.skipped.extend(collected.skipped)
+    unavailable = collected.unavailable
+    _plan_candidates(
+        plan, collected.by_parent, parents, order, username, index_all_attachments, membership
+    )
     _plan_notes(plan, notes, parents, username, index_notes, membership)
 
     planned_parents = {attachment.item_key for attachment in plan.attachments}
@@ -309,20 +339,27 @@ def is_in_storage(data: dict[str, Any]) -> bool:
     return "md5" not in data or bool(data["md5"])
 
 
-def _collect_candidates(
-    plan: IndexPlan,
+def _index_format(content_type: str | None) -> str | None:
+    document_format = format_for(content_type)
+    return None if document_format is None else document_format.value
+
+
+def collect_candidates(
     attachments: list[tuple[dict[str, Any], str]],
     parents: dict[str, tuple[dict[str, Any], str]],
-) -> tuple[dict[str, list[_Candidate]], set[str]]:
+    format_of: FormatFn,
+) -> Candidates:
     """Group downloadable, readable attachments by parent, recording every rejection.
 
-    Also returns the parents that had a readable attachment Zotero cannot serve.
-    Leaving those out *before* the format preference runs means that an unsynced
-    PDF gives way to a snapshot that was synced, instead of winning and then failing
-    to download.
+    `format_of` decides what "readable" means: `index` and `convert` read different
+    sets of formats. Also returns the parents that had a readable attachment
+    Zotero cannot serve. Leaving those out *before* the format preference runs
+    means that an unsynced PDF gives way to a snapshot that was synced, instead of
+    winning and then failing to download.
     """
-    candidates: dict[str, list[_Candidate]] = {}
-    unavailable: set[str] = set()
+    result = Candidates()
+    candidates = result.by_parent
+    unavailable = result.unavailable
     seen: set[str] = set()
 
     for data, collection_name in attachments:
@@ -337,24 +374,24 @@ def _collect_candidates(
         )
 
         if key in seen:
-            plan.skipped.append(entry)
+            result.skipped.append(entry)
             continue
         seen.add(key)
 
         link_mode = data.get("linkMode")
         if link_mode == LINKED_URL_MODE:
-            plan.skipped.append(entry.model_copy(update={"reason": SkipReason.LINKED_URL}))
+            result.skipped.append(entry.model_copy(update={"reason": SkipReason.LINKED_URL}))
             continue
 
-        document_format = format_for(content_type)
+        document_format = format_of(content_type)
         if document_format is None:
-            plan.skipped.append(entry.model_copy(update={"reason": SkipReason.UNSUPPORTED_TYPE}))
+            result.skipped.append(entry.model_copy(update={"reason": SkipReason.UNSUPPORTED_TYPE}))
             continue
 
         parent_key = data.get("parentItem")
         if not parent_key:
             logger.warning("Attachment %s has no parent item; skipping", key)
-            plan.skipped.append(entry.model_copy(update={"reason": SkipReason.ORPHAN_ATTACHMENT}))
+            result.skipped.append(entry.model_copy(update={"reason": SkipReason.ORPHAN_ATTACHMENT}))
             continue
         if parent_key not in parents:
             logger.warning(
@@ -363,7 +400,9 @@ def _collect_candidates(
                 key,
                 parent_key,
             )
-            plan.skipped.append(entry.model_copy(update={"reason": SkipReason.PARENT_OUT_OF_SCOPE}))
+            result.skipped.append(
+                entry.model_copy(update={"reason": SkipReason.PARENT_OUT_OF_SCOPE})
+            )
             continue
 
         if link_mode == LINKED_FILE_MODE or not is_in_storage(data):
@@ -375,27 +414,27 @@ def _collect_candidates(
             # "Snapshot" or "Preprint PDF" alone cannot be found in Zotero; the
             # paper's title can, and the user has to go and fix it there.
             paper = parents[parent_key][0].get("title") or "(untitled)"
-            plan.skipped.append(
+            result.skipped.append(
                 entry.model_copy(update={"reason": reason, "title": f"{paper} — {entry.title}"})
             )
             unavailable.add(parent_key)
             continue
 
         candidates.setdefault(parent_key, []).append(
-            _Candidate(
+            Candidate(
                 data=data,
                 collection_name=collection_name,
-                document_format=document_format,
+                format=document_format,
                 content_type=content_type,
             )
         )
 
-    return candidates, unavailable
+    return result
 
 
 def _plan_candidates(
     plan: IndexPlan,
-    candidates: dict[str, list[_Candidate]],
+    candidates: dict[str, list[Candidate]],
     parents: dict[str, tuple[dict[str, Any], str]],
     order: tuple[DocumentFormat, ...],
     username: str,
@@ -411,17 +450,7 @@ def _plan_candidates(
     """
     for parent_key, group in candidates.items():
         parent_data, _ = parents[parent_key]
-        if index_all_attachments:
-            chosen, rejected = group, []
-        else:
-            # The choice is between *formats*, not between files: an item with a
-            # paper and its supplement, both PDFs, still gets both indexed (§7.1).
-            best_format = min(
-                (item.document_format for item in group),
-                key=lambda fmt: _rank(fmt, order),
-            )
-            chosen = [item for item in group if item.document_format is best_format]
-            rejected = [item for item in group if item.document_format is not best_format]
+        chosen, rejected = choose_preferred(group, order, every=index_all_attachments)
 
         for candidate in chosen:
             plan.attachments.append(
@@ -439,12 +468,30 @@ def _plan_candidates(
             )
 
 
-def _rank(document_format: DocumentFormat, order: tuple[DocumentFormat, ...]) -> int:
-    return order.index(document_format) if document_format in order else len(order)
+def choose_preferred(
+    group: list[Candidate], order: Sequence[str], *, every: bool = False
+) -> tuple[list[Candidate], list[Candidate]]:
+    """Split an item's candidates into (chosen, rejected) by format preference.
+
+    The choice is between *formats*, not between files: an item with a paper and
+    its supplement, both PDFs, keeps both (§7.1). A format missing from `order`
+    ranks last rather than being dropped. `every` keeps them all.
+    """
+    if every:
+        return list(group), []
+    best = min((item.format for item in group), key=lambda fmt: _rank(fmt, order))
+    return (
+        [item for item in group if item.format == best],
+        [item for item in group if item.format != best],
+    )
+
+
+def _rank(document_format: str, order: Sequence[str]) -> int:
+    return list(order).index(document_format) if document_format in order else len(order)
 
 
 def _planned(
-    candidate: _Candidate,
+    candidate: Candidate,
     parent_key: str,
     parent_data: dict[str, Any],
     username: str,
@@ -462,7 +509,7 @@ def _planned(
         zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
         version=_version(candidate.data),
         content_type=candidate.content_type,
-        document_format=candidate.document_format,
+        document_format=DocumentFormat(candidate.format),
     )
 
 

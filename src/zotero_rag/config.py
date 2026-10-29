@@ -52,6 +52,9 @@ class GlobalConfig(BaseModel):
     #: Only needed when a reranker is enabled (§11.4.3). Cohere is a second provider
     #: because OpenRouter proxies chat and embeddings but not reranking.
     cohere_api_key_env: str = "COHERE_API_KEY"
+    #: Optional, for `convert --ocr hosted`: Firecrawl Parse also works keyless,
+    #: at lower limits, so a missing key is never an error.
+    firecrawl_api_key_env: str = "FIRECRAWL_API_KEY"
     zotero_library_type: Literal["user", "group"] = "user"
     defaults: Defaults = Field(default_factory=Defaults)
 
@@ -61,6 +64,7 @@ class GlobalConfig(BaseModel):
     zotero_library_id: str = Field(default="", exclude=True)
     zotero_api_key: str = Field(default="", exclude=True)
     cohere_api_key: str = Field(default="", exclude=True)
+    firecrawl_api_key: str = Field(default="", exclude=True)
 
     def resolve_env(self) -> None:
         """Populate the resolved credential fields from the environment.
@@ -74,6 +78,7 @@ class GlobalConfig(BaseModel):
         self.zotero_library_id = os.environ.get(self.zotero_library_id_env, "")
         self.zotero_api_key = os.environ.get(self.zotero_api_key_env, "")
         self.cohere_api_key = os.environ.get(self.cohere_api_key_env, "")
+        self.firecrawl_api_key = os.environ.get(self.firecrawl_api_key_env, "")
 
     def require_zotero(self) -> None:
         missing = [
@@ -183,6 +188,38 @@ class EvalConfig(BaseModel):
     document_char_budget: int = Field(default=30000, gt=0)
 
 
+class QualityThresholds(BaseModel):
+    """When a Markdown transcript counts as faithful to its source (PRD-markdown D4).
+
+    Calibrated in Phase 0 against 24 hand-graded conversions: these values pass
+    all 22 good ones and fail both bad ones. A FAIL only keeps a file that
+    `shrink-storage` would otherwise trash, so tightening them is always safe.
+    """
+
+    #: Share of the source's distinct words (≥ 4 letters) found in the transcript.
+    min_recall: float = Field(default=0.85, ge=0.0, le=1.0)
+    #: The same, for the weakest page or section: catches a dropped page.
+    min_worst_segment_recall: float = Field(default=0.80, ge=0.0, le=1.0)
+    #: Share of "words" of 20+ letters: spaces lost ("AlgebraicMethodsfor…").
+    max_glued_words: float = Field(default=0.02, ge=0.0, le=1.0)
+    #: Replacement characters, `(cid:NN)` codes and control characters.
+    max_garbage_ratio: float = Field(default=0.005, ge=0.0, le=1.0)
+    #: Letters among the visible characters: low means symbol soup.
+    min_letter_ratio: float = Field(default=0.60, ge=0.0, le=1.0)
+    #: Stray single letters: "T h e  r e s u l t s".
+    max_broken_spacing: float = Field(default=0.05, ge=0.0, le=1.0)
+    #: Below this many source words there is nothing to compare against.
+    min_baseline_words: int = Field(default=200, ge=1)
+    #: Pages or sections shorter than this are left out of the worst-segment check.
+    min_segment_words: int = Field(default=50, ge=1)
+
+
+class MarkdownConfig(BaseModel):
+    """Settings for Markdown transcripts (`convert`, `shrink-storage`)."""
+
+    quality: QualityThresholds = Field(default_factory=QualityThresholds)
+
+
 class Config(BaseModel):
     """The merged configuration for a run."""
 
@@ -191,6 +228,7 @@ class Config(BaseModel):
     global_: GlobalConfig = Field(default_factory=GlobalConfig, alias="global")
     index: IndexConfig = Field(default_factory=IndexConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
+    markdown: MarkdownConfig = Field(default_factory=MarkdownConfig)
 
     # Directory the index config was loaded from, when there was one.
     source_dir: Path | None = Field(default=None, exclude=True)

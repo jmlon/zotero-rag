@@ -208,6 +208,31 @@ zotero-rag generate-questions [--out PATH] [--per-document N] [--language LANG]
 - The result is a **draft to edit**, not a finished golden set, and the file's own
   header says so — see the end of §11.3.2 for why.
 
+### 3.7 `convert` (PRD-markdown.md)
+
+```
+zotero-rag convert [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
+                   [--limit N] [--only-item KEY]... [--reconvert] [--force]
+                   [--ocr off|hosted] [--jobs N] [--report PATH] [-v]
+```
+
+- Attaches a Markdown transcript of each item's preferred attachment to the item
+  in Zotero. The plan is `conversion.build_conversion_plan`, and the work is done by
+  `converter_run.run_conversion`. The design, decisions and measurements are in
+  `PLAN-markdown.md` and `PRD-markdown.md`.
+- **Writes to the library**, so before downloading anything it checks the key's
+  write access and asks once ("Write N transcripts to Zotero?"). `--yes` answers
+  every prompt.
+- Re-runs convert only MISSING and STALE sources. `--reconvert` also redoes
+  transcripts made by an older converter, and `--force` redoes those edited in
+  Zotero. Markdown the user attached is never replaced.
+- `--ocr hosted` holds back documents with scanned pages until the local pass is
+  done, then asks once before sending those pages, one page at a time, to
+  Firecrawl Parse.
+- `--report` writes one row per plan entry: state, action, outcome, quality
+  verdict and reasons, images, empty pages, and OCR'd pages. The file is JSON or
+  CSV, chosen by the suffix.
+
 ## 4. Zotero access
 
 - Online Zotero Web API via `pyzotero`, authenticated with an API token.
@@ -528,6 +553,12 @@ has one scoped `ignore_missing_imports` override for it and no others.
 HTML, DOCX, ODT and EPUB are read with the **standard library only**
 (`html.parser`, `zipfile`, `xml.etree`). No BeautifulSoup, `lxml`, or
 `python-docx`: §9's constraint held through M5.
+
+`firecrawl-anydoc` converts attachments to Markdown transcripts (`PRD-markdown.md`).
+It is a single Rust-backed wheel with no Python dependencies and no GPU or model
+download, so it stays within this rule. It is pinned `<0.3` because its API is pre-1.0,
+and it is imported lazily, so on a platform without a wheel only conversion fails.
+Indexing still reads HTML, DOCX, ODT and EPUB with the standard library, as above.
 
 `chromadb` is used **directly** (no `langchain-chroma` wrapper). The `langchain`
 meta-package is not installed.
@@ -1627,11 +1658,16 @@ Folders created before 0.4.4 keep `top_k: 5` until edited; see the end of §11.4
 ```
 src/zotero_rag/
   cli.py           typer app: list-collections, init, index, query, eval,
-                   generate-questions
+                   generate-questions, convert
   config.py        pydantic models, layered loading, pin_collection()
   scaffold.py      init: config.yaml + .env + .gitignore
-  zotero_api.py    client, collection tree, path/key resolution, item fetch
-  planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata()
+  zotero_api.py    client, collection tree, path/key resolution, item fetch,
+                   FileDownloader (any content type), attachment writes and trash
+  provenance.py    the note on a Markdown transcript: source, md5s, converter, quality
+  conversion.py    build_conversion_plan(): which attachments need a transcript, and why
+  converter_run.py run_conversion(): download, convert, assess, upload; report rows
+  planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata();
+                   collect_candidates()/choose_preferred() shared with conversion.py
   retrieval.py     BM25 keyword index, reciprocal rank fusion, retrieve() (M7)
   reranking.py     Cohere cross-encoder reranking of candidates (M7, §11.4.3)
   evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
@@ -1642,6 +1678,9 @@ src/zotero_rag/
   metadata.py      authors_str(), parse_year(), zotero_url()
   download.py      cache + multipart-envelope repair
   extraction.py    segment extraction, dispatched by format
+  markdown.py      Markdown transcripts: anydoc page by page for PDFs, html_text for
+                   snapshots, optional hosted OCR, front matter (PRD-markdown)
+  quality.py       transcript vs. source text: recall, glued words, garbage → verdict
   chunking.py      RecursiveCharacterTextSplitter per segment
   embedding.py     OpenRouter embeddings + tiktoken counting
   vectorstore.py   chromadb wrapper, StoredChunk

@@ -43,7 +43,7 @@ class AttachmentDownloadError(ZoteroRagError):
 def cache_path(
     cache_dir: Path,
     attachment_key: str,
-    document_format: DocumentFormat = DocumentFormat.PDF,
+    document_format: DocumentFormat | str = DocumentFormat.PDF,
 ) -> Path:
     return cache_dir / f"{attachment_key}{cache_suffix(document_format)}"
 
@@ -77,9 +77,9 @@ def strip_multipart_envelope(data: bytes) -> bytes:
     return stripped
 
 
-def _write_clean(path: Path, data: bytes, document_format: DocumentFormat) -> None:
+def _write_clean(path: Path, data: bytes, document_format: DocumentFormat | str) -> None:
     """Write a downloaded file, unwrapping a stray upload envelope for PDFs."""
-    cleaned = strip_multipart_envelope(data) if document_format is DocumentFormat.PDF else data
+    cleaned = strip_multipart_envelope(data) if document_format == DocumentFormat.PDF else data
     if not cleaned:
         raise AttachmentDownloadError(f"Downloaded file for {path.stem} is empty")
     path.write_bytes(cleaned)
@@ -89,13 +89,16 @@ def ensure_cached(
     zot: AttachmentFetcher,
     attachment_key: str,
     cache_dir: Path,
-    document_format: DocumentFormat = DocumentFormat.PDF,
+    document_format: DocumentFormat | str = DocumentFormat.PDF,
 ) -> Path:
-    """Return the local path for an attachment, downloading it if necessary."""
+    """Return the local path for an attachment, downloading it if necessary.
+
+    `document_format` may also be a conversion-only format name (`pptx`).
+    """
     target = cache_path(cache_dir, attachment_key, document_format)
 
     if target.is_file() and target.stat().st_size > 0:
-        if document_format is not DocumentFormat.PDF:
+        if document_format != DocumentFormat.PDF:
             logger.debug("cache hit for %s", attachment_key)
             return target
         existing = target.read_bytes()

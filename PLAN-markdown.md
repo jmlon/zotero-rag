@@ -89,7 +89,17 @@ Zotero write calls behave as assumed, and step 3's measurements are enough to
 settle D2. Phase 1's page-marker work and Phase 6's PAGE-segment extraction
 depend on that decision. Record the findings in `PRD-markdown.md`.
 
-### Phase 1 — Converter layer
+### Phase 1 — Converter layer — ✅ done
+
+*As built:*
+- `convert(path, source_format: str, *, ocr, api_key)`: the source format is a
+  string, because conversion-only formats (pptx, rtf…) have no `DocumentFormat`.
+  `DocumentFormat` is a `StrEnum`, so its members still pass.
+- `Converted` records `needs_ocr` and `ocr_pages` lists instead of `ocr: bool`.
+- A refused page counts as needing OCR only if it draws an image. anydoc says the
+  same of a blank page, and blank pages must not be uploaded.
+- `transcript()` builds the attached file (front matter + body), and takes the
+  date as a parameter.
 
 New module `src/zotero_rag/markdown.py`:
 
@@ -142,7 +152,27 @@ def convert(path: Path, document_format: DocumentFormat) -> Converted
   `HostedError` becomes a `ConversionError` with the service's message.
   `Converted` gains `ocr: bool`.
 
-### Phase 1b — Quality check (D4)
+### Phase 1b — Quality check (D4) — ✅ done
+
+*As built:*
+- `assess(markdown, baseline, thresholds, *, needs_ocr, ocr_pages)` takes the
+  thresholds from `config.markdown.quality`, which is packaged with the
+  calibrated values. `QualityReport` adds `glued_words`, `baseline_words`, and
+  `summary()`, the one-line form for provenance and reports
+  (`pass recall=0.96 worst=0.93@12`).
+- A FAIL outranks UNVERIFIED: glued words or garbage are visible without a
+  baseline.
+- `markdown.body()` strips front matter before judging. `Converted.images`
+  carries the PDF's image count for the report.
+- The real module on the Phase 0 sample agrees with 24 of 25 hand grades. The
+  exception is a 2-page ODT that comes out UNVERIFIED (166 words, under the 200
+  minimum): conservative, not wrong.
+- **Consequence to note:** a partially scanned PDF can never pass. `E2Y8PQAZ`
+  (13.9 MB, graded ok) fails on its 8 image-only cover and divider pages, and
+  OCR'ing them would make it UNVERIFIED instead. Such files are kept by
+  `shrink-storage`.
+  **Decided (2026-10-29): keep it strict.** These special cases are left to the
+  user, who can remove such a file by hand in Zotero.
 
 New module `src/zotero_rag/quality.py`. It answers one question: *does the
 Markdown contain the document's text?* The check needs an independent reading of
@@ -197,7 +227,35 @@ def assess(markdown: str, baseline: list[Segment]) -> QualityReport
   since it's still useful to an LLM, but it is flagged. `shrink-storage` trusts
   a stored PASS and re-runs `assess` when no verdict is stored (user-provided MDs).
 
-### Phase 2 — Zotero write layer
+### Phase 2 — Zotero write layer — ✅ done
+
+*As built:*
+- **New module `provenance.py`.** The note puts one `key=value` on each line,
+  because the converter value contains a space. `parse()` tolerates the HTML
+  the desktop client turns a note into, and ignores unknown keys.
+- **Writes in `zotero_api.py`:** `require_write_access` (handles group
+  libraries too), `create_markdown_attachment`, `replace_attachment_file`,
+  `update_attachment_note`, `trash_item` and `fetch_annotated_attachments`.
+  - Create and replace both re-read the attachment and check that Zotero's md5
+    equals the local file's, so the Phase 4 verification step is built in.
+  - A 412 becomes `ZoteroConflictError`, and a 413 says that the storage quota
+    is full.
+  - pyzotero's `update_item` returns `True`, so the new version comes from
+    `zot.request`'s `Last-Modified-Version`, with a re-read as fallback.
+- **Download fix:** `FileDownloader` replaces `zot.file()` for `index` (and for
+  `convert` later).
+  - It sends `Authorization: Bearer`, which httpx drops on the redirect to file
+    storage. A custom header would have followed the redirect.
+  - It unzips snapshots Zotero stored compressed, as pyzotero does, and waits
+    out 429/503 responses.
+  - Credentials are checked at the first download, not when it is built.
+- **Live check** (`spike/anydoc/write_layer_live.py`): 10/10 passed. The ODT
+  that `index` could not fetch now downloads, and a snapshot is byte-identical
+  to pyzotero's copy. Every write passed on the test account. The annotation
+  listing also returns annotations of items already in the trash, which is
+  harmless.
+- The ODT fix is self-contained (`FileDownloader` plus a three-line change in
+  `cli._run_index`), so it could ship as its own patch release.
 
 Extend `zotero_api.py`, keeping its pattern of catching `NETWORK_ERRORS` and
 raising `ZoteroApiError`:
@@ -237,7 +295,40 @@ source=ABCD1234 source_md5=9e1…  md5=3f2…  converter=anydoc 0.2.4
 When shrink trashes the source, it adds `source_removed=2026-11-02 source_url=https://…`.
 Parse it with a strict regex. A note that doesn't parse means "not ours".
 
-### Phase 3 — Conversion planning (pure, no network)
+### Phase 3 — Conversion planning (pure, no network) — ✅ done
+
+*As built:*
+- **`build_conversion_plan(collections, *, username, preference,
+  every_attachment, force, reconvert, converter_for)`.** `preference` and
+  `every_attachment` follow the index settings, so the transcript is made from
+  the attachment `index` would read.
+- **Three more states,** for transcripts no chosen source claims. All are
+  reported and none is touched:
+  - `SOURCE_MISSING`: the source was deleted, not by shrink.
+  - `SUPERSEDED`: a now-preferred format arrived, so a new transcript is made
+    from it.
+  - `DUPLICATE`: two transcripts of one source. The newest is kept current.
+- **Precedence:** USER_PROVIDED > EDITED > STALE > OUTDATED > CURRENT. An edited
+  transcript is never regenerated without `--force`, even when its source
+  changed.
+- **New skip reason `ALREADY_TEXT`** for txt and csv. A paper with only
+  plain-text attachments isn't reported as "no readable attachment".
+- **Refactors:** `planning.collect_candidates` and `planning.choose_preferred`
+  are now shared, and take the content-type→format function as a parameter.
+  `IndexPlan` and `ConversionPlan` share a `SkipReport` base. `index`
+  behaviour is unchanged, and all its tests pass untouched.
+- `markdown.transcript()` takes any attachment with the bibliographic fields (a
+  `Described` protocol). A pptx source has no `DocumentFormat`, so
+  `SourceAttachment.document_format` is `None` for it.
+- **Dry plan of the real library** (read-only): 1,280 items and 700 transcripts
+  to create (608 PDF, 91 HTML, 1 docx). Skips:
+  - 181 linked URLs and 79 unsynced files.
+  - 66 attachments not preferred, among them the ODT, whose item also has a
+    docx.
+  - 11 plain text and 2 images.
+
+  The library's 2 user Markdown files sit on items with nothing else, so
+  nothing is converted for them, and they aren't reported as contentless.
 
 New module `src/zotero_rag/conversion.py`, mirroring `planning.py`: a pure
 function over the raw item payloads, so every rule is unit-testable.
@@ -273,7 +364,35 @@ def build_conversion_plan(collections, preference, force, reconvert) -> Conversi
   and `content_types_for()` shape as `IndexPlan`, so the CLI reuses the
   summary printer.
 
-### Phase 4 — Execution and the `convert` command
+### Phase 4 — Execution and the `convert` command — ✅ done
+
+*As built:*
+- `converter_run.run_conversion()` prepares sources on a thread pool (download,
+  convert, assess) and publishes them on the calling thread. It returns a
+  `ConversionResult` per action: created, regenerated, conflict or failed.
+  `report_rows()` flattens the plan and the run into CSV or JSON rows.
+- **Added beyond the plan:**
+  - A **write confirmation** before the first upload ("Write N transcripts to
+    Zotero (a new, b regenerated)?"), with `--yes` to skip it. It's the first
+    command that writes to the library.
+  - `--jobs`.
+  - Rows for every plan entry in `--report`, not just failures.
+- **Verification** is built into the step 2 write functions, so there's no
+  separate step. A regeneration replaces the file and then updates the note. If
+  the note update fails, the run says so and suggests `--force`, because the
+  next run will see the transcript as edited.
+- The **transcript file name** is the source's stem plus `.md`
+  (`paper.pdf` → `paper.md`), and its title is "Markdown transcript". It's
+  cached as `cache/<transcript key>.txt` (the `TEXT` suffix, so `index` gets a
+  cache hit). Phase 6's `MARKDOWN` format will move it to `.md`.
+- **End-to-end on the test account** (`spike/anydoc/e2e_setup.py`, 6 papers):
+  - The dry run matched expectations: 5 to create, the user's own Markdown
+    kept, and a snapshot that lost to its PDF.
+  - The real run wrote 5 transcripts in 14 s, ODT included. Quality: 3 pass, 1
+    unverified (short ODT), and 1 fail (partly scanned report).
+  - A rerun found nothing to convert.
+  - A replaced source was regenerated in place. A hand-edited transcript was
+    kept, then overwritten by `--force`. After that, everything was up to date.
 
 `src/zotero_rag/converter_run.py` (the executor) plus the CLI command in `cli.py`:
 

@@ -8,6 +8,9 @@ global:
     # Only needed if you enable a reranker below. Cohere is a separate provider
     # because OpenRouter proxies chat and embeddings, but not reranking.
     cohere_api_key_env: COHERE_API_KEY
+    # Optional, for `convert --ocr hosted`, which sends scanned PDF pages to
+    # Firecrawl Parse. It works without a key, at lower limits.
+    firecrawl_api_key_env: FIRECRAWL_API_KEY
     zotero_library_type: user
     defaults:
         llm_model: openai/gpt-4o-mini
@@ -95,3 +98,18 @@ eval:
     # Characters of each document shown to the generator. A paper longer than this
     # is sampled head-and-tail, so the conclusions arrive with the abstract.
     document_char_budget: 30000
+
+markdown:
+    # When a Markdown transcript counts as faithful to its source file. Only a
+    # transcript that passes lets `shrink-storage` trash the original. Calibrated
+    # against hand-graded conversions (PRD-markdown.md, Phase 0); a stricter value
+    # only means more originals are kept.
+    quality:
+        min_recall: 0.85 # share of the source's words found in the transcript
+        min_worst_segment_recall: 0.80 # the same, for the weakest page: a dropped page
+        max_glued_words: 0.02 # 20+ letter "words": lost spaces
+        max_garbage_ratio: 0.005 # replacement characters, (cid:NN) codes
+        min_letter_ratio: 0.60 # letters among visible characters
+        max_broken_spacing: 0.05 # stray single letters: "T h e  r e s u l t s"
+        min_baseline_words: 200 # fewer source words than this: unverifiable (scans)
+        min_segment_words: 50 # shorter pages are left out of the worst-page check

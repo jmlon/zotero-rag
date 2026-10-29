@@ -209,6 +209,44 @@ Every run also records which sub-folders each item is filed in, which is what th
 terminal UI's folder filter uses. Moving an item between folders in Zotero is picked
 up by the next `index` without re-embedding anything.
 
+### Markdown transcripts for LLMs
+
+```bash
+zotero-rag convert --dry-run   # what would be converted, and why
+zotero-rag convert             # attach a Markdown transcript to each paper
+```
+
+`convert` turns the attachment `index` would read — a PDF, Word or OpenDocument
+file, an EPUB, a saved web page — into Markdown and **attaches it to the paper in
+Zotero**, beside the original. A transcript is useful well beyond this tool: any LLM
+reads it more reliably than a PDF. PDFs are converted page by page, so each page is
+marked (`<!-- page 4 -->`), and the file opens with front matter naming the paper,
+its authors and the attachment it came from. Conversion runs locally (no GPU); the
+original is never modified.
+
+It is the first command that **writes to your library**, so it needs an API key
+with write access, asks before writing (`--yes` skips the question), and is careful
+about what it touches:
+
+- **Re-running is cheap.** A transcript records the checksum of its source; only
+  new papers and replaced files are converted again.
+- **Your edits are kept.** A transcript edited in Zotero is left alone — even when
+  its PDF changes — unless you pass `--force`.
+- **Your own Markdown wins.** A paper with a `.md` file you attached counts as
+  converted and gets no second transcript.
+- **Each transcript is checked** against the text `index` extracts from the same
+  file: missing pages, lost spaces between words, or garbled characters are
+  reported. A transcript that fails is still attached, since it is still useful,
+  but the run lists it.
+- **Scanned pages** have no text to convert. They are reported; `--ocr hosted`
+  sends *just those pages* to [Firecrawl Parse](https://firecrawl.dev) for OCR,
+  after asking you (set `FIRECRAWL_API_KEY` for higher limits).
+
+`--limit N` and `--only-item KEY` try it on a few papers first; `--report run.csv`
+(or `.json`) writes a row per paper with its state, outcome and quality verdict.
+Transcripts are tagged `zotero-rag:markdown`, so Zotero's tag selector shows them
+all.
+
 ### 4. Ask questions
 
 ```bash
@@ -442,7 +480,8 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   .env            your credentials (never committed)
   questions.yaml  optional golden set for `eval` — worth committing
   chroma/            the vector store
-  cache/             downloaded PDFs, kept so re-indexing does not re-download
+  cache/             downloaded attachments and transcripts, kept so re-indexing
+                     does not re-download
   collections.json   the indexed collection tree, rewritten by every `index` run
   .zotero-rag-ui/    the terminal UI's prompt history (and its -v log)
 ```

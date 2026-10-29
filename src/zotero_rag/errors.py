@@ -56,6 +56,19 @@ class ZoteroApiError(ZoteroRagError):
     """The Zotero Web API call failed."""
 
 
+class ZoteroWriteAccessError(ZoteroApiError):
+    """The API key may read the library but not change it or upload files."""
+
+
+class ZoteroConflictError(ZoteroApiError):
+    """The item changed in Zotero after it was read, so the write was refused.
+
+    Expected when someone edits the library while a run is going: the item is
+    skipped and the next run sees the new state, rather than one side's edit
+    silently overwriting the other's.
+    """
+
+
 class CollectionNotFoundError(ZoteroRagError):
     """No collection matches the given path or key."""
 

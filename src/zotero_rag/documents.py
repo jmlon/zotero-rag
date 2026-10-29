@@ -86,9 +86,48 @@ def format_for(content_type: str | None) -> DocumentFormat | None:
     return CONTENT_TYPES.get(base)
 
 
-def cache_suffix(document_format: DocumentFormat) -> str:
-    """File suffix for a cached attachment of this format."""
-    return CACHE_SUFFIXES.get(document_format, ".bin")
+# Formats only Markdown conversion reads, named as anydoc names them. `format_for`
+# leaves these out on purpose: `index` skips them until a transcript exists.
+CONVERSION_ONLY_TYPES: dict[str, str] = {
+    "application/msword": "doc",
+    "application/rtf": "rtf",
+    "text/rtf": "rtf",
+    "application/vnd.ms-powerpoint": "ppt",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+    "application/vnd.ms-excel": "xlsx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": "xlsx",
+    "application/vnd.oasis.opendocument.spreadsheet": "ods",
+    "application/vnd.oasis.opendocument.presentation": "odp",
+}
+
+# Readable formats that are already text, so a transcript would add nothing.
+_ALREADY_TEXT = frozenset({DocumentFormat.TEXT, DocumentFormat.NOTE})
+
+
+def conversion_format_for(content_type: str | None) -> str | None:
+    """The format to convert an attachment from, or `None` if it isn't converted.
+
+    The value is a `DocumentFormat` value for formats `index` reads too, else the
+    anydoc name of a format only conversion reads.
+    """
+    document_format = format_for(content_type)
+    if document_format is not None:
+        return None if document_format in _ALREADY_TEXT else document_format.value
+    if not content_type:
+        return None
+    return CONVERSION_ONLY_TYPES.get(content_type.split(";", 1)[0].strip().lower())
+
+
+def cache_suffix(document_format: DocumentFormat | str) -> str:
+    """File suffix for a cached attachment of this format.
+
+    A conversion-only format (`pptx`, `rtf`…) is cached under its own name.
+    """
+    if document_format in CACHE_SUFFIXES:
+        return CACHE_SUFFIXES[DocumentFormat(document_format)]
+    if document_format in CONVERSION_ONLY_TYPES.values():
+        return f".{document_format}"
+    return ".bin"
 
 
 def locator_kind_for(document_format: DocumentFormat) -> LocatorKind:

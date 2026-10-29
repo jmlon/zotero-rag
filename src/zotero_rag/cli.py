@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import os
 import shutil
+from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -27,6 +30,21 @@ from zotero_rag.config import (
     load_env,
     packaged_defaults,
     pin_collection,
+)
+from zotero_rag.conversion import (
+    ConversionAction,
+    ConversionEntry,
+    ConversionPlan,
+    ConversionState,
+    build_conversion_plan,
+)
+from zotero_rag.converter_run import (
+    REPORT_FIELDS,
+    ConversionResult,
+    ConversionRun,
+    Outcome,
+    report_rows,
+    run_conversion,
 )
 from zotero_rag.documents import DocumentFormat
 from zotero_rag.download import CACHE_DIRNAME, ensure_cached
@@ -84,9 +102,11 @@ from zotero_rag.planning import (
     IndexPlan,
     PlannedAttachment,
     SkipReason,
+    SkipReport,
     build_plan,
     item_membership,
 )
+from zotero_rag.quality import QualityVerdict
 from zotero_rag.querying import QueryResult, answer_question
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.scaffold import init_index_folder
@@ -94,6 +114,7 @@ from zotero_rag.snapshot import write_snapshot
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
     CollectionNode,
+    FileDownloader,
     build_client,
     build_collection_tree,
     collection_scope,
@@ -103,6 +124,7 @@ from zotero_rag.zotero_api import (
     fetch_username,
     find_collection_by_key,
     library_scope,
+    require_write_access,
     resolve_collection_path,
     scope_tree,
 )
@@ -314,6 +336,7 @@ def _resolve_target(
     collection: str | None,
     collection_key: str | None,
     assume_yes: bool,
+    verb: str = "index",
 ) -> tuple[list[CollectionNode], str, CollectionNode | None]:
     """Decide which collections are in scope, honouring any pinned collection.
 
@@ -347,10 +370,12 @@ def _resolve_target(
     scope = library_scope(roots)
     err_console.print(
         f"[yellow]Warning:[/yellow] no collection given, so the whole library would be "
-        f"indexed — {_plural(len(scope), 'collection')}. Items that belong to no "
+        f"{verb}ed — {_plural(len(scope), 'collection')}. Items that belong to no "
         f"collection are not included."
     )
-    if not assume_yes and not typer.confirm("Index the entire library?", default=False):
+    if not assume_yes and not typer.confirm(
+        f"{verb.capitalize()} the entire library?", default=False
+    ):
         raise typer.Abort()
     return scope, "the whole library", None
 
@@ -364,7 +389,6 @@ def _run_index(
     plan: IndexPlan,
     config: Config,
     store: VectorStore,
-    zot: Any,
     embeddings: Any,
     cache_dir: Path,
 ) -> IndexStats:
@@ -374,6 +398,8 @@ def _run_index(
     formats = {
         attachment.attachment_key: attachment.document_format for attachment in plan.attachments
     }
+    # Not `zot.file()`: pyzotero cannot download content types it does not list (ODT).
+    files = FileDownloader.from_config(config)
 
     with Progress(
         SpinnerColumn(),
@@ -391,7 +417,7 @@ def _run_index(
         return index_plan(
             plan,
             store=store,
-            download=lambda key: ensure_cached(zot, key, cache_dir, formats[key]),
+            download=lambda key: ensure_cached(files, key, cache_dir, formats[key]),
             embed=embeddings.embed_documents,
             chunk_size=config.index.chunk_size,
             chunk_overlap=config.index.chunk_overlap,
@@ -451,7 +477,7 @@ def _print_formats(plan: IndexPlan) -> None:
     console.print(f"  [dim]formats:[/dim] {listed}")
 
 
-def _print_skips(plan: IndexPlan) -> None:
+def _print_skips(plan: SkipReport) -> None:
     """Report skips with the detail needed to act on them.
 
     A bare `10  unsupported content type` tells the user nothing about what those
@@ -658,7 +684,7 @@ def index(
             if repair:
                 _run_repair(store, config, embeddings)
 
-        stats = _run_index(plan, config, store, zot, embeddings, cache_dir)
+        stats = _run_index(plan, config, store, embeddings, cache_dir)
         store.write_fingerprint(
             StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
         )
@@ -809,6 +835,334 @@ def _answer_as_json(result: QueryResult, show_sources: bool) -> str:
         },
     }
     return json.dumps(payload, indent=2, ensure_ascii=False)
+
+
+# --- convert (PRD-markdown) -------------------------------------------------------
+
+#: What to tell the user about entries a run leaves alone, and how to change that.
+_STATE_HINTS: dict[ConversionState, str] = {
+    ConversionState.EDITED: "kept; --force overwrites them",
+    ConversionState.OUTDATED: "kept; --reconvert regenerates them",
+    ConversionState.USER_PROVIDED: "yours; never replaced",
+    ConversionState.SOURCE_GONE: "kept; the original is in the trash",
+    ConversionState.SOURCE_MISSING: "kept; delete them in Zotero if unwanted",
+    ConversionState.SUPERSEDED: "kept; a preferred attachment was converted instead",
+    ConversionState.DUPLICATE: "kept; delete the extra one in Zotero",
+}
+
+
+def _select_actions(
+    actions: list[ConversionEntry], only_items: list[str] | None, limit: int | None
+) -> list[ConversionEntry]:
+    """Narrow a run to some items (`--only-item`) or a first batch (`--limit`)."""
+    if only_items:
+        wanted = {key.strip().upper() for key in only_items}
+        actions = [
+            entry
+            for entry in actions
+            if entry.source
+            and (entry.source.item_key in wanted or entry.source.attachment_key in wanted)
+        ]
+    return actions[:limit] if limit else actions
+
+
+def _print_conversion_states(plan: ConversionPlan) -> None:
+    """The entries left alone, with what the user can do about each kind."""
+    for state, count in plan.state_counts.items():
+        if state in (ConversionState.MISSING, ConversionState.STALE):
+            continue
+        acted = sum(1 for e in plan.actions if e.state is state)
+        if acted == count:
+            continue
+        hint = _STATE_HINTS.get(state, "")
+        suffix = f"  [dim]({hint})[/dim]" if hint else ""
+        console.print(f"  [dim]{count - acted:>4}[/dim]  {state.value}{suffix}")
+
+
+def _print_conversion_plan(
+    plan: ConversionPlan, actions: list[ConversionEntry], target: str, ocr: str
+) -> None:
+    console.print(
+        f"\nTarget: [bold]{escape(target)}[/bold] "
+        f"({_plural(len(plan.collections), 'collection')}, "
+        f"{_plural(plan.items_seen, 'item')})\n"
+    )
+    if actions:
+        table = Table(title="Transcripts that would be written", title_justify="left")
+        table.add_column("#", justify="right", style="dim")
+        table.add_column("Title", overflow="ellipsis", max_width=52)
+        table.add_column("Format")
+        table.add_column("Action")
+        table.add_column("Why", overflow="ellipsis", max_width=30)
+        table.add_column("Attachment", style="dim")
+        for number, entry in enumerate(actions, start=1):
+            assert entry.source is not None
+            table.add_row(
+                str(number),
+                escape(entry.title),
+                entry.source.source_format,
+                str(entry.action),
+                entry.state.value,
+                entry.source.attachment_key,
+            )
+        console.print(table)
+    else:
+        console.print("[green]Nothing to convert: every transcript is up to date.[/green]")
+
+    console.print(f"\n[bold]{_plural(len(actions), 'transcript')}[/bold] would be written.")
+    if len(actions) < len(plan.actions):
+        console.print(f"  [dim]{len(plan.actions) - len(actions)} more left for a later run.[/dim]")
+    _print_conversion_states(plan)
+    if plan.skipped:
+        console.print("Skipped:")
+        _print_skips(plan)
+    if ocr == "hosted":
+        console.print(
+            "\n[dim]--ocr hosted: which documents have scanned pages is only known after "
+            "converting; you will be asked before any page is sent.[/dim]"
+        )
+    console.print("\n[dim]Dry run: nothing was downloaded, converted, or written.[/dim]")
+
+
+def _confirm_ocr(entries: list[ConversionEntry]) -> bool:
+    verb = "has" if len(entries) == 1 else "have"
+    err_console.print(
+        f"\n[yellow]{_plural(len(entries), 'document')} {verb} scanned pages.[/yellow] "
+        "With --ocr hosted, just those pages are uploaded to Firecrawl Parse "
+        "(firecrawl.dev) to be read. Nothing else leaves this machine."
+    )
+    for entry in entries[:10]:
+        err_console.print(f"  [dim]• {escape(entry.title)}[/dim]")
+    if len(entries) > 10:
+        err_console.print(f"  [dim]… and {len(entries) - 10} more[/dim]")
+    return typer.confirm("Send those pages for OCR?", default=False)
+
+
+def _print_conversion_summary(plan: ConversionPlan, run: ConversionRun, verbose: bool) -> None:
+    counts = run.outcome_counts
+    written = counts.get(Outcome.CREATED, 0) + counts.get(Outcome.REGENERATED, 0)
+    console.print(
+        f"\n[bold green]Wrote {_plural(written, 'transcript')}[/bold green] "
+        f"({counts.get(Outcome.CREATED, 0)} new, {counts.get(Outcome.REGENERATED, 0)} "
+        f"regenerated) for {_plural(plan.items_seen, 'item')} in "
+        f"{_plural(len(plan.collections), 'collection')}."
+    )
+    if run.quality_counts:
+        listed = ", ".join(f"{n} {verdict}" for verdict, n in run.quality_counts.items())
+        console.print(f"  [dim]quality:[/dim] {listed}")
+    _print_conversion_states(plan)
+    if plan.skipped:
+        _print_skips(plan)
+
+    weak = run.with_quality(QualityVerdict.FAIL) + run.with_quality(QualityVerdict.UNVERIFIED)
+    if weak:
+        console.print(
+            f"\n{_plural(len(weak), 'transcript')} did not pass the quality check "
+            "(attached anyway; shrink-storage will keep their originals):"
+        )
+        shown = weak if verbose else weak[:15]
+        for result in shown:
+            assert result.quality is not None
+            reasons = "; ".join(result.quality.reasons)
+            console.print(
+                f"  [yellow]•[/yellow] {escape(result.title)} "
+                f"[dim]({result.quality.verdict}: {escape(reasons)})[/dim]"
+            )
+        if len(shown) < len(weak):
+            console.print(f"  [dim]… and {len(weak) - len(shown)} more (-v lists all)[/dim]")
+
+    if run.unread_scans and not run.ocr_declined:
+        count = len(run.unread_scans)
+        console.print(
+            f"\n{_plural(count, 'document')} {'has' if count == 1 else 'have'} scanned pages "
+            "with no text. --ocr hosted would send just those pages to Firecrawl Parse."
+        )
+    images = sum(result.images for result in run.results)
+    if images:
+        console.print(f"[dim]{images} images in the sources are not in the transcripts.[/dim]")
+
+    problems = [r for r in run.results if r.outcome in (Outcome.FAILED, Outcome.CONFLICT)]
+    if problems:
+        console.print(f"\n[yellow]{_plural(len(problems), 'problem')}:[/yellow]")
+        for result in problems:
+            console.print(f"  [yellow]•[/yellow] {escape(result.title)}: {escape(result.error)}")
+
+
+def _write_conversion_report(path: Path, plan: ConversionPlan, run: ConversionRun | None) -> None:
+    rows = report_rows(plan.entries, run)
+    if path.suffix.lower() == ".json":
+        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    else:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+    console.print(f"Report written to {escape(str(path))}")
+
+
+@app.command()
+def convert(
+    collection: Annotated[
+        str | None,
+        typer.Option("--collection", help="Zotero collection path, e.g. 'Research/Legal'."),
+    ] = None,
+    collection_key: Annotated[
+        str | None,
+        typer.Option("--collection-key", help="Zotero collection key (unambiguous)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="List what would be converted; download and write nothing."),
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Answer yes to every confirmation.")
+    ] = False,
+    limit: Annotated[
+        int | None,
+        typer.Option("--limit", help="Convert at most N documents this run.", min=1),
+    ] = None,
+    only_item: Annotated[
+        list[str] | None,
+        typer.Option("--only-item", help="Convert just this item or attachment key; repeatable."),
+    ] = None,
+    reconvert: Annotated[
+        bool,
+        typer.Option("--reconvert", help="Regenerate transcripts made by an older converter."),
+    ] = False,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Also regenerate transcripts edited in Zotero."),
+    ] = False,
+    ocr: Annotated[
+        str,
+        typer.Option(
+            "--ocr",
+            help="off, or hosted: send scanned PDF pages (only those) to Firecrawl Parse.",
+        ),
+    ] = "off",
+    jobs: Annotated[
+        int,
+        typer.Option("--jobs", help="Documents converted in parallel.", min=1),
+    ] = min(4, os.cpu_count() or 1),
+    report: Annotated[
+        Path | None,
+        typer.Option("--report", help="Also write every entry to this .csv or .json file."),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Attach a Markdown transcript to each paper, for LLMs to read.
+
+    Converts the attachment `index` would read (PDF, Word, OpenDocument, EPUB, a
+    saved web page…) and uploads the transcript to Zotero beside it. Re-running
+    only converts what is new or changed. Must be run from an index folder.
+    """
+    _enable_verbose(verbose)
+    if collection is not None and collection_key is not None:
+        err_console.print(
+            "[bold red]Error:[/bold red] give either --collection or --collection-key, not both."
+        )
+        raise typer.Exit(code=1)
+    if ocr not in ("off", "hosted"):
+        err_console.print("[bold red]Error:[/bold red] --ocr must be off or hosted.")
+        raise typer.Exit(code=1)
+
+    run: ConversionRun | None = None
+    try:
+        config = load_config()
+        if config.source_dir is None:
+            raise NotAnIndexFolderError(
+                f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
+                "or change to an index folder."
+            )
+        zot = build_client(config)
+        roots = build_collection_tree(fetch_collections(zot))
+        scope, target, _node = _resolve_target(
+            config, roots, collection, collection_key, assume_yes, verb="convert"
+        )
+        username = "" if dry_run else fetch_username(zot)
+        fetched: list[tuple[str, list[dict[str, object]]]] = []
+        with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
+            for collection_node in scope:
+                status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
+                fetched.append(
+                    (collection_node.name, fetch_collection_items(zot, collection_node.key))
+                )
+
+        plan = build_conversion_plan(
+            fetched,
+            username=username,
+            preference=config.index.attachment_preference,
+            every_attachment=config.index.index_all_attachments,
+            force=force,
+            reconvert=reconvert,
+        )
+        actions = _select_actions(plan.actions, only_item, limit)
+
+        if dry_run:
+            _print_conversion_plan(plan, actions, target, ocr)
+            if report:
+                _write_conversion_report(report, plan, None)
+            return
+        if not actions:
+            console.print("[green]Nothing to convert: every transcript is up to date.[/green]")
+            _print_conversion_states(plan)
+            if report:
+                _write_conversion_report(report, plan, None)
+            return
+
+        # A read-only key would otherwise fail after the downloads and conversions.
+        require_write_access(zot, config)
+        new = sum(1 for e in actions if e.action is ConversionAction.CREATE)
+        if not assume_yes and not typer.confirm(
+            f"Write {_plural(len(actions), 'transcript')} to Zotero "
+            f"({new} new, {len(actions) - new} regenerated)?",
+            default=True,
+        ):
+            raise typer.Abort()
+
+        cache_dir = config.source_dir / CACHE_DIRNAME
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Converting...", total=len(actions))
+
+            def on_done(result: ConversionResult) -> None:
+                progress.update(task, advance=1, description=escape(result.title[:50]))
+
+            def confirm_ocr(entries: list[ConversionEntry]) -> bool:
+                if assume_yes:
+                    return True
+                progress.stop()
+                try:
+                    return _confirm_ocr(entries)
+                finally:
+                    progress.start()
+
+            run = run_conversion(
+                actions,
+                zot=zot,
+                files=FileDownloader.from_config(config),
+                cache_dir=cache_dir,
+                thresholds=config.markdown.quality,
+                today=date.today(),
+                ocr="hosted" if ocr == "hosted" else "off",
+                api_key=config.global_.firecrawl_api_key,
+                jobs=jobs,
+                confirm_ocr=confirm_ocr,
+                on_done=on_done,
+            )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    _print_conversion_summary(plan, run, verbose=_is_verbose())
+    if report:
+        _write_conversion_report(report, plan, run)
 
 
 @app.command()

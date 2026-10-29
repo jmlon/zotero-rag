@@ -7,6 +7,8 @@ requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
     "chromadb>=1.5.9",
+    # Markdown transcripts. Capped below the next minor: the API is pre-1.0.
+    "firecrawl-anydoc>=0.2.4,<0.3",
     # Imported directly to catch transport errors pyzotero lets through.
     "httpx>=0.28",
     "langchain-core>=1.5.1",
