@@ -403,3 +403,104 @@ def test_images_are_counted_for_the_report(file_factory: FileFactory) -> None:
     path = file_factory("report.pdf", scanned_pdf_bytes([None, "Some text", None]))
 
     assert convert(path, DocumentFormat.PDF).images == 2
+
+
+# --- Pages anydoc refuses but pypdf can read (Phase 6 finding) -----------------------
+
+
+class RefusingAnydoc:
+    """The real anydoc, except that it calls any page containing REFUSED a scan.
+
+    Real case: a survey page drawn with vector figures, which anydoc reports as
+    needing OCR although its text layer is intact.
+    """
+
+    def __init__(self, error: type[Exception] = anydoc.NeedsOcrError) -> None:
+        self.error = error
+        self.NeedsOcrError = anydoc.NeedsOcrError
+        self.ConvertError = anydoc.ConvertError
+
+    def to_markdown_bytes(self, data: bytes, fmt: str, **kwargs: Any) -> str:
+        if "REFUSED" in (PdfReader(io.BytesIO(data)).pages[0].extract_text() or ""):
+            raise self.error("page 1 of 1 needs OCR")
+        return anydoc.to_markdown_bytes(data, fmt)  # type: ignore[arg-type]
+
+
+LONG_PAGE = "REFUSED " + " ".join(f"word{chr(97 + i)}" for i in range(24))
+
+
+def wide_pdf(pages: list[str]) -> bytes:
+    """Pages wide enough for a line of 25 words, so the text layer holds them."""
+    writer = PdfWriter(clone_from=io.BytesIO(make_pdf_bytes(pages)))
+    for page in writer.pages:
+        page.mediabox.right = 2000
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+@pytest.mark.parametrize("error", [anydoc.NeedsOcrError, anydoc.MalformedError])
+def test_a_refused_page_with_a_text_layer_uses_it(
+    file_factory: FileFactory, monkeypatch: pytest.MonkeyPatch, error: type[Exception]
+) -> None:
+    monkeypatch.setattr(markdown, "_anydoc", lambda: RefusingAnydoc(error))
+    path = file_factory("survey.pdf", wide_pdf(["Opening page", LONG_PAGE, "Closing page"]))
+
+    result = convert(path, DocumentFormat.PDF)
+
+    assert result.text_layer_pages == [2]
+    assert result.empty_pages == []
+    assert result.needs_ocr == []
+    assert "wordx" in result.markdown.split("<!-- page 2 -->")[1].split("<!-- page 3 -->")[0]
+
+
+def test_a_refused_page_with_too_little_text_stays_empty(
+    file_factory: FileFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(markdown, "_anydoc", lambda: RefusingAnydoc())
+    path = file_factory("paper.pdf", wide_pdf(["Opening page", "REFUSED few words"]))
+
+    result = convert(path, DocumentFormat.PDF)
+
+    assert result.text_layer_pages == []
+    assert result.empty_pages == [2]
+
+
+def test_text_layer_pages_are_named_in_the_front_matter() -> None:
+    attachment = PlannedAttachment(
+        attachment_key="ATT1",
+        item_key="ITEM1",
+        title="T",
+        authors="",
+        year="",
+        collection_name="C",
+    )
+    converted = Converted(markdown="x\n", converter="anydoc", pages=3, text_layer_pages=[2])
+
+    text = transcript(converted, attachment, source_md5="m", generated=date(2026, 10, 29))
+
+    assert yaml.safe_load(text.split("---\n")[1])["text_layer_pages"] == [2]
+
+
+def test_cleaning_drops_embedded_latex_and_base64_but_keeps_glued_text() -> None:
+    from zotero_rag.pdf_text import clean
+
+    blob = "AAAB+XicbVBNS8NAEN34WetX1KOXxSJ4KkkV9Fj04rGC/YA2hs120y7dbMLupLSE/BMvHhTx6j"
+    text = (
+        'Before <latexit sha1_base64="Dy">AAAB+Xicb/VBNS8</latexit> after. '
+        f"Stray {blob} blob. AlgebraicMethodsforInteractiveProofSystemsCarstenLundLanceFortnow"
+    )
+
+    cleaned = clean(text)
+
+    assert "latexit" not in cleaned
+    assert blob not in cleaned
+    assert "Before" in cleaned and "after." in cleaned
+    assert "AlgebraicMethodsforInteractiveProofSystemsCarstenLundLanceFortnow" in cleaned
+
+
+def test_the_converter_name_carries_the_revision() -> None:
+    # Transcripts made before a change in output must read as outdated, so
+    # `convert --reconvert` can find them.
+    assert markdown.converter_name("pdf").endswith(f" r{markdown.REVISION}")
+    assert markdown.converter_name("html").endswith(f" r{markdown.REVISION}")

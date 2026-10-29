@@ -136,7 +136,7 @@ class IndexConfig(BaseModel):
     # a hundred items in a real library hold both a PDF and an HTML snapshot of the
     # same article, so indexing everything would embed that content twice (§11.2).
     attachment_preference: list[str] = Field(
-        default_factory=lambda: ["pdf", "docx", "odt", "epub", "html", "txt"]
+        default_factory=lambda: ["pdf", "docx", "odt", "epub", "html", "markdown", "txt"]
     )
     index_all_attachments: bool = False
     # Notes complement an item's file rather than competing with it.

@@ -20,6 +20,9 @@ class DocumentFormat(StrEnum):
     PDF = "pdf"
     HTML = "html"
     TEXT = "txt"
+    # Its own format rather than TEXT: a transcript carries page markers and front
+    # matter that plain text does not, and preference can rank it apart (PRD-markdown).
+    MARKDOWN = "markdown"
     DOCX = "docx"
     ODT = "odt"
     EPUB = "epub"
@@ -43,8 +46,8 @@ CONTENT_TYPES: dict[str, DocumentFormat] = {
     "text/html": DocumentFormat.HTML,
     "application/xhtml+xml": DocumentFormat.HTML,
     "text/plain": DocumentFormat.TEXT,
-    "text/markdown": DocumentFormat.TEXT,
-    "text/x-markdown": DocumentFormat.TEXT,
+    "text/markdown": DocumentFormat.MARKDOWN,
+    "text/x-markdown": DocumentFormat.MARKDOWN,
     "text/csv": DocumentFormat.TEXT,
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document": (
         DocumentFormat.DOCX
@@ -58,6 +61,7 @@ CACHE_SUFFIXES: dict[DocumentFormat, str] = {
     DocumentFormat.PDF: ".pdf",
     DocumentFormat.HTML: ".html",
     DocumentFormat.TEXT: ".txt",
+    DocumentFormat.MARKDOWN: ".md",
     DocumentFormat.DOCX: ".docx",
     DocumentFormat.ODT: ".odt",
     DocumentFormat.EPUB: ".epub",
@@ -67,6 +71,8 @@ LOCATOR_KINDS: dict[DocumentFormat, LocatorKind] = {
     DocumentFormat.PDF: LocatorKind.PAGE,
     DocumentFormat.HTML: LocatorKind.SECTION,
     DocumentFormat.TEXT: LocatorKind.SECTION,
+    # Per segment in practice: pages when a transcript marks them, else sections.
+    DocumentFormat.MARKDOWN: LocatorKind.SECTION,
     DocumentFormat.DOCX: LocatorKind.SECTION,
     DocumentFormat.ODT: LocatorKind.SECTION,
     DocumentFormat.EPUB: LocatorKind.SECTION,
@@ -101,7 +107,7 @@ CONVERSION_ONLY_TYPES: dict[str, str] = {
 }
 
 # Readable formats that are already text, so a transcript would add nothing.
-_ALREADY_TEXT = frozenset({DocumentFormat.TEXT, DocumentFormat.NOTE})
+_ALREADY_TEXT = frozenset({DocumentFormat.TEXT, DocumentFormat.MARKDOWN, DocumentFormat.NOTE})
 
 
 def conversion_format_for(content_type: str | None) -> str | None:

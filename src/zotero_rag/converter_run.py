@@ -230,6 +230,7 @@ def _publish(prepared: _Prepared, zot: Any, cache_dir: Path, today: date) -> Con
         source_md5=source.md5 or file_md5(prepared.path or staged),
         md5=file_md5(staged),
         converter=converted.converter,
+        source_format=source.source_format,
         quality=prepared.quality.summary() if prepared.quality else "",
     )
     result = ConversionResult(
@@ -275,7 +276,7 @@ def _publish(prepared: _Prepared, zot: Any, cache_dir: Path, today: date) -> Con
 
     result.transcript_key = uploaded.key
     # Cached under the transcript's own key, so `index` reading it later is a hit.
-    target = cache_path(cache_dir, uploaded.key, DocumentFormat.TEXT)
+    target = cache_path(cache_dir, uploaded.key, DocumentFormat.MARKDOWN)
     shutil.copyfile(staged, target)
     shutil.rmtree(staged.parent, ignore_errors=True)
     return result

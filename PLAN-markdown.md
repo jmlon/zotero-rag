@@ -480,7 +480,55 @@ Then:
 URL probing gets its own `httpx.Client`: 10 s timeout, redirects followed, a
 descriptive `User-Agent`, and at most 2 concurrent requests per host.
 
-### Phase 6 — Index integration (separate milestone, gated by eval)
+### Phase 6 — Index integration (separate milestone, gated by eval) — 🚧 built; eval pending
+
+*As built (items 1–3 and 5):*
+- **`DocumentFormat.MARKDOWN`** (`markdown`, cached as `.md`) is what
+  `text/markdown` and `text/x-markdown` map to. `convert` caches transcripts with
+  it, and treats it as already text.
+- **`extraction.extract_markdown`:** front matter is dropped, `<!-- page N -->`
+  markers become PAGE segments (empty pages are left out), and Markdown without
+  markers splits on headings.
+- **The pair rule** (`planning._pair_transcripts`): a transcript (recognised by
+  its provenance) and its source form one document.
+  - The document competes under the source's format, so a paper's transcript
+    never pushes out its supplement. The preference then picks which copy is
+    indexed, and the other is skipped as `SAME_DOCUMENT`, with `replaced_by`.
+    Never both, even with `index_all_attachments`.
+  - A transcript whose source is gone (shrunk) competes under the
+    `source_format` its provenance now records. Notes written before that field
+    existed fall back to `markdown`.
+- **Default preference** `[pdf, docx, odt, epub, html, markdown, txt]`. Markdown
+  sits after the formats it transcribes, so `index` behaves as before until
+  item 4 decides otherwise.
+- **`indexer.drop_replaced_copies`** runs on every `index`. When the preference
+  swaps a document's copy, it deletes the old copy's chunks, but only once the
+  new copy is in the store. Unlike `--prune` this loses nothing.
+- **Fingerprint unchanged** (item 5). A swap is ordinary re-indexing.
+- **Findings from the first real `convert` run (KG collection, 11 PDFs):**
+  - **anydoc refuses some text pages as "needs OCR".** Pages with vector
+    figures and embedded LaTeX trip its scan detector: 3 of 11 papers lost a
+    page this way, and whole-document conversion fails outright. A refused page
+    with at least 20 words in its pypdf text layer now uses that text instead,
+    recorded as `text_layer_pages`. The quality check caught the case that
+    mattered (page 7 recall 0.32); the survey now passes with recall 0.96.
+  - **pypdf reads LaTeXiT figure sources as base64 "text".** `pdf_text.clean`
+    drops `<latexit>` blocks and base64 runs, for the fallback and for `index`
+    extraction alike. A run is dropped only if it has digits and `+` or `/`, so
+    text that lost its spaces survives.
+  - **Broken spacing counted math notation.** The metric now counts only runs
+    of ≥ 3 lone letters with ≥ 25% vowels. Spread-out words keep failing (the
+    ontology paper's code listings, 0.195), while variables like `h r t` and
+    `d d r r k` no longer do (the survey drops from 0.087 to 0.005). Agreement
+    with the step 0 grades is unchanged at 24/25.
+  - **`markdown.REVISION`** (now 2) is part of the converter name, so
+    transcripts made before a change in output read as OUTDATED and
+    `convert --reconvert` redoes them. On KG it lists all 11, including the
+    transcripts that lack a page.
+- **Dry runs on the real KG collection** (5 papers converted): the default
+  preference indexes the 5 PDFs and skips the transcripts as the same document,
+  and markdown-first does exactly the reverse. The unconverted paper stays on
+  its PDF either way.
 
 1. `DocumentFormat.MARKDOWN`, separate from `TEXT`. This resolves the PRD §11.2
    TO-FIX. `text/markdown` and `text/x-markdown` map to it.

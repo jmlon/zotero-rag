@@ -91,6 +91,7 @@ from zotero_rag.index_folder import (
 )
 from zotero_rag.indexer import (
     IndexStats,
+    drop_replaced_copies,
     find_orphans,
     index_plan,
     prune_orphans,
@@ -505,12 +506,12 @@ _FIXABLE_SKIPS: dict[SkipReason, str] = {
     SkipReason.NOT_IN_STORAGE: (
         "Zotero holds no file for these. In Zotero desktop, check Settings → Sync: "
         "file syncing on, using Zotero storage (not WebDAV), quota not full. Then sync "
-        "and index again."
+        "and run this command again."
     ),
     SkipReason.LINKED_FILE: (
         "These files live only on your computer. Convert them to stored files in "
         "Zotero (Tools → Manage Attachments → Convert Linked Files to Stored Files), "
-        "sync, and index again."
+        "sync, and run this command again."
     ),
 }
 
@@ -688,6 +689,9 @@ def index(
         store.write_fingerprint(
             StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
         )
+        # Before counting orphans: a copy replaced by its transcript (or source) is
+        # not an orphan to report, it is a duplicate to drop.
+        replaced, _ = drop_replaced_copies(store, plan)
         orphans = prune_orphans(store, plan) if prune else (len(find_orphans(store, plan)), 0)
         # Folders can change without any attachment changing, so membership is
         # checked on every run, and the snapshot is written only once it is current.
@@ -701,6 +705,11 @@ def index(
         return
 
     _print_index_summary(plan, stats, store, verbose=_is_verbose())
+    if replaced:
+        console.print(
+            f"Dropped the old copy of {_plural(replaced, 'document')} now indexed from "
+            "its transcript or source, so its text is not retrieved twice."
+        )
     _print_orphans(orphans, pruned=prune)
     if refreshed:
         console.print(
@@ -909,7 +918,8 @@ def _print_conversion_plan(
     else:
         console.print("[green]Nothing to convert: every transcript is up to date.[/green]")
 
-    console.print(f"\n[bold]{_plural(len(actions), 'transcript')}[/bold] would be written.")
+    if actions:
+        console.print(f"\n[bold]{_plural(len(actions), 'transcript')}[/bold] would be written.")
     if len(actions) < len(plan.actions):
         console.print(f"  [dim]{len(plan.actions) - len(actions)} more left for a later run.[/dim]")
     _print_conversion_states(plan)

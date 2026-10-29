@@ -40,7 +40,7 @@ FileFactory = Callable[[str, bytes | str], Path]
         ("text/html", DocumentFormat.HTML),
         ("application/xhtml+xml", DocumentFormat.HTML),
         ("text/plain", DocumentFormat.TEXT),
-        ("text/markdown", DocumentFormat.TEXT),
+        ("text/markdown", DocumentFormat.MARKDOWN),
         ("text/csv", DocumentFormat.TEXT),
         ("application/vnd.oasis.opendocument.text", DocumentFormat.ODT),
         (

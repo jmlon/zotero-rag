@@ -64,8 +64,10 @@ index:
     # Which attachment wins when an item has several readable ones. Many items
     # hold both a published PDF and an HTML snapshot of the same article; indexing
     # both would embed that content twice and let the copies compete in retrieval.
-    # Formats: pdf, docx, odt, epub, html, txt (plain text, Markdown, CSV).
-    attachment_preference: [pdf, docx, odt, epub, html, txt]
+    # Formats: pdf, docx, odt, epub, html, markdown, txt (plain text, CSV).
+    # A transcript made by `convert` and its source are one document: only the
+    # copy ranked higher here is indexed. Put `markdown` first to index transcripts.
+    attachment_preference: [pdf, docx, odt, epub, html, markdown, txt]
     # true indexes every readable attachment of an item instead of just the best.
     index_all_attachments: false
     # Zotero notes are indexed alongside their item's file, never instead of it.

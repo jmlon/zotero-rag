@@ -779,12 +779,16 @@ copies of documents already indexed — they would compete with the PDF chunks i
 retrieval and could yield two citations for one source. So format support needs a
 **per-item preference order** rather than "index everything readable":
 
-# TO FIX: Include markdown with precedence over txt
 ```yaml
   # First format found for an item wins; the rest are recorded as skipped.
   attachment_preference: [pdf, docx, odt, html, txt]
   index_all_attachments: false   # true = index every readable attachment
 ```
+
+*Since the Markdown work (PRD-markdown.md, Phase 6):* Markdown is a format of its
+own (`markdown`), ranked separately from `txt`. A transcript made by `convert` and
+its source form one document: they compete under the source's format, and the
+preference only decides which copy is indexed. Never both.
 
 With that in place the payoff is **+105 items (+13% of items with attachments)**
 newly searchable and no duplication, versus +205 attachments and ~100 redundant

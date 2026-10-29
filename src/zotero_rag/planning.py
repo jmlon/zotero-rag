@@ -19,7 +19,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from zotero_rag import html_text
+from zotero_rag import html_text, provenance
 from zotero_rag.documents import DocumentFormat, LocatorKind, format_for
 from zotero_rag.metadata import authors_str, parse_year, zotero_url
 
@@ -38,6 +38,10 @@ DEFAULT_PREFERENCE: tuple[DocumentFormat, ...] = (
     DocumentFormat.ODT,
     DocumentFormat.EPUB,
     DocumentFormat.HTML,
+    # After the formats it transcribes until `eval` shows a transcript retrieves
+    # better (PLAN-markdown, Phase 6): the order decides which copy of a converted
+    # document is indexed, the source or its transcript.
+    DocumentFormat.MARKDOWN,
     DocumentFormat.TEXT,
 )
 
@@ -57,6 +61,8 @@ class SkipReason(StrEnum):
     PARENT_OUT_OF_SCOPE = "parent item not in the indexed collections"
     # `convert` only: plain text, Markdown and CSV need no transcript.
     ALREADY_TEXT = "already plain text"
+    # A transcript and its source hold the same text; only one of them is indexed.
+    SAME_DOCUMENT = "the same document is indexed from its transcript or source"
 
 
 class PlannedAttachment(BaseModel):
@@ -136,6 +142,8 @@ class SkippedEntry(BaseModel):
     collection_name: str = ""
     # What Zotero said the file was, so "unsupported content type" is actionable.
     content_type: str = ""
+    # SAME_DOCUMENT: the attachment indexed in this one's place.
+    replaced_by: str = ""
 
 
 class SkipReport(BaseModel):
@@ -447,25 +455,91 @@ def _plan_candidates(
     snapshot of the same article (§11.2). Indexing both would embed the same
     content twice, so by default only the most preferred format wins and the rest
     are recorded as skipped rather than silently dropped.
+
+    A Markdown transcript made by `convert` and its source are one document in two
+    copies. The document competes under its source's format — so a paper's
+    transcript does not push out its supplement — and the preference order then
+    picks which copy is indexed. Never both, even with `index_all_attachments`.
     """
     for parent_key, group in candidates.items():
         parent_data, _ = parents[parent_key]
-        chosen, rejected = choose_preferred(group, order, every=index_all_attachments)
+        documents, copies, extra = _pair_transcripts(group)
+        chosen, rejected = choose_preferred(documents, order, every=index_all_attachments)
 
-        for candidate in chosen:
-            plan.attachments.append(
-                _planned(candidate, parent_key, parent_data, username, membership)
-            )
-        for candidate in rejected:
-            plan.skipped.append(
-                SkippedEntry(
-                    key=candidate.data["key"],
-                    title=candidate.data.get("title") or candidate.data["key"],
-                    reason=SkipReason.NOT_PREFERRED,
-                    collection_name=candidate.collection_name,
-                    content_type=candidate.content_type,
+        for document in chosen:
+            pair = copies.get(document.data["key"])
+            if pair is None:
+                indexed, other = document, None
+            else:
+                source, transcript = pair
+                prefer_transcript = _rank(DocumentFormat.MARKDOWN, order) < _rank(
+                    source.format, order
                 )
+                indexed, other = (transcript, source) if prefer_transcript else pair
+            plan.attachments.append(
+                _planned(indexed, parent_key, parent_data, username, membership)
             )
+            if other is not None:
+                plan.skipped.append(_skipped(other, SkipReason.SAME_DOCUMENT, indexed))
+            for duplicate in extra.get(document.data["key"], []):
+                plan.skipped.append(_skipped(duplicate, SkipReason.SAME_DOCUMENT, indexed))
+        for document in rejected:
+            plan.skipped.append(_skipped(document, SkipReason.NOT_PREFERRED))
+            pair = copies.get(document.data["key"])
+            for copy in ([pair[1]] if pair else []) + extra.get(document.data["key"], []):
+                plan.skipped.append(_skipped(copy, SkipReason.NOT_PREFERRED))
+
+
+def _pair_transcripts(
+    group: list[Candidate],
+) -> tuple[list[Candidate], dict[str, tuple[Candidate, Candidate]], dict[str, list[Candidate]]]:
+    """Fold each transcript into the document it transcribes.
+
+    Returns the documents that compete for the item — sources, plain attachments,
+    and transcripts whose source is gone — then, keyed by the competing document,
+    the (source, transcript) pair, and any surplus transcripts of the same source.
+    A transcript whose source is gone competes under the source's format, as
+    recorded in its provenance, so a converted PDF keeps the PDF's standing.
+    """
+    by_key = {str(candidate.data["key"]): candidate for candidate in group}
+    transcripts: dict[str, list[Candidate]] = {}
+    documents: list[Candidate] = []
+    for candidate in group:
+        record = (
+            provenance.parse(candidate.data.get("note"))
+            if candidate.format == DocumentFormat.MARKDOWN
+            else None
+        )
+        if record is None:
+            documents.append(candidate)
+        elif record.source in by_key:
+            transcripts.setdefault(record.source, []).append(candidate)
+        else:
+            standing = record.source_format or candidate.format
+            documents.append(candidate.model_copy(update={"format": standing}))
+
+    copies: dict[str, tuple[Candidate, Candidate]] = {}
+    extra: dict[str, list[Candidate]] = {}
+    for source_key, found in transcripts.items():
+        # Two transcripts of one source only follow an interrupted run; the
+        # newest stands for the pair and the rest are skipped, never indexed twice.
+        found.sort(key=lambda c: _version(c.data), reverse=True)
+        copies[source_key] = (by_key[source_key], found[0])
+        extra[source_key] = found[1:]
+    return documents, copies, extra
+
+
+def _skipped(
+    candidate: Candidate, reason: SkipReason, replaced_by: Candidate | None = None
+) -> SkippedEntry:
+    return SkippedEntry(
+        key=candidate.data["key"],
+        title=candidate.data.get("title") or candidate.data["key"],
+        reason=reason,
+        collection_name=candidate.collection_name,
+        content_type=candidate.content_type,
+        replaced_by=str(replaced_by.data["key"]) if replaced_by is not None else "",
+    )
 
 
 def choose_preferred(
@@ -509,7 +583,9 @@ def _planned(
         zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
         version=_version(candidate.data),
         content_type=candidate.content_type,
-        document_format=DocumentFormat(candidate.format),
+        # The file's own format, not its standing: a transcript whose source is
+        # gone competes as that source's format but is read as Markdown.
+        document_format=format_for(candidate.content_type) or DocumentFormat(candidate.format),
     )
 
 

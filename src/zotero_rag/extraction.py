@@ -12,17 +12,21 @@ returns an empty list, which the caller reports as skipped rather than failed.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 
 from pydantic import BaseModel
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
-from zotero_rag import html_text, office
+from zotero_rag import html_text, office, pdf_text
 from zotero_rag.documents import DocumentFormat, LocatorKind, locator_kind_for
 from zotero_rag.errors import ZoteroRagError
+from zotero_rag.markdown import body
 
 logger = logging.getLogger(__name__)
+
+_PAGE_MARKER = re.compile(r"<!--\s*page\s+(\d+)\s*-->", re.IGNORECASE)
 
 
 class ExtractionError(ZoteroRagError):
@@ -51,6 +55,8 @@ def extract_segments(path: Path, document_format: DocumentFormat) -> list[Segmen
         return extract_html(path)
     if document_format is DocumentFormat.TEXT:
         return extract_text(path)
+    if document_format is DocumentFormat.MARKDOWN:
+        return extract_markdown(path)
     if document_format is DocumentFormat.DOCX:
         return _from_sections(office.docx_sections, path, document_format)
     if document_format is DocumentFormat.ODT:
@@ -85,7 +91,7 @@ def extract_pdf(pdf_path: Path) -> list[Segment]:
     pages: list[Segment] = []
     for number, page in enumerate(reader.pages, start=1):
         try:
-            text = page.extract_text() or ""
+            text = pdf_text.clean(page.extract_text() or "")
         except Exception as exc:  # noqa: BLE001 - extraction failures vary widely
             logger.warning("Page %d of %s could not be extracted: %s", number, pdf_path.name, exc)
             continue
@@ -122,6 +128,42 @@ def extract_text(path: Path) -> list[Segment]:
     if not segments:
         logger.warning("No extractable text in %s", path.name)
     return segments
+
+
+def extract_markdown(path: Path) -> list[Segment]:
+    """A Markdown file: a transcript's pages, or any Markdown's sections.
+
+    A transcript made by `convert` marks each PDF page (`<!-- page 4 -->`), and
+    those become PAGE segments, so a citation of the transcript reads `p. 4` just
+    as one of the PDF did. Without markers — a transcript of a Word file, or
+    Markdown the user wrote — headings give the sections. Front matter is
+    metadata about the file, not its text, and is left out either way.
+    """
+    content = body(_read_text(path))
+    pages = _marked_pages(content)
+    if pages is not None:
+        segments = [
+            Segment(number=number, text=text, kind=LocatorKind.PAGE)
+            for number, text in pages
+            if text.strip()
+        ]
+    else:
+        segments = _to_segments(_markdown_sections(content), LocatorKind.SECTION)
+    if not segments:
+        logger.warning("No extractable text in %s", path.name)
+    return segments
+
+
+def _marked_pages(content: str) -> list[tuple[int, str]] | None:
+    """(page number, text) for each `<!-- page N -->`, or None without markers."""
+    markers = list(_PAGE_MARKER.finditer(content))
+    if not markers:
+        return None
+    pages: list[tuple[int, str]] = []
+    for marker, following in zip(markers, [*markers[1:], None], strict=True):
+        end = following.start() if following else len(content)
+        pages.append((int(marker.group(1)), content[marker.end() : end].strip()))
+    return pages
 
 
 def extract_note(note_html: str) -> list[Segment]:

@@ -43,6 +43,9 @@ class Provenance(BaseModel):
     source_md5: str
     md5: str
     converter: str
+    # The source's format (`pdf`, `html`…). Absent from notes written before it
+    # existed; `index` uses it to rank a transcript whose source is gone.
+    source_format: str = ""
     quality: str = ""
     source_removed: date | None = None
     source_url: str = ""
@@ -55,6 +58,8 @@ class Provenance(BaseModel):
             f"md5={self.md5}",
             f"converter={self.converter}",
         ]
+        if self.source_format:
+            lines.append(f"source_format={self.source_format}")
         if self.quality:
             lines.append(f"quality={self.quality}")
         if self.source_removed is not None:
@@ -102,6 +107,7 @@ def parse(note: str | None) -> Provenance | None:
         source_md5=fields["source_md5"],
         md5=fields["md5"],
         converter=fields["converter"],
+        source_format=fields.get("source_format", ""),
         quality=fields.get("quality", ""),
         source_removed=removed,
         source_url=fields.get("source_url", ""),

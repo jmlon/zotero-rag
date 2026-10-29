@@ -32,7 +32,7 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PyPdfError
 from pypdf.generic import DictionaryObject
 
-from zotero_rag import __version__, html_text
+from zotero_rag import __version__, html_text, pdf_text
 from zotero_rag.documents import DocumentFormat
 from zotero_rag.errors import ZoteroRagError
 
@@ -45,6 +45,9 @@ ANYDOC_FORMATS = frozenset(
     {"pdf", "docx", "odt", "epub", "doc", "rtf", "ppt", "pptx", "xlsx", "ods", "odp"}
 )
 PAGE_MARKER = "<!-- page {number} -->"
+# A refused page with at least this many words in its text layer is not a scan or
+# a blank, so its text layer stands in for the transcript of that page.
+FALLBACK_MIN_WORDS = 20
 
 _BLANK_LINES = re.compile(r"\n{3,}")
 
@@ -97,6 +100,8 @@ class Converted(BaseModel):
     needs_ocr: list[int] = Field(default_factory=list)
     # Pages read by the hosted OCR service rather than locally.
     ocr_pages: list[int] = Field(default_factory=list)
+    # Pages anydoc refused whose plain text layer was used instead.
+    text_layer_pages: list[int] = Field(default_factory=list)
     # Images the PDF draws. Markdown keeps none of them; reported, never judged.
     images: int = 0
     warnings: list[str] = Field(default_factory=list)
@@ -158,6 +163,8 @@ def transcript(
         fields["empty_pages"] = converted.empty_pages
     if converted.ocr_pages:
         fields["ocr_pages"] = converted.ocr_pages
+    if converted.text_layer_pages:
+        fields["text_layer_pages"] = converted.text_layer_pages
     header = yaml.safe_dump(fields, sort_keys=False, allow_unicode=True, width=1000)
     return f"---\n{header}---\n\n{converted.markdown}"
 
@@ -185,15 +192,25 @@ def normalise(markdown: str) -> str:
     return f"{text}\n" if text else ""
 
 
+#: Bumped whenever this module's output changes for the same input, so that
+#: `convert --reconvert` can find and redo transcripts made before the change.
+#: 2: a PDF page anydoc refuses falls back to its text layer instead of a hole.
+REVISION = 2
+
+
 @functools.cache
 def converter_name(source_format: str) -> str:
-    """What produced a transcript, recorded in its provenance."""
+    """What produced a transcript, recorded in its provenance.
+
+    The library version alone is not enough: the same anydoc can be driven
+    differently, and a transcript made the old way must look outdated.
+    """
     if source_format == DocumentFormat.HTML:
-        return f"zotero-rag {__version__}"
+        return f"zotero-rag {__version__} r{REVISION}"
     try:
-        return f"anydoc {version('firecrawl-anydoc')}"
+        return f"anydoc {version('firecrawl-anydoc')} r{REVISION}"
     except PackageNotFoundError:
-        return "anydoc"
+        return f"anydoc r{REVISION}"
 
 
 # --- PDF ------------------------------------------------------------------------
@@ -205,6 +222,7 @@ def _convert_pdf(path: Path, ocr: OcrMode, api_key: str) -> Converted:
     texts: dict[int, str] = {}
     scans: dict[int, bytes] = {}
     empty: list[int] = []
+    text_layer: list[int] = []
     warnings: list[str] = []
     images = 0
 
@@ -219,16 +237,22 @@ def _convert_pdf(path: Path, ocr: OcrMode, api_key: str) -> Converted:
             continue
         try:
             text = anydoc.to_markdown_bytes(data, "pdf")
-        except anydoc.NeedsOcrError:
-            # anydoc says the same of a blank page as of a scan; only a page with
-            # images can hold text OCR would find, and only those may be uploaded.
-            # An unreadable resource tree (-1) might hide a scan, so it counts too.
-            if page_images != 0:
-                scans[number] = data
-            empty.append(number)
-            continue
         except anydoc.ConvertError as exc:
-            warnings.append(f"page {number}: {type(exc).__name__}: {exc}")
+            # anydoc refuses some pages that have text: vector figures can read to
+            # it as a scan. Their own text layer, plain as it is, beats a hole.
+            fallback = pdf_text.text_layer(page)
+            if pdf_text.word_count(fallback) >= FALLBACK_MIN_WORDS:
+                texts[number] = fallback
+                text_layer.append(number)
+                continue
+            if isinstance(exc, anydoc.NeedsOcrError):
+                # anydoc says the same of a blank page as of a scan; only a page
+                # with images can hold text OCR would find, and only those may be
+                # uploaded. An unreadable resource tree (-1) might hide a scan.
+                if page_images != 0:
+                    scans[number] = data
+            else:
+                warnings.append(f"page {number}: {type(exc).__name__}: {exc}")
             empty.append(number)
             continue
         if text.strip():
@@ -260,6 +284,7 @@ def _convert_pdf(path: Path, ocr: OcrMode, api_key: str) -> Converted:
         empty_pages=sorted(empty),
         needs_ocr=needs_ocr,
         ocr_pages=ocr_pages,
+        text_layer_pages=text_layer,
         images=images,
         warnings=warnings,
     )

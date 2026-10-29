@@ -134,7 +134,7 @@ def test_the_transcript_is_cached_for_index_and_staging_is_cleaned(tmp_path: Pat
     result, _ = run([create()], {"PDFKEY01": paper_pdf()}, tmp_path)
 
     key = result.results[0].transcript_key
-    cached = tmp_path / "cache" / f"{key}.txt"
+    cached = tmp_path / "cache" / f"{key}.md"
     text = cached.read_text()
     assert text.startswith("---\ntitle: A Paper\n")
     assert "<!-- page 1 -->" in text
@@ -481,7 +481,10 @@ def test_an_up_to_date_library_needs_nothing(
 ) -> None:
     items = _items("PDFKEY01")
     note = Provenance(
-        source="PDFKEY01", source_md5="a" * 32, md5="c" * 32, converter="anydoc 0.2.4"
+        source="PDFKEY01",
+        source_md5="a" * 32,
+        md5="c" * 32,
+        converter=markdown.converter_name("pdf"),
     ).to_note()
     items.append(
         {
@@ -498,7 +501,6 @@ def test_an_up_to_date_library_needs_nothing(
             },
         }
     )
-    monkeypatch.setattr("zotero_rag.conversion.converter_name", lambda fmt: "anydoc 0.2.4")
     _library(monkeypatch, items)
 
     result = runner.invoke(cli.app, ["convert", "--yes", "--report", "r.json"])

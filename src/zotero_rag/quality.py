@@ -35,8 +35,11 @@ _HYPHEN_BREAK = re.compile(r"(\w)-\s*\n\s*(\w)")
 _CID = re.compile(r"\(cid:\d+\)")
 # A "word" this long is several words that lost their spaces.
 _GLUED_LETTERS = 20
-# Real one-letter words (English, Spanish); any other lone letter is debris.
-_SINGLE_LETTER_WORDS = frozenset({"a", "i", "o", "y", "e"})
+# Letters spread out by bad glyph spacing come in runs and spell words; notation
+# stands alone or strings consonants together. Words run 35–45% vowels.
+_MIN_SPREAD_RUN = 3
+_MIN_SPREAD_VOWELS = 0.25
+_VOWELS = frozenset("aeiouáéíóú")
 
 
 class QualityVerdict(StrEnum):
@@ -205,11 +208,31 @@ def _letter_ratio(text: str) -> float:
 
 
 def _broken_spacing(flat: str) -> float:
+    """Share of letters spread out as words: "t h e  r e s u l t s".
+
+    Two things set damage apart from notation. Spread-out text comes in runs, so
+    only runs of three or more letters count; and it spells words, which carry
+    vowels, where a run of variables — `h r t`, `d d r r k` in a complexity table
+    — is almost all consonants. Phase 0's math-heavy survey and a paper with
+    letter-spaced code listings are separated by exactly these two rules.
+    """
     tokens = [token for token in flat.split() if token.isalpha()]
     if not tokens:
         return 0.0
-    singles = sum(1 for token in tokens if len(token) == 1 and token not in _SINGLE_LETTER_WORDS)
-    return singles / len(tokens)
+    spread = 0
+    run: list[str] = []
+    for token in [*tokens, "end"]:
+        if len(token) == 1:
+            run.append(token)
+            continue
+        if len(run) >= _MIN_SPREAD_RUN and _vowel_share(run) >= _MIN_SPREAD_VOWELS:
+            spread += len(run)
+        run = []
+    return spread / len(tokens)
+
+
+def _vowel_share(letters: list[str]) -> float:
+    return sum(letter in _VOWELS for letter in letters) / len(letters)
 
 
 def _pages(numbers: Sequence[int]) -> str:

@@ -20,7 +20,7 @@ from zotero_rag.chunking import chunk_segments
 from zotero_rag.embedding import count_tokens
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.extraction import extract_note, extract_segments
-from zotero_rag.planning import IndexPlan, PlannedAttachment
+from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason
 from zotero_rag.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
@@ -246,6 +246,29 @@ def prune_orphans(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
     if orphans:
         logger.info("pruned %d attachment(s), %d chunk(s)", len(orphans), chunks)
     return len(orphans), chunks
+
+
+def drop_replaced_copies(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
+    """Delete chunks of a document's copy that its other copy now replaces.
+
+    When the preference switches a converted document from its PDF to its
+    transcript (or back), the old copy's chunks would sit beside the new ones and
+    the same passage would be retrieved twice. Unlike `--prune` this loses nothing:
+    a copy is dropped only once the copy replacing it is in the store, so a run in
+    which the transcript failed to index keeps the PDF's chunks.
+
+    Returns (attachments removed, chunks removed).
+    """
+    stored = store.attachment_keys()
+    replaced = {
+        entry.key
+        for entry in plan.skipped_for(SkipReason.SAME_DOCUMENT)
+        if entry.key in stored and entry.replaced_by in stored
+    }
+    chunks = sum(store.delete_by_attachment(key) for key in replaced)
+    if replaced:
+        logger.info("dropped %d replaced copy(ies), %d chunk(s)", len(replaced), chunks)
+    return len(replaced), chunks
 
 
 def refresh_collection_keys(store: VectorStore, plan: IndexPlan) -> int:

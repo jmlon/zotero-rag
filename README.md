@@ -161,7 +161,9 @@ has moved between subcollections, the run updates that record without re-embeddi
 | Saved web page (snapshot) | sections, split at headings | `§ Methods` |
 | Word (`.docx`), OpenDocument (`.odt`) | sections, split at headings | `§ Results` |
 | EPUB | chapters, in spine order | `§ Chapter Two` |
-| Plain text, Markdown, CSV | Markdown headings, else the whole file | `§ Title` |
+| Markdown transcript made by `convert` | pages, as marked from the PDF | `p. 4` |
+| Other Markdown | sections, split at headings | `§ Title` |
+| Plain text, CSV | Markdown headings, else the whole file | `§ Title` |
 | Zotero note | the note | `note` |
 
 When an item has **several** readable attachments — very often a published PDF
@@ -214,6 +216,7 @@ up by the next `index` without re-embedding anything.
 ```bash
 zotero-rag convert --dry-run   # what would be converted, and why
 zotero-rag convert             # attach a Markdown transcript to each paper
+zotero-rag convert --reconvert
 ```
 
 `convert` turns the attachment `index` would read — a PDF, Word or OpenDocument
@@ -238,9 +241,27 @@ about what it touches:
   file: missing pages, lost spaces between words, or garbled characters are
   reported. A transcript that fails is still attached, since it is still useful,
   but the run lists it.
+- **When anydoc refuses a page** that has a text layer (vector figures can
+  look like a scan to it), that page's plain text is used instead, and the
+  front matter lists it as a `text_layer_pages` entry.
+- **After upgrading**, `convert --reconvert` regenerates transcripts made by an
+  older converter; a plain run lists how many there are.
 - **Scanned pages** have no text to convert. They are reported; `--ocr hosted`
   sends *just those pages* to [Firecrawl Parse](https://firecrawl.dev) for OCR,
   after asking you (set `FIRECRAWL_API_KEY` for higher limits).
+
+**Indexing the transcripts.** A transcript and the file it came from are the
+same document, so `index` reads only one of them: by default the original. To
+index transcripts instead, put `markdown` first in `attachment_preference`:
+
+```yaml
+index:
+  attachment_preference: [markdown, pdf, docx, odt, epub, html, txt]
+```
+
+The next `index` run embeds the transcripts and drops the old copies' chunks, so
+no passage is retrieved twice. Citations still read `p. 4`: the transcript keeps
+the PDF's page numbers.
 
 `--limit N` and `--only-item KEY` try it on a few papers first; `--report run.csv`
 (or `.json`) writes a row per paper with its state, outcome and quality verdict.
@@ -442,7 +463,7 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `retrieval` | `hybrid` | `vector` (embeddings only) or `hybrid` (also BM25 keyword search) |
 | `reranker` | `null` | `cohere` re-scores retrieved passages against the question (needs `COHERE_API_KEY`) |
 | `reranker_fanout` | `4` | candidates retrieved per final passage, for the reranker to choose from |
-| `attachment_preference` | `[pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several |
+| `attachment_preference` | `[pdf, docx, odt, epub, html, markdown, txt]` | which attachment wins when an item has several; also whether a converted paper is indexed from its source or its transcript |
 | `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
 | `index_notes` | `true` | index your Zotero notes alongside each item's file |
 | `chunk_size` / `chunk_overlap` | `1000` / `200` | characters per chunk, and overlap between them |

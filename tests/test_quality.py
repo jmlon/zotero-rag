@@ -123,7 +123,7 @@ def test_cid_codes_and_replacement_characters_fail() -> None:
 
 def test_letters_spread_out_by_spaces_fail() -> None:
     source = pages()
-    spaced = as_markdown(source) + "\n\n" + " ".join("t h e r s u l t s" for _ in range(40))
+    spaced = as_markdown(source) + "\n\n" + " ".join("t h e r e s u l t s" for _ in range(40))
 
     report = assess(spaced, source, THRESHOLDS)
 
@@ -252,3 +252,23 @@ def test_thresholds_can_be_overridden_in_config() -> None:
 def test_a_threshold_outside_zero_to_one_is_rejected() -> None:
     with pytest.raises(ValueError):
         QualityThresholds(min_recall=1.5)
+
+
+def test_math_notation_is_not_broken_spacing() -> None:
+    # Phase 6 finding: a knowledge-graph survey's (h, r, t) triples and its
+    # complexity tables (O(d), O(r k)) read as runs of lone consonants.
+    source = pages()
+    notation = " ".join("h r t d d r r k k where the triple holds" for _ in range(60))
+
+    report = assess(as_markdown(source) + "\n\n" + notation, source, THRESHOLDS)
+
+    assert report.broken_spacing == 0.0
+
+
+def test_isolated_letters_are_not_broken_spacing() -> None:
+    source = pages()
+    prose = " ".join("let x be the head and y the tail" for _ in range(60))
+
+    report = assess(as_markdown(source) + "\n\n" + prose, source, THRESHOLDS)
+
+    assert report.broken_spacing == 0.0
