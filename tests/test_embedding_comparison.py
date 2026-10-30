@@ -13,11 +13,12 @@ from pathlib import Path
 
 import pytest
 from langchain_core.messages import AIMessage
+from langchain_openai import ChatOpenAI
 from typer.testing import CliRunner
 
-from zotero_rag import cli
+from zotero_rag import cli, evaluation
 from zotero_rag.config import Config, EmbeddingModelSpec, EmbeddingPricing, load_config
-from zotero_rag.embedding import DEFAULT_BATCH_SIZE, build_embeddings
+from zotero_rag.embedding import DEFAULT_BATCH_SIZE, MAX_RETRIES, build_embeddings
 from zotero_rag.embedding_comparison import (
     chunkings,
     context_warning,
@@ -26,9 +27,10 @@ from zotero_rag.embedding_comparison import (
     scaled_overlap,
     variant_config,
 )
-from zotero_rag.evaluation import JudgeVerdict, RawVerdict
+from zotero_rag.evaluation import JudgeVerdict, RawVerdict, build_verdict_fn
 from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.indexer import DIMENSION_PROBE
+from zotero_rag.llm import build_chat
 from zotero_rag.vectorstore import VectorStore
 
 runner = CliRunner()
@@ -480,3 +482,123 @@ def test_embedding_requests_are_batched_below_provider_limits(
 
     config.embedding_models = [EmbeddingModelSpec(id="google/gemini-embedding-001", batch_size=16)]
     assert build_embeddings(config).chunk_size == 16
+
+
+def test_a_rate_limited_model_is_named_and_its_gaps_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    _index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+
+    class RateLimited:
+        def embed_documents(self, texts: list[str]) -> list[list[float]]:
+            if texts == [DIMENSION_PROBE]:
+                return [[1.0, 0.0, 0.5]]
+            raise RuntimeError("Error code: 429 - Rate limit exceeded")
+
+        def embed_query(self, text: str) -> list[float]:
+            return [1.0, 0.0, 0.5]
+
+    monkeypatch.setattr(cli, "build_embeddings", lambda config: RateLimited())
+
+    result = runner.invoke(cli.app, ["compare-embeddings", "--model", "cheap/model", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert any(
+        "with cheap/model" in record.getMessage() and "429" in record.getMessage()
+        for record in caplog.records
+    )
+    assert "Built cheap/model @ 1000/200 with gaps" in result.output
+    assert "1 attachment failed" in result.output
+    assert "Run again to retry them" in result.output
+
+
+def test_embedding_requests_retry_a_rate_limit_for_longer() -> None:
+    config = Config()
+    config.global_.api_key = "test-key"
+    assert build_embeddings(config).max_retries == MAX_RETRIES > 2
+
+
+# --- concurrent scoring -------------------------------------------------------
+
+
+def test_variants_are_scored_at_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _index_folder(tmp_path)
+    _two_models(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+    # The baseline and both variants must be answering at once to get past this.
+    together = threading.Barrier(3, timeout=5)
+    threads: set[str] = set()
+
+    class Chat:
+        def invoke(self, messages: object) -> AIMessage:
+            threads.add(threading.current_thread().name)
+            together.wait()
+            return AIMessage(content="It sits between the edge and the cloud [1].")
+
+    monkeypatch.setattr(cli, "build_chat", lambda config: Chat())
+
+    result = runner.invoke(cli.app, ["compare-embeddings", "--yes", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert len(threads) == 3
+    assert all(name.startswith("score") for name in threads)
+    variants = json.loads(result.stdout)["variants"]
+    # Rows keep the planned order, baseline first, whichever finished first.
+    assert [v["embedding_model"] for v in variants][1:] == ["cheap/model", "other/model"]
+    assert variants[0]["baseline"]
+    assert all(v["aggregate"]["questions"] == 1 for v in variants)
+
+
+def test_eval_workers_caps_the_requests_in_flight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_folder(tmp_path)
+    _two_models(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+    active = 0
+    most_active = 0
+    lock = threading.Lock()
+
+    class Chat:
+        def invoke(self, messages: object) -> AIMessage:
+            nonlocal active, most_active
+            with lock:
+                active += 1
+                most_active = max(most_active, active)
+            time.sleep(0.05)
+            with lock:
+                active -= 1
+            return AIMessage(content="It sits between the edge and the cloud [1].")
+
+    monkeypatch.setattr(cli, "build_chat", lambda config: Chat())
+
+    result = runner.invoke(
+        cli.app, ["compare-embeddings", "--eval-workers", "2", "--yes", "--json"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert most_active == 2
+    assert len(json.loads(result.stdout)["variants"]) == 3
+
+
+def test_answering_and_grading_retry_a_rate_limit_for_longer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config()
+    config.global_.api_key = "test-key"
+    assert build_chat(config).max_retries == MAX_RETRIES
+
+    judges: list[ChatOpenAI] = []
+    real = evaluation.ChatOpenAI
+
+    def judge(**kwargs: object) -> ChatOpenAI:
+        judges.append(real(**kwargs))  # type: ignore[arg-type]
+        return judges[-1]
+
+    monkeypatch.setattr(evaluation, "ChatOpenAI", judge)
+    build_verdict_fn(config)
+    assert [j.max_retries for j in judges] == [MAX_RETRIES]

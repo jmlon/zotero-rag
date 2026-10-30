@@ -113,6 +113,9 @@ def index_plan(
     warning, recorded in `stats.failures`, and the pass continues.
     """
     stats = IndexStats(planned=len(plan.attachments))
+    # Named in each warning: `compare-embeddings` builds several models at once,
+    # and a rate limit is only actionable if you know whose it was.
+    embedding_with = f" with {embedding_model}" if embedding_model else ""
 
     with _timed(stats):
         for attachment in plan.attachments:
@@ -150,7 +153,7 @@ def index_plan(
                     stats.indexed -= 1
                     stats.reindexed += 1
             except ZoteroRagError as exc:
-                logger.warning("Skipping %r: %s", attachment.title, exc)
+                logger.warning("Skipping %r%s: %s", attachment.title, embedding_with, exc)
                 stats.failed += 1
                 stats.failures.append(
                     AttachmentFailure(
@@ -160,7 +163,9 @@ def index_plan(
                     )
                 )
             except Exception as exc:  # noqa: BLE001 - an unexpected error must not abort the run
-                logger.warning("Skipping %r: unexpected error: %s", attachment.title, exc)
+                logger.warning(
+                    "Skipping %r%s: unexpected error: %s", attachment.title, embedding_with, exc
+                )
                 stats.failed += 1
                 stats.failures.append(
                     AttachmentFailure(

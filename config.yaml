@@ -94,16 +94,6 @@ embedding_models:
       input: 0.06
     notes: "Excellent retrieval accuracy paired with an expansive 32k context size."
 
-  - id: "mistralai/mistral-embed-2312"
-    provider: "Mistral"
-    dimensions: 1024
-    context_window: 8192
-    pricing:
-      currency: "USD"
-      unit: "per_1M_tokens"
-      input: 0.10
-    notes: "Highly optimized semantic extraction model built by Mistral AI."
-
   - id: "google/gemini-embedding-001"
     provider: "Google"
     dimensions: 768

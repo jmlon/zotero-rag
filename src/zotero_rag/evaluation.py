@@ -35,6 +35,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr, computed_field
 
 from zotero_rag.config import Config
+from zotero_rag.embedding import MAX_RETRIES
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.llm import usage_from_message
 from zotero_rag.querying import QueryResult, Source
@@ -392,6 +393,7 @@ def _structured(config: Config, schema: type[BaseModel]) -> Any:
     chat = ChatOpenAI(
         model=config.judge_model,
         temperature=config.eval.judge_temperature,
+        max_retries=MAX_RETRIES,
         openai_api_base=config.global_.endpoint,
         openai_api_key=SecretStr(config.global_.api_key),
     )

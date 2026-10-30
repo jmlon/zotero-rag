@@ -450,6 +450,7 @@ zotero-rag compare-embeddings --model baai/bge-m3 --chunk-size 500 --chunk-size 
 zotero-rag compare-embeddings --model baai/bge-m3 --chunk-overlap 0 --chunk-overlap 300
 zotero-rag compare-embeddings --no-build                  # re-score the stores already built
 zotero-rag compare-embeddings --yes --json > models.json
+zotero-rag compare-embeddings --no-build --yes            # No rebuilding indexes, approve execution
 ```
 
 The configured model at the configured `chunk_size` and `chunk_overlap` is the
@@ -468,6 +469,12 @@ variants are built one after another, so no provider gets more than one request
 at a time from the run. `--workers N` caps how many models build at once (`1` is
 fully sequential). Ctrl-C stops the workers after the attachment in hand; what they
 wrote is kept, and the next run carries on from there.
+
+Scoring is parallel too: `--eval-workers N` (default 4) variants are answered and
+graded at once, each one question at a time. They all share the answering and
+grading models, so N is the most requests those models get at once; lower it if
+the LLM provider returns rate-limit errors. Chat, grading and embedding requests
+retry a rate limit with backoff for about 25 seconds before giving up.
 
 The candidates and their prices come from the `embedding_models` list in
 `config.yaml` (the packaged defaults ship one). `--model` also accepts a model

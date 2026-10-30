@@ -164,12 +164,6 @@ embedding_models:
       context_window: 32000
       pricing: { currency: USD, unit: per_1M_tokens, input: 0.06 }
       notes: Strong retrieval accuracy with a 32k context.
-    - id: mistralai/mistral-embed-2312
-      provider: Mistral
-      dimensions: 1024
-      context_window: 8192
-      pricing: { currency: USD, unit: per_1M_tokens, input: 0.10 }
-      notes: Mistral AI's embedding model.
     - id: google/gemini-embedding-001
       provider: Google
       dimensions: 768

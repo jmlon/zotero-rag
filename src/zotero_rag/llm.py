@@ -14,6 +14,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import SecretStr
 
 from zotero_rag.config import Config
+from zotero_rag.embedding import MAX_RETRIES
 from zotero_rag.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,9 @@ def build_chat(config: Config) -> ChatOpenAI:
     return ChatOpenAI(
         model=config.llm_model,
         temperature=config.index.temperature,
+        # Comparisons answer from several threads at once; ride out a 429 instead
+        # of losing the question to it.
+        max_retries=MAX_RETRIES,
         # Canonical field names; `base_url`/`api_key` are their aliases.
         openai_api_base=config.global_.endpoint,
         openai_api_key=SecretStr(config.global_.api_key),

@@ -25,6 +25,12 @@ _ENCODING = tiktoken.get_encoding("cl100k_base")
 #: in the `embedding_models` catalogue can set its own `batch_size`.
 DEFAULT_BATCH_SIZE = 100
 
+#: Retries of a failed request. The OpenAI client backs off exponentially and
+#: honours a provider's `Retry-After`, but LangChain's default of 2 gives up after
+#: about 1.5s, which a rate-limited provider (Mistral, the free tiers) outlasts.
+#: Six is roughly 25s of backoff before an attachment is skipped.
+MAX_RETRIES = 6
+
 
 def count_tokens(texts: list[str]) -> int:
     """Token count for a batch of texts, used for the `-v` usage report."""
@@ -39,6 +45,7 @@ def build_embeddings(config: Config) -> OpenAIEmbeddings:
         model=config.embedding_model,
         # LangChain's name for texts per request, not our characters per chunk.
         chunk_size=spec.batch_size if spec and spec.batch_size else DEFAULT_BATCH_SIZE,
+        max_retries=MAX_RETRIES,
         # Canonical field names; `base_url`/`api_key` are their aliases.
         openai_api_base=config.global_.endpoint,
         openai_api_key=SecretStr(config.global_.api_key),

@@ -11,6 +11,7 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, cast
 
@@ -1914,8 +1915,13 @@ def _print_comparison_plan(
             out.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
 
 
+#: Variants scored at once by `compare-embeddings`. They all call the same answering
+#: and grading models, so this bounds the requests in flight, not the variant count.
+DEFAULT_EVAL_WORKERS = 4
+
+
 class _Interrupted(Exception):
-    """Raised inside a build worker once the user has pressed Ctrl-C."""
+    """Raised inside a build or scoring worker once the user has pressed Ctrl-C."""
 
 
 def _build_variant(
@@ -1954,6 +1960,25 @@ def _build_variant(
     drop_replaced_copies(store, plan)
     prune_orphans(store, plan)
     return stats
+
+
+def _run_in_pool(
+    jobs: list[Callable[[], None]], workers: int, prefix: str, stop: threading.Event
+) -> None:
+    """Run `jobs` on at most `workers` threads, re-raising the first failure.
+
+    Ctrl-C reaches only the main thread, so it sets `stop` for the jobs to notice
+    at their next check, waits for them, and is raised again.
+    """
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(jobs)), thread_name_prefix=prefix)
+    try:
+        for future in [pool.submit(job) for job in jobs]:
+            future.result()
+    except KeyboardInterrupt:
+        stop.set()
+        raise
+    finally:
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 def _build_variants(
@@ -2039,20 +2064,14 @@ def _build_variants(
                     errors[variant.store_dir] = str(exc) or type(exc).__name__
                     progress.update(task, description=f"[red]{escape(variant.label)}: failed[/red]")
 
-        pool = ThreadPoolExecutor(
-            max_workers=min(workers or len(by_model), len(by_model)),
-            thread_name_prefix="embed",
+        # On Ctrl-C workers finish the attachment in hand, then stop; the stores
+        # keep what was written, and the next run picks up from there.
+        _run_in_pool(
+            [partial(run_model, variants) for variants in by_model.values()],
+            workers or len(by_model),
+            "embed",
+            stop,
         )
-        try:
-            for future in [pool.submit(run_model, variants) for variants in by_model.values()]:
-                future.result()
-        except KeyboardInterrupt:
-            # Workers finish the attachment in hand, then stop; the stores keep
-            # what was written, and the next run picks up from there.
-            stop.set()
-            raise
-        finally:
-            pool.shutdown(wait=True, cancel_futures=True)
 
     for variant in to_build:
         if variant.store_dir in errors:
@@ -2060,7 +2079,14 @@ def _build_variants(
                 f"[yellow]Warning:[/yellow] could not build {escape(variant.label)}: "
                 f"{escape(errors[variant.store_dir])}"
             )
-        elif (stats := built.get(variant.store_dir)) is not None and stats.chunks:
+        elif (stats := built.get(variant.store_dir)) is not None and stats.failed:
+            err_console.print(
+                f"[yellow]Built {escape(variant.label)} with gaps:[/yellow] "
+                f"{_plural(stats.chunks, 'new chunk')}, but "
+                f"{_plural(stats.failed, 'attachment')} failed "
+                f"({escape(stats.failures[0].error[:80])}). Run again to retry them."
+            )
+        elif stats is not None and stats.chunks:
             err_console.print(
                 f"Built [bold]{escape(variant.label)}[/bold]: "
                 f"{_plural(stats.chunks, 'new chunk')} in {stats.elapsed_s:.0f}s."
@@ -2071,12 +2097,16 @@ def _build_variants(
 def _evaluate_variant(
     variant: Variant,
     config: Config,
-    baseline_store: VectorStore,
+    store: VectorStore | None,
     stats: IndexStats | None,
     build_error: str,
     evaluate_with: Callable[[VectorStore, Config], list[QuestionOutcome]],
 ) -> VariantResult:
-    """Score one variant. Any failure is recorded on its row, never raised."""
+    """Score one variant. Any failure is recorded on its row, never raised.
+
+    `store` is opened by the caller, on the main thread, and is `None` when the
+    variant has nothing stored to score.
+    """
     spec = config.embedding_model_spec(variant.embedding_model)
     result = VariantResult(
         embedding_model=variant.embedding_model,
@@ -2089,7 +2119,7 @@ def _evaluate_variant(
         built_chunks=stats.chunks if stats else 0,
         build_failures=stats.failed if stats else 0,
     )
-    if not variant.baseline and not _stored_chunks(variant.store_dir):
+    if store is None:
         result.error = (
             f"could not build: {build_error}"
             if build_error
@@ -2097,7 +2127,6 @@ def _evaluate_variant(
         )
         return result
 
-    store = baseline_store if variant.baseline else VectorStore(variant.store_dir)
     result.store_chunks = store.count()
     result.embedding_dim = store.derived_dimension()
     result.index_tokens = stored_tokens(store)
@@ -2256,6 +2285,15 @@ def compare_embeddings_command(
             min=1,
         ),
     ] = None,
+    eval_workers: Annotated[
+        int,
+        typer.Option(
+            "--eval-workers",
+            help="Variants scored at once. Every one calls the same answering and grading "
+            "models, so this caps the requests they get at a time; 1 scores in turn.",
+            min=1,
+        ),
+    ] = DEFAULT_EVAL_WORKERS,
     dry_run: Annotated[
         bool,
         typer.Option("--dry-run", help="Show the variants and the cost; build and run nothing."),
@@ -2325,7 +2363,17 @@ def compare_embeddings_command(
         def ask(messages: list[BaseMessage]) -> AIMessage:
             return cast(AIMessage, chat.invoke(messages))
 
-        results: list[VariantResult] = []
+        # Opened here rather than on the workers: chromadb fills its client cache
+        # without a lock.
+        stores = {
+            variant.store_dir: baseline_store
+            if variant.baseline
+            else VectorStore(variant.store_dir)
+            for variant in variants
+            if variant.baseline or _stored_chunks(variant.store_dir)
+        }
+        results: list[VariantResult | None] = [None] * len(variants)
+        stop = threading.Event()
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -2334,13 +2382,18 @@ def compare_embeddings_command(
             console=err_console,
             transient=True,
         ) as progress:
-            task = progress.add_task("Evaluating...", total=len(variants) * len(questions))
+            tasks = [
+                progress.add_task(escape(variant.label), total=len(questions), start=False)
+                for variant in variants
+            ]
 
-            for variant in variants:
+            def score(position: int) -> None:
+                if stop.is_set():
+                    return
+                variant, task = variants[position], tasks[position]
+                progress.start_task(task)
 
-                def evaluate_with(
-                    store: VectorStore, settings: Config, variant: Variant = variant
-                ) -> list[QuestionOutcome]:
+                def evaluate_with(store: VectorStore, settings: Config) -> list[QuestionOutcome]:
                     embeddings = build_embeddings(settings)
                     keyword_index = build_keyword_index(store, mode)
 
@@ -2359,26 +2412,36 @@ def compare_embeddings_command(
                         )
 
                     def on_start(question: EvalQuestion) -> None:
-                        progress.update(
-                            task,
-                            advance=1,
-                            description=escape(f"{variant.label}: {question.question}"[:60]),
-                        )
+                        if stop.is_set():
+                            raise _Interrupted
+                        progress.advance(task)
 
                     return evaluate(questions, answer_one, verdict_of, None, on_start)
 
                 result = _evaluate_variant(
                     variant,
                     config,
-                    baseline_store,
+                    stores.get(variant.store_dir),
                     built.get(variant.store_dir),
                     build_errors.get(variant.store_dir, ""),
                     evaluate_with,
                 )
-                # A variant that never ran still owes the bar its questions.
                 if result.aggregate is None:
-                    progress.update(task, advance=len(questions))
-                results.append(result)
+                    progress.update(
+                        task,
+                        completed=len(questions),
+                        description=f"[red]{escape(variant.label)}: failed[/red]",
+                    )
+                results[position] = result
+
+            # Each worker answers and grades one question at a time, so the LLM
+            # sees at most `eval_workers` requests at once, whatever the variants.
+            _run_in_pool(
+                [partial(score, position) for position in range(len(variants))],
+                eval_workers,
+                "score",
+                stop,
+            )
 
         report = ComparisonReport(
             settings=ComparisonSettings(
@@ -2393,7 +2456,7 @@ def compare_embeddings_command(
                 questions_file=str(questions_path),
                 questions=len(questions),
             ),
-            variants=results,
+            variants=[result for result in results if result is not None],
         )
     except ZoteroRagError as exc:
         _fail(exc)
