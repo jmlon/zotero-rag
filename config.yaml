@@ -14,6 +14,7 @@ global:
         embedding_model: openai/text-embedding-3-small
         vector_db: chroma
         reranker: null
+        judge_model: null # null => grade with llm_model
 
 index:
     # Pinned by the first `index` run; null in a freshly initialized folder.

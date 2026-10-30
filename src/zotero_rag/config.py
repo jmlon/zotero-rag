@@ -62,6 +62,9 @@ class Defaults(BaseModel):
     embedding_model: str = "openai/text-embedding-3-small"
     vector_db: str = "chroma"
     reranker: RerankerName = None
+    #: The model that grades `eval` answers. null => the answering model; a
+    #: different one avoids a model grading its own answers.
+    judge_model: str | None = None
 
 
 class GlobalConfig(BaseModel):
@@ -333,8 +336,8 @@ class Config(BaseModel):
 
     @property
     def judge_model(self) -> str:
-        """The grading model: the configured one, else whatever answers."""
-        return self.eval.judge_model or self.llm_model
+        """The grading model: this folder's, else the global default, else whatever answers."""
+        return self.eval.judge_model or self.global_.defaults.judge_model or self.llm_model
 
     @property
     def generator_model(self) -> str:

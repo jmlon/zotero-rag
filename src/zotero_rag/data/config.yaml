@@ -19,6 +19,11 @@ global:
         # null | an OpenRouter reranker id | cohere. Inherited by the index unless
         # it sets its own.
         reranker: null
+        # The model that grades `eval` and `compare-embeddings` answers. null =>
+        # the answering model (llm_model). A different model, ideally from another
+        # provider, avoids a model grading its own answers. eval.judge_model below
+        # overrides it for one index folder.
+        judge_model: null
 
 index:
     # Pinned by the first `index` run; null in a freshly initialized folder.
@@ -88,8 +93,8 @@ eval:
     # Golden set for `zotero-rag eval`: questions, expected points, and the items
     # a correct answer should cite. Relative paths resolve inside this folder.
     questions_file: questions.yaml
-    # null => grade with the same model that answers. Point a stronger model at
-    # the grading if you want a second opinion on a cheap answering model.
+    # null => inherit global.defaults.judge_model, and failing that grade with the
+    # model that answers.
     judge_model: null
     # Keep this at 0. It does not make the judge fully deterministic — repeat runs
     # reproduce the grades but can move point coverage by a few points — so treat a

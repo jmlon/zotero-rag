@@ -632,3 +632,78 @@ def test_answering_and_grading_retry_a_rate_limit_for_longer(
     monkeypatch.setattr(evaluation, "ChatOpenAI", judge)
     build_verdict_fn(config)
     assert [j.max_retries for j in judges] == [MAX_RETRIES]
+
+
+# --- the report -----------------------------------------------------------------
+
+
+def test_the_table_names_the_retrieval_settings_and_drops_the_store_columns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+
+    result = runner.invoke(
+        cli.app,
+        ["compare-embeddings", "--model", "cheap/model", "--chunk-overlap", "100", "--yes"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "top_k 3 · window 0 · hybrid retrieval · no reranker" in result.output
+    assert "Chunks" not in result.output and "Index tok" not in result.output
+    # The counts the columns showed are one line per chunking when its stores agree.
+    assert "Every 1000/100 store holds 1 chunk" in result.output
+    assert "different documents" not in result.output
+
+
+def test_stores_holding_different_documents_are_flagged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+    # A stale baseline: one more chunk than the collection now gives a fresh store.
+    VectorStore(tmp_path / "chroma").add(
+        ids=["OLD:1:0"],
+        embeddings=[[1.0, 0.0, 0.5]],
+        documents=["A paper since removed from the collection."],
+        metadatas=[{"attachment_key": "OLD", "item_key": "OLD", "page": 1}],
+    )
+
+    result = runner.invoke(cli.app, ["compare-embeddings", "--model", "cheap/model", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert "stores hold different documents" in result.output
+    assert "not comparable" in result.output
+
+
+def test_every_run_is_saved_under_reports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+
+    shown = runner.invoke(cli.app, ["compare-embeddings", "--model", "cheap/model", "--yes"])
+    as_json = runner.invoke(
+        cli.app, ["compare-embeddings", "--model", "cheap/model", "--yes", "--json"]
+    )
+
+    assert shown.exit_code == as_json.exit_code == 0
+    assert "Saved to reports/compare-embeddings-" in shown.output
+    texts = sorted((tmp_path / "reports").glob("compare-embeddings-*.txt"))
+    jsons = sorted((tmp_path / "reports").glob("compare-embeddings-*.json"))
+    assert texts and jsons
+    table = texts[0].read_text(encoding="utf-8")
+    assert "cheap/model" in table and "top_k 3" in table
+    assert "\x1b[" not in table  # plain text, no colour codes
+    saved = json.loads(jsons[-1].read_text(encoding="utf-8"))
+    assert [v["embedding_model"] for v in saved["variants"]][1:] == ["cheap/model"]
+
+
+def test_the_judge_defaults_globally_and_a_folder_can_override_it() -> None:
+    config = Config()
+    assert config.judge_model == config.llm_model
+    config.global_.defaults.judge_model = "anthropic/claude-sonnet-5-5"
+    assert config.judge_model == "anthropic/claude-sonnet-5-5"
+    config.eval.judge_model = "google/gemini-3-pro"
+    assert config.judge_model == "google/gemini-3-pro"

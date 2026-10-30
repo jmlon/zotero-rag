@@ -8,9 +8,10 @@ import logging
 import os
 import shutil
 import threading
+from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
-from datetime import date
+from datetime import date, datetime
 from functools import partial
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -1862,6 +1863,7 @@ def _print_comparison_plan(
     to_build: list[Variant],
     corpus_tokens: int,
     questions: int,
+    retrieval: str,
 ) -> None:
     """What would be built and evaluated, and what building would cost."""
     index_dir = config.source_dir or Path.cwd()
@@ -1909,12 +1911,15 @@ def _print_comparison_plan(
         f"est. {_money(estimated_total)} in total); "
         f"{_plural(len(variants), 'variant')} × {_plural(questions, 'question')} = "
         f"{len(variants) * questions} answers by {escape(config.llm_model)}, each graded "
-        f"by {escape(config.judge_model)}."
+        f"by {escape(config.judge_model)}; {escape(retrieval)}."
     )
     for variant in variants:
         if warning := context_warning(config, variant):
             out.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
 
+
+#: Where `compare-embeddings` keeps a copy of every table it prints, in the index folder.
+REPORTS_DIRNAME = "reports"
 
 #: Variants scored at once by `compare-embeddings`. They all call the same answering
 #: and grading models, so this bounds the requests in flight, not the variant count.
@@ -2144,15 +2149,28 @@ def _evaluate_variant(
     return result
 
 
+def _retrieval_summary(top_k: int, window: int, retrieval: str, reranker: str | None) -> str:
+    """`top_k 10 · window 0 · hybrid retrieval · no reranker`: what every row shares."""
+    reranking = f"reranked by {reranker}" if reranker else "no reranker"
+    return f"top_k {top_k} · window {window} · {retrieval} retrieval · {reranking}"
+
+
+def _settings_summary(settings: ComparisonSettings) -> str:
+    return _retrieval_summary(
+        settings.top_k, settings.retrieval_window, settings.retrieval, settings.reranker
+    )
+
+
 def _comparison_table(report: ComparisonReport) -> Table:
     """One row per variant: what it scored and what it cost."""
-    table = Table(title="Embedding comparison", title_justify="left")
+    table = Table(
+        title=f"Embedding comparison · {escape(_settings_summary(report.settings))}",
+        title_justify="left",
+    )
     table.add_column("Embedding model", overflow="fold")
     table.add_column("Chunk", justify="right")
     table.add_column("Overlap", justify="right")
     table.add_column("Dim", justify="right", style="dim")
-    table.add_column("Chunks", justify="right", style="dim")
-    table.add_column("Index tok", justify="right")
     table.add_column("Index $", justify="right")
     table.add_column("Score", justify="right")
     table.add_column("Hit", justify="right")
@@ -2173,7 +2191,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
                 name,
                 str(variant.chunk_size),
                 str(variant.chunk_overlap),
-                *["[dim]—[/dim]"] * 4,
+                *["[dim]—[/dim]"] * 2,
                 "[bold red]error[/bold red]",
                 *["[dim]—[/dim]"] * 5,
             )
@@ -2187,8 +2205,6 @@ def _comparison_table(report: ComparisonReport) -> Table:
             str(variant.chunk_size),
             str(variant.chunk_overlap),
             str(variant.embedding_dim or "—"),
-            str(variant.store_chunks),
-            str(variant.index_tokens),
             _money(variant.index_cost),
             score,
             _percent(summary.hit_rate),
@@ -2200,36 +2216,96 @@ def _comparison_table(report: ComparisonReport) -> Table:
     return table
 
 
-def _print_comparison(report: ComparisonReport) -> None:
-    console.print(_comparison_table(report))
+def _store_contents(report: ComparisonReport) -> list[str]:
+    """What each chunking's stores hold, or which ones disagree.
+
+    Stores of one chunking built from the same documents hold the same chunks, so
+    the counts are one line rather than two columns. When they differ, a store is
+    stale or missing documents, and its row is not comparable with the others.
+    """
+    by_chunking: dict[tuple[int, int], list[VariantResult]] = {}
+    for variant in report.variants:
+        if variant.store_chunks:
+            by_chunking.setdefault((variant.chunk_size, variant.chunk_overlap), []).append(variant)
+    lines: list[str] = []
+    for (size, overlap), variants in by_chunking.items():
+        held = Counter((v.store_chunks, v.index_tokens) for v in variants)
+        # Measured against the baseline when it is in this group, which is the row
+        # every other is read against; otherwise against the most common contents.
+        reference = next((v for v in variants if v.baseline), None)
+        if reference is not None:
+            chunks, tokens = reference.store_chunks, reference.index_tokens
+            holder = "the baseline holds"
+        else:
+            (chunks, tokens), _ = held.most_common(1)[0]
+            holder = "most hold"
+        if len(held) == 1:
+            lines.append(
+                f"[dim]Every {size}/{overlap} store holds {_plural(chunks, 'chunk')} "
+                f"({tokens:,} tokens).[/dim]"
+            )
+            continue
+        lines.append(
+            f"[yellow]The {size}/{overlap} stores hold different documents[/yellow]: "
+            f"{holder} {_plural(chunks, 'chunk')} ({tokens:,} tokens), but"
+        )
+        for v in variants:
+            if (v.store_chunks, v.index_tokens) != (chunks, tokens):
+                lines.append(
+                    f"  [yellow]{escape(v.label)}[/yellow] holds "
+                    f"{_plural(v.store_chunks, 'chunk')} ({v.index_tokens:,} tokens)"
+                )
+        lines.append(
+            "  Those scores are not comparable. Re-run `index` if the baseline is stale, or "
+            "delete a stale variant's store and compare again."
+        )
+    return lines
+
+
+def _print_comparison(report: ComparisonReport, out: Console) -> None:
+    out.print(_comparison_table(report))
+    for line in _store_contents(report):
+        out.print(line)
     for variant in report.variants:
         if variant.error:
-            console.print(f"  [red]{escape(variant.label)}:[/red] {escape(variant.error)}")
+            out.print(f"  [red]{escape(variant.label)}:[/red] {escape(variant.error)}")
         elif variant.build_failures:
-            console.print(
+            out.print(
                 f"  [yellow]{escape(variant.label)}:[/yellow] "
                 f"{_plural(variant.build_failures, 'attachment')} failed to embed, so this "
                 "store is missing documents the others hold."
             )
         if variant.aggregate is not None and variant.aggregate.errors:
-            console.print(
+            out.print(
                 f"  [magenta]{escape(variant.label)}: "
                 f"{_plural(variant.aggregate.errors, 'question')} could not be graded[/magenta]"
             )
 
     settings = report.settings
-    reranking = f" · reranked by {settings.reranker}" if settings.reranker else ""
-    windowing = f" ±{settings.retrieval_window}" if settings.retrieval_window else ""
-    console.print(
+    out.print(
         f"\n[dim]{_plural(settings.questions, 'question')} from {escape(settings.questions_file)}"
         f" · {escape(settings.llm_model)} answering, {escape(settings.judge_model)} grading · "
-        f"top_k {settings.top_k} · {settings.retrieval}{windowing} retrieval{reranking}[/dim]"
+        f"{escape(_settings_summary(settings))}[/dim]"
     )
-    console.print(
+    out.print(
         "[dim]Score is out of 5. Tokens are counted with OpenAI's cl100k tokenizer, so costs "
         "for other providers are estimates. Point coverage moves a few points between "
         "identical runs; treat a small difference as noise.[/dim]"
     )
+
+
+def _save_comparison(report: ComparisonReport, index_dir: Path) -> tuple[Path, Path]:
+    """Write the table and the full JSON to `reports/`, for comparing runs later."""
+    reports = index_dir / REPORTS_DIRNAME
+    reports.mkdir(exist_ok=True)
+    stem = f"compare-embeddings-{datetime.now():%Y%m%d-%H%M%S}"
+    text_path, json_path = reports / f"{stem}.txt", reports / f"{stem}.json"
+    with text_path.open("w", encoding="utf-8") as handle:
+        # Wide enough that no model id wraps, and plain: a report is read in an
+        # editor or a diff, where colour codes are noise.
+        _print_comparison(report, Console(file=handle, width=200, color_system=None))
+    json_path.write_text(report.model_dump_json(indent=2), encoding="utf-8")
+    return text_path, json_path
 
 
 @app.command("compare-embeddings")
@@ -2336,9 +2412,21 @@ def compare_embeddings_command(
         to_build = [] if no_build else [variant for variant in variants if not variant.baseline]
         chunks = {variant.store_dir: _stored_chunks(variant.store_dir) for variant in variants}
         corpus_tokens = stored_tokens(baseline_store)
+        chosen_top_k = top_k if top_k is not None else config.index.top_k
+        mode = retrieval if retrieval is not None else config.index.retrieval
+        window = config.index.retrieval_window
+        # Resolved before the prompt, so a bad reranker name fails before any work.
+        rerank, rerank_name = resolve_reranker(config, reranker)
 
         _print_comparison_plan(
-            out, config, variants, chunks, to_build, corpus_tokens, len(questions)
+            out,
+            config,
+            variants,
+            chunks,
+            to_build,
+            corpus_tokens,
+            len(questions),
+            _retrieval_summary(chosen_top_k, window, mode, rerank_name),
         )
         if dry_run:
             out.print("\n[dim]Dry run: nothing was embedded, answered, or graded.[/dim]")
@@ -2354,10 +2442,6 @@ def compare_embeddings_command(
             plan, _, _, _ = _fetch_plan(config, None, None, assume_yes, with_username=True)
             built, build_errors = _build_variants(plan, config, to_build, workers)
 
-        chosen_top_k = top_k if top_k is not None else config.index.top_k
-        mode = retrieval if retrieval is not None else config.index.retrieval
-        window = config.index.retrieval_window
-        rerank, rerank_name = resolve_reranker(config, reranker)
         chat = build_chat(config)
         verdict_of = build_verdict_fn(config)
 
@@ -2463,10 +2547,16 @@ def compare_embeddings_command(
         _fail(exc)
         return
 
+    index_dir = config.source_dir or Path.cwd()
+    text_path, json_path = _save_comparison(report, index_dir)
     if as_json:
         print(report.model_dump_json(indent=2))  # noqa: T201
-        return
-    _print_comparison(report)
+    else:
+        _print_comparison(report, console)
+    err_console.print(
+        f"[dim]Saved to {escape(str(text_path.relative_to(index_dir)))} "
+        f"and {escape(json_path.name)}.[/dim]"
+    )
 
 
 #: Above this many documents, generation is worth confirming: it is one LLM call

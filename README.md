@@ -479,12 +479,26 @@ retry a rate limit with backoff for about 25 seconds before giving up.
 
 The candidates and their prices come from the `embedding_models` list in
 `config.yaml` (the packaged defaults ship one). `--model` also accepts a model
-not on the list, which is compared without a price. The table shows each
-variant's score, retrieval hit, citation and point coverage beside its index tokens and
+not on the list, which is compared without a price. The table's title names the
+`top_k`, window, retrieval mode and reranker every row shares. It shows each
+variant's score, retrieval hit, citation and point coverage beside its index
 cost, plus the answering tokens per question, because at the same `top_k` larger
 chunks make every query more expensive. Tokens are counted with OpenAI's
 tokenizer, so costs for other providers are estimates. A model the provider
 doesn't serve fails on its row and the rest of the comparison carries on.
+
+Stores of the same chunking built from the same documents hold the same chunks, so
+the chunk and token counts are one line under the table. If a store disagrees
+(usually a baseline indexed before the collection changed) it is named, because its
+score was measured on different documents.
+
+Every run is also saved to `reports/compare-embeddings-<date>-<time>.txt` (the
+table as printed) and `.json` (every question's result), so runs can be compared
+later.
+
+Grade with a different model from the one answering, so no model marks its own
+work. Set `judge_model` once under `global.defaults` for every folder, or under
+`eval:` for one folder; left `null`, the answering model grades.
 
 ### What the measurements actually said
 
@@ -581,7 +595,7 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `llm_model` | `openai/gpt-4o-mini` | any OpenRouter chat model slug |
 | `embedding_model` | `openai/text-embedding-3-small` | any OpenRouter embedding slug |
 | `eval.questions_file` | `questions.yaml` | golden set used by `eval` |
-| `eval.judge_model` | `null` | grading model; `null` means the answering model |
+| `eval.judge_model` | `null` | grading model; `null` inherits `global.defaults.judge_model`, then the answering model |
 | `eval.questions_per_document` | `3` | questions `generate-questions` writes per document |
 | `eval.document_char_budget` | `30000` | characters of each document shown to the generator |
 
@@ -612,6 +626,7 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   questions.yaml  optional golden set for `eval` — worth committing
   chroma/            the vector store
   embeddings/        stores built by `compare-embeddings`, one per model and chunking
+  reports/           a copy of every `compare-embeddings` table, as text and JSON
   cache/             downloaded attachments and transcripts, kept so re-indexing
                      does not re-download
   collections.json   the indexed collection tree, rewritten by every `index` run
