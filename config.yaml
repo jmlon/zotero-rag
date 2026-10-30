@@ -37,7 +37,7 @@ embedding_models:
   - id: "perplexity/pplx-embed-v1-0.6b"
     provider: "Perplexity"
     dimensions: 384
-    context_window: 512
+    context_window: 32000
     pricing:
       currency: "USD"
       unit: "per_1M_tokens"
@@ -74,7 +74,7 @@ embedding_models:
       input: 0.02
     notes: "Highly reliable industry default for general English semantic search."
 
-  - id: "amazon/titan-text-embeddings-v2"
+  - id: "amazon/titan-embed-text-v2"
     provider: "Amazon"
     dimensions: 1024
     context_window: 8192
@@ -94,7 +94,7 @@ embedding_models:
       input: 0.06
     notes: "Excellent retrieval accuracy paired with an expansive 32k context size."
 
-  - id: "mistralai/mistral-embed"
+  - id: "mistralai/mistral-embed-2312"
     provider: "Mistral"
     dimensions: 1024
     context_window: 8192
@@ -107,7 +107,7 @@ embedding_models:
   - id: "google/gemini-embedding-001"
     provider: "Google"
     dimensions: 768
-    context_window: 2048
+    context_window: 20000
     pricing:
       currency: "USD"
       unit: "per_1M_tokens"

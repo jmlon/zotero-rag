@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 # OpenAI embedding models use cl100k_base; close enough for reporting on others.
 _ENCODING = tiktoken.get_encoding("cl100k_base")
 
+#: Texts per embedding request. LangChain's default of 1000 is OpenAI's limit, but
+#: OpenRouter fronts providers with lower ones: Google's Vertex endpoint rejects
+#: more than 250, so one long paper's chunks failed in a single request. A model
+#: in the `embedding_models` catalogue can set its own `batch_size`.
+DEFAULT_BATCH_SIZE = 100
+
 
 def count_tokens(texts: list[str]) -> int:
     """Token count for a batch of texts, used for the `-v` usage report."""
@@ -28,8 +34,11 @@ def count_tokens(texts: list[str]) -> int:
 def build_embeddings(config: Config) -> OpenAIEmbeddings:
     """Build the embedding client. Requires an OpenRouter key."""
     config.global_.require_openrouter()
+    spec = config.embedding_model_spec(config.embedding_model)
     return OpenAIEmbeddings(
         model=config.embedding_model,
+        # LangChain's name for texts per request, not our characters per chunk.
+        chunk_size=spec.batch_size if spec and spec.batch_size else DEFAULT_BATCH_SIZE,
         # Canonical field names; `base_url`/`api_key` are their aliases.
         openai_api_base=config.global_.endpoint,
         openai_api_key=SecretStr(config.global_.api_key),

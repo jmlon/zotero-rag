@@ -7,6 +7,9 @@ import json
 import logging
 import os
 import shutil
+import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from typing import Annotated, Any, cast
@@ -16,7 +19,14 @@ from langchain_core.messages import AIMessage, BaseMessage
 from rich.console import Console
 from rich.logging import RichHandler
 from rich.markup import escape
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskProgressColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    Progress,
+    SpinnerColumn,
+    TaskID,
+    TaskProgressColumn,
+    TextColumn,
+)
 from rich.table import Table
 from rich.tree import Tree
 
@@ -49,6 +59,17 @@ from zotero_rag.converter_run import (
 from zotero_rag.documents import DocumentFormat
 from zotero_rag.download import CACHE_DIRNAME, ensure_cached
 from zotero_rag.embedding import build_embeddings
+from zotero_rag.embedding_comparison import (
+    ComparisonReport,
+    ComparisonSettings,
+    Variant,
+    VariantResult,
+    chunkings,
+    context_warning,
+    plan_variants,
+    stored_tokens,
+    variant_config,
+)
 from zotero_rag.errors import (
     CollectionMismatchError,
     NotAnIndexFolderError,
@@ -90,6 +111,7 @@ from zotero_rag.index_folder import (
     resolve_reranker,
 )
 from zotero_rag.indexer import (
+    DIMENSION_PROBE,
     IndexStats,
     drop_replaced_copies,
     find_orphans,
@@ -398,6 +420,44 @@ def _print_notice(notice: Notice) -> None:
     err_console.print(f"[yellow]{notice.level.capitalize()}:[/yellow] {escape(notice.text)}")
 
 
+def _fetch_plan(
+    config: Config,
+    collection: str | None,
+    collection_key: str | None,
+    assume_yes: bool,
+    with_username: bool,
+) -> tuple[IndexPlan, list[CollectionNode], str, CollectionNode | None]:
+    """Fetch the target collections from Zotero and plan what indexing them embeds.
+
+    Returns the plan, the library's collection tree, a description of the target,
+    and the single collection to pin (`None` for the whole library).
+    """
+    zot = build_client(config)
+    roots = build_collection_tree(fetch_collections(zot))
+    scope, target, node = _resolve_target(config, roots, collection, collection_key, assume_yes)
+
+    # The citation URL needs the library owner's username; a dry run skips it.
+    username = fetch_username(zot) if with_username else ""
+
+    fetched: list[tuple[CollectionNode, list[dict[str, object]]]] = []
+    with err_console.status("[dim]Fetching items from Zotero...[/dim]") as status:
+        for collection_node in scope:
+            status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
+            fetched.append((collection_node, fetch_collection_items(zot, collection_node.key)))
+
+    plan = build_plan(
+        [(collection_node.name, items) for collection_node, items in fetched],
+        username,
+        preference=config.index.attachment_preference,
+        index_all_attachments=config.index.index_all_attachments,
+        index_notes=config.index.index_notes,
+        membership=item_membership(
+            (collection_node.key, items) for collection_node, items in fetched
+        ),
+    )
+    return plan, roots, target, node
+
+
 def _run_index(
     plan: IndexPlan,
     config: Config,
@@ -640,28 +700,8 @@ def index(
         if not dry_run:
             config.global_.require_openrouter()
 
-        zot = build_client(config)
-        roots = build_collection_tree(fetch_collections(zot))
-        scope, target, node = _resolve_target(config, roots, collection, collection_key, assume_yes)
-
-        # The citation URL needs the library owner's username; a dry run skips it.
-        username = "" if dry_run else fetch_username(zot)
-
-        fetched: list[tuple[CollectionNode, list[dict[str, object]]]] = []
-        with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
-            for collection_node in scope:
-                status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
-                fetched.append((collection_node, fetch_collection_items(zot, collection_node.key)))
-
-        plan = build_plan(
-            [(collection_node.name, items) for collection_node, items in fetched],
-            username,
-            preference=config.index.attachment_preference,
-            index_all_attachments=config.index.index_all_attachments,
-            index_notes=config.index.index_notes,
-            membership=item_membership(
-                (collection_node.key, items) for collection_node, items in fetched
-            ),
+        plan, roots, target, node = _fetch_plan(
+            config, collection, collection_key, assume_yes, with_username=not dry_run
         )
 
         if dry_run:
@@ -1794,6 +1834,575 @@ def eval_command(
         print(report.model_dump_json(indent=2))  # noqa: T201
         return
     _print_eval_report(report, verbose=_is_verbose())
+
+
+def _money(value: float | None) -> str:
+    return "[dim]n/a[/dim]" if value is None else f"${value:.4f}"
+
+
+def _stored_chunks(directory: Path) -> int:
+    """Chunks in the store at `directory`, without creating one where there is none."""
+    return VectorStore(directory).count() if VectorStore.exists(directory) else 0
+
+
+def _variant_remedy(variant: Variant) -> str:
+    return (
+        f"This comparison store does not match {variant.label}. Delete {variant.store_dir} "
+        "and run `compare-embeddings` again to rebuild it."
+    )
+
+
+def _print_comparison_plan(
+    out: Console,
+    config: Config,
+    variants: list[Variant],
+    chunks: dict[Path, int],
+    to_build: list[Variant],
+    corpus_tokens: int,
+    questions: int,
+) -> None:
+    """What would be built and evaluated, and what building would cost."""
+    index_dir = config.source_dir or Path.cwd()
+    building = {variant.store_dir for variant in to_build}
+    table = Table(title="Embedding comparison plan", title_justify="left")
+    table.add_column("Embedding model")
+    table.add_column("Chunk", justify="right")
+    table.add_column("Overlap", justify="right", style="dim")
+    table.add_column("Store", style="dim")
+    table.add_column("Status")
+    table.add_column("$/1M tok", justify="right")
+    table.add_column("Est. index $", justify="right")
+
+    estimated_total = 0.0
+    for variant in variants:
+        held = chunks[variant.store_dir]
+        spec = config.embedding_model_spec(variant.embedding_model)
+        estimate: float | None = None
+        if variant.baseline:
+            status = f"baseline · {_plural(held, 'chunk')}"
+        elif held:
+            status = f"built · {_plural(held, 'chunk')}"
+        elif variant.store_dir in building:
+            status = "[yellow]to build[/yellow]"
+            # Every chunking of the same text at the same overlap ratio comes to about
+            # the same token total, so the baseline's is a fair estimate.
+            estimate = spec.cost(corpus_tokens) if spec else None
+            estimated_total += estimate or 0.0
+        else:
+            status = "[red]not built[/red]"
+        table.add_row(
+            escape(variant.embedding_model),
+            str(variant.chunk_size),
+            str(variant.chunk_overlap),
+            escape(str(variant.store_dir.relative_to(index_dir))),
+            status,
+            _money(spec.pricing.input if spec and spec.pricing else None),
+            _money(estimate) if estimate is not None else "[dim]—[/dim]",
+        )
+    out.print(table)
+
+    unbuilt = sum(1 for variant in to_build if not chunks[variant.store_dir])
+    out.print(
+        f"\n{_plural(unbuilt, 'store')} to build (~{corpus_tokens} embedding tokens each, "
+        f"est. {_money(estimated_total)} in total); "
+        f"{_plural(len(variants), 'variant')} × {_plural(questions, 'question')} = "
+        f"{len(variants) * questions} answers by {escape(config.llm_model)}, each graded "
+        f"by {escape(config.judge_model)}."
+    )
+    for variant in variants:
+        if warning := context_warning(config, variant):
+            out.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
+
+
+class _Interrupted(Exception):
+    """Raised inside a build worker once the user has pressed Ctrl-C."""
+
+
+def _build_variant(
+    plan: IndexPlan,
+    config: Config,
+    variant: Variant,
+    store: VectorStore,
+    download: Callable[[str], Path],
+    on_start: Callable[[PlannedAttachment], None],
+) -> IndexStats:
+    """Index the planned attachments into a variant's own store.
+
+    Incremental like `index`: a store built by an earlier run only embeds what
+    changed in Zotero since. Downloads come from the folder's shared cache.
+    """
+    settings = variant_config(config, variant)
+    embeddings = build_embeddings(settings)
+    # One short call, so a model the provider does not serve fails here, once,
+    # rather than once per attachment.
+    embeddings.embed_documents([DIMENSION_PROBE])
+
+    stats = index_plan(
+        plan,
+        store=store,
+        download=download,
+        embed=embeddings.embed_documents,
+        chunk_size=settings.index.chunk_size,
+        chunk_overlap=settings.index.chunk_overlap,
+        embedding_model=settings.embedding_model,
+        on_start=on_start,
+    )
+    store.write_fingerprint(
+        StoreFingerprint.intended(settings, embedding_dim=store.derived_dimension() or 0)
+    )
+    # A comparison store mirrors the collection as it is now.
+    drop_replaced_copies(store, plan)
+    prune_orphans(store, plan)
+    return stats
+
+
+def _build_variants(
+    plan: IndexPlan, config: Config, to_build: list[Variant], workers: int | None
+) -> tuple[dict[Path, IndexStats], dict[Path, str]]:
+    """Build the comparison stores, one worker thread per embedding model.
+
+    The time goes on embedding calls, so threads overlap the waiting. A model's
+    variants share one worker and run in turn, so no provider gets more than one
+    request at a time from this run. Returns the stats of each store built and the
+    error of each that failed.
+
+    Two things stay off the workers: stores are opened here, because chromadb fills
+    its client cache without a lock, and downloads take one lock, because two
+    workers asking for the same uncached file would both write it.
+    """
+    index_dir = config.source_dir or Path.cwd()
+    cache_dir = index_dir / CACHE_DIRNAME
+    formats = {
+        attachment.attachment_key: attachment.document_format for attachment in plan.attachments
+    }
+    files = FileDownloader.from_config(config)
+    download_lock = threading.Lock()
+
+    def download(key: str) -> Path:
+        with download_lock:
+            return ensure_cached(files, key, cache_dir, formats[key])
+
+    built: dict[Path, IndexStats] = {}
+    errors: dict[Path, str] = {}
+    stores: dict[Path, VectorStore] = {}
+    by_model: dict[str, list[Variant]] = {}
+    for variant in to_build:
+        try:
+            store = VectorStore(variant.store_dir)
+            check_fingerprint(
+                store, variant_config(config, variant), _variant_remedy(variant), _print_notice
+            )
+        except ZoteroRagError as exc:
+            errors[variant.store_dir] = str(exc)
+            continue
+        stores[variant.store_dir] = store
+        by_model.setdefault(variant.embedding_model, []).append(variant)
+    if not by_model:
+        return built, errors
+
+    stop = threading.Event()
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        console=err_console,
+        transient=True,
+    ) as progress:
+        tasks = {
+            variant.store_dir: progress.add_task(
+                escape(variant.label), total=len(plan.attachments), start=False
+            )
+            for variants in by_model.values()
+            for variant in variants
+        }
+
+        def run_model(variants: list[Variant]) -> None:
+            for variant in variants:
+                if stop.is_set():
+                    return
+                task = tasks[variant.store_dir]
+                progress.start_task(task)
+
+                def on_start(attachment: PlannedAttachment, task: TaskID = task) -> None:
+                    if stop.is_set():
+                        raise _Interrupted
+                    progress.advance(task)
+
+                try:
+                    built[variant.store_dir] = _build_variant(
+                        plan, config, variant, stores[variant.store_dir], download, on_start
+                    )
+                except _Interrupted:
+                    return
+                except Exception as exc:  # noqa: BLE001 - one model's failure must not stop the rest
+                    errors[variant.store_dir] = str(exc) or type(exc).__name__
+                    progress.update(task, description=f"[red]{escape(variant.label)}: failed[/red]")
+
+        pool = ThreadPoolExecutor(
+            max_workers=min(workers or len(by_model), len(by_model)),
+            thread_name_prefix="embed",
+        )
+        try:
+            for future in [pool.submit(run_model, variants) for variants in by_model.values()]:
+                future.result()
+        except KeyboardInterrupt:
+            # Workers finish the attachment in hand, then stop; the stores keep
+            # what was written, and the next run picks up from there.
+            stop.set()
+            raise
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
+
+    for variant in to_build:
+        if variant.store_dir in errors:
+            err_console.print(
+                f"[yellow]Warning:[/yellow] could not build {escape(variant.label)}: "
+                f"{escape(errors[variant.store_dir])}"
+            )
+        elif (stats := built.get(variant.store_dir)) is not None and stats.chunks:
+            err_console.print(
+                f"Built [bold]{escape(variant.label)}[/bold]: "
+                f"{_plural(stats.chunks, 'new chunk')} in {stats.elapsed_s:.0f}s."
+            )
+    return built, errors
+
+
+def _evaluate_variant(
+    variant: Variant,
+    config: Config,
+    baseline_store: VectorStore,
+    stats: IndexStats | None,
+    build_error: str,
+    evaluate_with: Callable[[VectorStore, Config], list[QuestionOutcome]],
+) -> VariantResult:
+    """Score one variant. Any failure is recorded on its row, never raised."""
+    spec = config.embedding_model_spec(variant.embedding_model)
+    result = VariantResult(
+        embedding_model=variant.embedding_model,
+        chunk_size=variant.chunk_size,
+        chunk_overlap=variant.chunk_overlap,
+        store=str(variant.store_dir),
+        baseline=variant.baseline,
+        provider=spec.provider if spec else "",
+        price_per_million=spec.pricing.input if spec and spec.pricing else None,
+        built_chunks=stats.chunks if stats else 0,
+        build_failures=stats.failed if stats else 0,
+    )
+    if not variant.baseline and not _stored_chunks(variant.store_dir):
+        result.error = (
+            f"could not build: {build_error}"
+            if build_error
+            else "no chunks in its store (not built, or every embedding call failed)"
+        )
+        return result
+
+    store = baseline_store if variant.baseline else VectorStore(variant.store_dir)
+    result.store_chunks = store.count()
+    result.embedding_dim = store.derived_dimension()
+    result.index_tokens = stored_tokens(store)
+    settings = variant_config(config, variant)
+    try:
+        if not variant.baseline:
+            check_fingerprint(store, settings, _variant_remedy(variant), _print_notice)
+        outcomes = evaluate_with(store, settings)
+    except Exception as exc:  # noqa: BLE001 - one model's outage must not lose the others
+        result.error = str(exc) or type(exc).__name__
+        return result
+    result.aggregate = aggregate(outcomes)
+    result.results = outcomes
+    return result
+
+
+def _comparison_table(report: ComparisonReport) -> Table:
+    """One row per variant: what it scored and what it cost."""
+    table = Table(title="Embedding comparison", title_justify="left")
+    table.add_column("Embedding model", overflow="fold")
+    table.add_column("Chunk", justify="right")
+    table.add_column("Overlap", justify="right")
+    table.add_column("Dim", justify="right", style="dim")
+    table.add_column("Chunks", justify="right", style="dim")
+    table.add_column("Index tok", justify="right")
+    table.add_column("Index $", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Hit", justify="right")
+    table.add_column("Cited", justify="right")
+    table.add_column("Coverage", justify="right")
+    table.add_column("Ans tok/q", justify="right", style="dim")
+    table.add_column("Time", justify="right", style="dim")
+
+    scores = [v.aggregate.mean_score for v in report.variants if v.aggregate is not None]
+    best = max(scores, default=None)
+    for variant in report.variants:
+        name = escape(variant.embedding_model)
+        if variant.baseline:
+            name += " [dim](baseline)[/dim]"
+        summary = variant.aggregate
+        if summary is None:
+            table.add_row(
+                name,
+                str(variant.chunk_size),
+                str(variant.chunk_overlap),
+                *["[dim]—[/dim]"] * 4,
+                "[bold red]error[/bold red]",
+                *["[dim]—[/dim]"] * 5,
+            )
+            continue
+        score = f"{summary.mean_score:.2f}"
+        if summary.mean_score == best and len(scores) > 1:
+            score = f"[bold green]{score}[/bold green]"
+        per_question = variant.answer_tokens_per_question
+        table.add_row(
+            name,
+            str(variant.chunk_size),
+            str(variant.chunk_overlap),
+            str(variant.embedding_dim or "—"),
+            str(variant.store_chunks),
+            str(variant.index_tokens),
+            _money(variant.index_cost),
+            score,
+            _percent(summary.hit_rate),
+            _percent(summary.citation_rate),
+            _percent(summary.mean_coverage),
+            f"{per_question:.0f}" if per_question is not None else "—",
+            f"{summary.elapsed_s:.0f}s",
+        )
+    return table
+
+
+def _print_comparison(report: ComparisonReport) -> None:
+    console.print(_comparison_table(report))
+    for variant in report.variants:
+        if variant.error:
+            console.print(f"  [red]{escape(variant.label)}:[/red] {escape(variant.error)}")
+        elif variant.build_failures:
+            console.print(
+                f"  [yellow]{escape(variant.label)}:[/yellow] "
+                f"{_plural(variant.build_failures, 'attachment')} failed to embed, so this "
+                "store is missing documents the others hold."
+            )
+        if variant.aggregate is not None and variant.aggregate.errors:
+            console.print(
+                f"  [magenta]{escape(variant.label)}: "
+                f"{_plural(variant.aggregate.errors, 'question')} could not be graded[/magenta]"
+            )
+
+    settings = report.settings
+    reranking = f" · reranked by {settings.reranker}" if settings.reranker else ""
+    windowing = f" ±{settings.retrieval_window}" if settings.retrieval_window else ""
+    console.print(
+        f"\n[dim]{_plural(settings.questions, 'question')} from {escape(settings.questions_file)}"
+        f" · {escape(settings.llm_model)} answering, {escape(settings.judge_model)} grading · "
+        f"top_k {settings.top_k} · {settings.retrieval}{windowing} retrieval{reranking}[/dim]"
+    )
+    console.print(
+        "[dim]Score is out of 5. Tokens are counted with OpenAI's cl100k tokenizer, so costs "
+        "for other providers are estimates. Point coverage moves a few points between "
+        "identical runs; treat a small difference as noise.[/dim]"
+    )
+
+
+@app.command("compare-embeddings")
+def compare_embeddings_command(
+    models: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--model",
+            help="Embedding model to compare; repeatable. Defaults to every model in "
+            "the config's embedding_models list.",
+        ),
+    ] = None,
+    chunk_sizes: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--chunk-size",
+            help="Chunk size in characters; repeatable. Defaults to the configured one.",
+            min=1,
+        ),
+    ] = None,
+    chunk_overlaps: Annotated[
+        list[int] | None,
+        typer.Option(
+            "--chunk-overlap",
+            help="Chunk overlap in characters; repeatable, paired with every chunk size. "
+            "Defaults to the configured overlap ratio applied to each size.",
+            min=0,
+        ),
+    ] = None,
+    questions_file: Annotated[
+        Path | None,
+        typer.Option("--questions", help="Question set to run; defaults to the configured one."),
+    ] = None,
+    top_k: Annotated[
+        int | None,
+        typer.Option("--top-k", help="Chunks to retrieve; overrides the configured top_k.", min=1),
+    ] = None,
+    retrieval: RetrievalOption = None,
+    reranker: RerankerOption = None,
+    only: Annotated[
+        list[str] | None,
+        typer.Option("--only", help="Run just this question id; repeatable."),
+    ] = None,
+    no_build: Annotated[
+        bool,
+        typer.Option("--no-build", help="Evaluate only the stores that already exist."),
+    ] = False,
+    workers: Annotated[
+        int | None,
+        typer.Option(
+            "--workers",
+            help="Embedding models built at once. Defaults to one worker per model; "
+            "1 builds them one after another.",
+            min=1,
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Show the variants and the cost; build and run nothing."),
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Skip the confirmation prompt.")
+    ] = False,
+    as_json: Annotated[
+        bool, typer.Option("--json", help="Emit the full comparison as JSON instead of a table.")
+    ] = False,
+    verbose: VerboseOption = False,
+) -> None:
+    """Compare embedding models, chunk sizes and overlaps on the eval question set.
+
+    The configured model, chunk size and overlap are the baseline, read from chroma/.
+    Every other combination is indexed into
+    embeddings/<model>/<chunk_size>-<chunk_overlap>/ from the download cache, then
+    all are scored with the same questions, answering model and judge. Stores are
+    kept, so a later comparison only builds what is new.
+    """
+    _enable_verbose(verbose)
+    # The plan is a preamble to the JSON, not part of it.
+    out = err_console if as_json else console
+
+    try:
+        config, baseline_store = open_index(_print_notice)
+        questions_path = resolve_questions_path(config, questions_file)
+        questions = _select_questions(load_questions(questions_path), only or [])
+
+        chosen_models = models or [spec.id for spec in config.embedding_models]
+        chosen_sizes = chunk_sizes or [config.index.chunk_size]
+        pairs, impossible = chunkings(config, chosen_sizes, chunk_overlaps or None)
+        for size, overlap in impossible:
+            out.print(
+                f"[yellow]Warning:[/yellow] skipping chunk size {size} with overlap {overlap}: "
+                "the overlap must be smaller than the chunk."
+            )
+        variants = plan_variants(config, chosen_models, pairs)
+        to_build = [] if no_build else [variant for variant in variants if not variant.baseline]
+        chunks = {variant.store_dir: _stored_chunks(variant.store_dir) for variant in variants}
+        corpus_tokens = stored_tokens(baseline_store)
+
+        _print_comparison_plan(
+            out, config, variants, chunks, to_build, corpus_tokens, len(questions)
+        )
+        if dry_run:
+            out.print("\n[dim]Dry run: nothing was embedded, answered, or graded.[/dim]")
+            return
+        if not assume_yes and not typer.confirm("Proceed?", default=False, err=True):
+            raise typer.Abort()
+
+        config.global_.require_openrouter()
+        built: dict[Path, IndexStats] = {}
+        build_errors: dict[Path, str] = {}
+        if to_build:
+            # One fetch serves every variant: they all index the same collection.
+            plan, _, _, _ = _fetch_plan(config, None, None, assume_yes, with_username=True)
+            built, build_errors = _build_variants(plan, config, to_build, workers)
+
+        chosen_top_k = top_k if top_k is not None else config.index.top_k
+        mode = retrieval if retrieval is not None else config.index.retrieval
+        window = config.index.retrieval_window
+        rerank, rerank_name = resolve_reranker(config, reranker)
+        chat = build_chat(config)
+        verdict_of = build_verdict_fn(config)
+
+        def ask(messages: list[BaseMessage]) -> AIMessage:
+            return cast(AIMessage, chat.invoke(messages))
+
+        results: list[VariantResult] = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=err_console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Evaluating...", total=len(variants) * len(questions))
+
+            for variant in variants:
+
+                def evaluate_with(
+                    store: VectorStore, settings: Config, variant: Variant = variant
+                ) -> list[QuestionOutcome]:
+                    embeddings = build_embeddings(settings)
+                    keyword_index = build_keyword_index(store, mode)
+
+                    def answer_one(question: str) -> QueryResult:
+                        return answer_question(
+                            question,
+                            store=store,
+                            embed_query=embeddings.embed_query,
+                            answer=ask,
+                            top_k=chosen_top_k,
+                            window=window,
+                            mode=mode,
+                            keyword_index=keyword_index,
+                            rerank=rerank,
+                            rerank_fanout=config.index.reranker_fanout,
+                        )
+
+                    def on_start(question: EvalQuestion) -> None:
+                        progress.update(
+                            task,
+                            advance=1,
+                            description=escape(f"{variant.label}: {question.question}"[:60]),
+                        )
+
+                    return evaluate(questions, answer_one, verdict_of, None, on_start)
+
+                result = _evaluate_variant(
+                    variant,
+                    config,
+                    baseline_store,
+                    built.get(variant.store_dir),
+                    build_errors.get(variant.store_dir, ""),
+                    evaluate_with,
+                )
+                # A variant that never ran still owes the bar its questions.
+                if result.aggregate is None:
+                    progress.update(task, advance=len(questions))
+                results.append(result)
+
+        report = ComparisonReport(
+            settings=ComparisonSettings(
+                collection_name=config.index.collection_name,
+                collection_key=config.index.collection_key,
+                llm_model=config.llm_model,
+                judge_model=config.judge_model,
+                top_k=chosen_top_k,
+                retrieval=mode,
+                retrieval_window=window,
+                reranker=rerank_name,
+                questions_file=str(questions_path),
+                questions=len(questions),
+            ),
+            variants=results,
+        )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+
+    if as_json:
+        print(report.model_dump_json(indent=2))  # noqa: T201
+        return
+    _print_comparison(report)
 
 
 #: Above this many documents, generation is worth confirming: it is one LLM call

@@ -437,6 +437,47 @@ Two ready-made sets live in `questions/` — a 3-question `Writing` smoke test a
 21-question `Networking` set. A 3-question set turned out too small to resolve any
 difference at all, so if you write your own, aim for twenty rather than three.
 
+### Choosing an embedding model and chunking
+
+All three — model, chunk size and overlap — are fixed when a store is built, so comparing them means one store per
+combination. `compare-embeddings` builds those stores and scores each one with the
+same questions, answering model and judge as `eval`:
+
+```bash
+zotero-rag compare-embeddings --dry-run                   # variants, stores, estimated cost
+zotero-rag compare-embeddings                             # every model in embedding_models
+zotero-rag compare-embeddings --model baai/bge-m3 --chunk-size 500 --chunk-size 2000
+zotero-rag compare-embeddings --model baai/bge-m3 --chunk-overlap 0 --chunk-overlap 300
+zotero-rag compare-embeddings --no-build                  # re-score the stores already built
+zotero-rag compare-embeddings --yes --json > models.json
+```
+
+The configured model at the configured `chunk_size` and `chunk_overlap` is the
+**baseline**, read from `chroma/` and never rebuilt. Every other combination goes into
+`embeddings/<model>/<chunk_size>-<chunk_overlap>/` (the model id with `/` and `:`
+turned into `_`),
+indexed from the folder's download cache, so nothing is downloaded twice. The stores
+are kept: a later run embeds only what changed in Zotero, which makes adding one
+more model to a comparison cheap. Without `--chunk-overlap`, each chunk size keeps
+the configured overlap *ratio* (200/1000 → 100 for 500), so the overlap isn't a second
+variable. Each `--chunk-overlap` you pass is paired with every chunk size instead,
+and a pair whose overlap isn't smaller than its chunk is skipped with a warning.
+
+Stores are built in parallel, one worker per embedding model; a model's own
+variants are built one after another, so no provider gets more than one request
+at a time from the run. `--workers N` caps how many models build at once (`1` is
+fully sequential). Ctrl-C stops the workers after the attachment in hand; what they
+wrote is kept, and the next run carries on from there.
+
+The candidates and their prices come from the `embedding_models` list in
+`config.yaml` (the packaged defaults ship one). `--model` also accepts a model
+not on the list, which is compared without a price. The table shows each
+variant's score, retrieval hit, citation and point coverage beside its index tokens and
+cost, plus the answering tokens per question, because at the same `top_k` larger
+chunks make every query more expensive. Tokens are counted with OpenAI's
+tokenizer, so costs for other providers are estimates. A model the provider
+doesn't serve fails on its row and the rest of the comparison carries on.
+
 ### What the measurements actually said
 
 Everything below came out of `eval` on the 21-question set, and is why the defaults
@@ -556,6 +597,7 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   .env            your credentials (never committed)
   questions.yaml  optional golden set for `eval` — worth committing
   chroma/            the vector store
+  embeddings/        stores built by `compare-embeddings`, one per model and chunking
   cache/             downloaded attachments and transcripts, kept so re-indexing
                      does not re-download
   collections.json   the indexed collection tree, rewritten by every `index` run

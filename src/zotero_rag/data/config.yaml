@@ -118,3 +118,67 @@ markdown:
         max_broken_spacing: 0.05 # stray single letters: "T h e  r e s u l t s"
         min_baseline_words: 200 # fewer source words than this: unverifiable (scans)
         min_segment_words: 50 # shorter pages are left out of the worst-page check
+
+# Candidate embedding models for `compare-embeddings`, which builds one store per
+# model and chunk size under embeddings/<model>/<chunk_size>/ and scores each with
+# the `eval` question set. Prices turn the token counts into the cost column; a
+# model missing from this list can still be compared with --model, just unpriced.
+# The configured embedding_model at the configured chunk_size is the baseline and
+# is read from chroma/ as-is, never rebuilt.
+# Embedding requests carry 100 texts each; a provider that accepts fewer takes a
+# `batch_size:` on its entry.
+embedding_models:
+    - id: perplexity/pplx-embed-v1-0.6b
+      provider: Perplexity
+      dimensions: 384
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.004 }
+      notes: Ultra-low budget vector baseline for extremely fast retrieval.
+    - id: qwen/qwen3-embedding-8b
+      provider: Alibaba
+      dimensions: 4096
+      context_window: 32768
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.01 }
+      notes: Open-weight model with a large context window and high dimensionality.
+    - id: baai/bge-m3
+      provider: BAAI
+      dimensions: 1024
+      context_window: 8192
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.01 }
+      notes: Open-source multilingual embedding.
+    - id: openai/text-embedding-3-small
+      provider: OpenAI
+      dimensions: 1536
+      context_window: 8191
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.02 }
+      notes: The default.
+    - id: amazon/titan-embed-text-v2
+      provider: Amazon
+      dimensions: 1024
+      context_window: 8192
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.02 }
+      notes: Configurable dimension downscaling (512 or 256).
+    - id: voyageai/voyage-4
+      provider: Voyage AI
+      dimensions: 1024
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.06 }
+      notes: Strong retrieval accuracy with a 32k context.
+    - id: mistralai/mistral-embed-2312
+      provider: Mistral
+      dimensions: 1024
+      context_window: 8192
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.10 }
+      notes: Mistral AI's embedding model.
+    - id: google/gemini-embedding-001
+      provider: Google
+      dimensions: 768
+      context_window: 20000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.15 }
+      notes: Google's text embedding model.
+    - id: nvidia/nemotron-3.5-embed-1b:free
+      provider: NVIDIA
+      dimensions: 1024
+      context_window: 32768
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.00 }
+      notes: Rate-limited free tier on OpenRouter.

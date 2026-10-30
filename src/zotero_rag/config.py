@@ -221,6 +221,37 @@ class MarkdownConfig(BaseModel):
     quality: QualityThresholds = Field(default_factory=QualityThresholds)
 
 
+class EmbeddingPricing(BaseModel):
+    """What embedding costs, as the provider quotes it."""
+
+    currency: str = "USD"
+    #: The only unit quoted by the providers in the catalogue; anything else would
+    #: make every cost in the comparison silently wrong by some factor.
+    unit: Literal["per_1M_tokens"] = "per_1M_tokens"
+    input: float = Field(ge=0.0)
+
+
+class EmbeddingModelSpec(BaseModel):
+    """One entry of the `embedding_models` catalogue that `compare-embeddings` tries."""
+
+    id: str
+    provider: str = ""
+    dimensions: int | None = None
+    #: Tokens. A chunk longer than this is truncated or rejected by the provider.
+    context_window: int | None = None
+    pricing: EmbeddingPricing | None = None
+    #: Texts per embedding request, for a provider that accepts fewer than the
+    #: default (`embedding.DEFAULT_BATCH_SIZE`). `None` uses the default.
+    batch_size: int | None = Field(default=None, gt=0)
+    notes: str = ""
+
+    def cost(self, tokens: int) -> float | None:
+        """The price of embedding `tokens`, or `None` when no price is listed."""
+        if self.pricing is None:
+            return None
+        return tokens * self.pricing.input / 1_000_000
+
+
 class Config(BaseModel):
     """The merged configuration for a run."""
 
@@ -230,6 +261,8 @@ class Config(BaseModel):
     index: IndexConfig = Field(default_factory=IndexConfig)
     eval: EvalConfig = Field(default_factory=EvalConfig)
     markdown: MarkdownConfig = Field(default_factory=MarkdownConfig)
+    #: Candidate embedding models for `compare-embeddings`, with their prices.
+    embedding_models: list[EmbeddingModelSpec] = Field(default_factory=list)
 
     # Directory the index config was loaded from, when there was one.
     source_dir: Path | None = Field(default=None, exclude=True)
@@ -260,6 +293,10 @@ class Config(BaseModel):
     @property
     def vector_db(self) -> str:
         return self.index.vector_db or self.global_.defaults.vector_db
+
+    def embedding_model_spec(self, model_id: str) -> EmbeddingModelSpec | None:
+        """The catalogue entry for `model_id`, if it is listed."""
+        return next((spec for spec in self.embedding_models if spec.id == model_id), None)
 
 
 def env_file_candidates(directory: Path | None = None) -> list[Path]:
