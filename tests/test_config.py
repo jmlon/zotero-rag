@@ -193,3 +193,11 @@ def test_secrets_are_never_serialised_back_to_yaml(
     assert "supersecret" not in str(dumped)
     assert "alsosecret" not in str(dumped)
     assert "zotero_api_key" not in dumped["global"]
+
+
+def test_packaged_preference_indexes_transcripts_first() -> None:
+    # PLAN-markdown, Phase 6: equal answer quality, ~13% fewer prompt tokens.
+    config = Config.model_validate(packaged_defaults())
+
+    assert config.index.attachment_preference[0] == "markdown"
+    assert config.index.attachment_preference == Config().index.attachment_preference

@@ -31,3 +31,95 @@ index:
     llm_model: null
     embedding_model: null
     vector_db: null
+
+
+embedding_models:
+  - id: "perplexity/pplx-embed-v1-0.6b"
+    provider: "Perplexity"
+    dimensions: 384
+    context_window: 512
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.004
+    notes: "Ultra-low budget vector baseline for extremely fast retrieval."
+
+  - id: "qwen/qwen3-embedding-8b"
+    provider: "Alibaba"
+    dimensions: 4096
+    context_window: 32768
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.01
+    notes: "State-of-the-art open weight model with massive context window and high dimensionality."
+
+  - id: "baai/bge-m3"
+    provider: "BAAI"
+    dimensions: 1024
+    context_window: 8192
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.01
+    notes: "Top-tier open-source multilingual embedding optimized for complex multi-lingual RAG."
+
+  - id: "openai/text-embedding-3-small"
+    provider: "OpenAI"
+    dimensions: 1536
+    context_window: 8191
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.02
+    notes: "Highly reliable industry default for general English semantic search."
+
+  - id: "amazon/titan-text-embeddings-v2"
+    provider: "Amazon"
+    dimensions: 1024
+    context_window: 8192
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.02
+    notes: "Flexible text embedding allowing configurable dimension downscaling (512 or 256)."
+
+  - id: "voyageai/voyage-4"
+    provider: "Voyage AI"
+    dimensions: 1024
+    context_window: 32000
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.06
+    notes: "Excellent retrieval accuracy paired with an expansive 32k context size."
+
+  - id: "mistralai/mistral-embed"
+    provider: "Mistral"
+    dimensions: 1024
+    context_window: 8192
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.10
+    notes: "Highly optimized semantic extraction model built by Mistral AI."
+
+  - id: "google/gemini-embedding-001"
+    provider: "Google"
+    dimensions: 768
+    context_window: 2048
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.15
+    notes: "Google legacy baseline text vector model."
+
+  - id: "nvidia/nemotron-3.5-embed-1b:free"
+    provider: "NVIDIA"
+    dimensions: 1024
+    context_window: 32768
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.00
+    notes: "Rate-limited, free-tier multimodal and text model on OpenRouter."

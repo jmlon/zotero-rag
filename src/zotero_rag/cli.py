@@ -111,6 +111,17 @@ from zotero_rag.quality import QualityVerdict
 from zotero_rag.querying import QueryResult, answer_question
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.scaffold import init_index_folder
+from zotero_rag.shrink import (
+    KeepReason,
+    ShrinkEntry,
+    Verdict,
+    format_size,
+    parse_size,
+    shrink_candidates,
+)
+from zotero_rag.shrink_run import BACKUP_DIRNAME, LinkProber, check_candidates, trash_files
+from zotero_rag.shrink_run import REPORT_FIELDS as SHRINK_REPORT_FIELDS
+from zotero_rag.shrink_run import report_rows as shrink_report_rows
 from zotero_rag.snapshot import write_snapshot
 from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
 from zotero_rag.zotero_api import (
@@ -120,6 +131,7 @@ from zotero_rag.zotero_api import (
     build_collection_tree,
     collection_scope,
     count_collections,
+    fetch_annotated_attachments,
     fetch_collection_items,
     fetch_collections,
     fetch_username,
@@ -462,9 +474,11 @@ def _print_index_summary(
 def _segment_noun(plan: IndexPlan) -> str:
     """What this run's segments are, so the summary never calls a snapshot a page."""
     formats = set(plan.format_counts)
-    if formats == {DocumentFormat.PDF}:
+    # A transcript made by `convert` keeps its PDF's pages.
+    paged = {DocumentFormat.PDF, DocumentFormat.MARKDOWN}
+    if formats <= paged:
         return "pages"
-    if DocumentFormat.PDF in formats:
+    if formats & paged:
         return "pages and sections"
     return "sections"
 
@@ -999,12 +1013,16 @@ def _print_conversion_summary(plan: ConversionPlan, run: ConversionRun, verbose:
 
 
 def _write_conversion_report(path: Path, plan: ConversionPlan, run: ConversionRun | None) -> None:
-    rows = report_rows(plan.entries, run)
+    _write_report(path, report_rows(plan.entries, run), REPORT_FIELDS)
+
+
+def _write_report(path: Path, rows: list[dict[str, str | int]], fields: tuple[str, ...]) -> None:
+    """Flat rows as JSON for a `.json` path, else as CSV."""
     if path.suffix.lower() == ".json":
         path.write_text(json.dumps(rows, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     else:
         with path.open("w", newline="", encoding="utf-8") as handle:
-            writer = csv.DictWriter(handle, fieldnames=REPORT_FIELDS)
+            writer = csv.DictWriter(handle, fieldnames=fields)
             writer.writeheader()
             writer.writerows(rows)
     console.print(f"Report written to {escape(str(path))}")
@@ -1173,6 +1191,286 @@ def convert(
     _print_conversion_summary(plan, run, verbose=_is_verbose())
     if report:
         _write_conversion_report(report, plan, run)
+
+
+# --- shrink-storage -------------------------------------------------------------
+
+#: What the user can do about a kept file, when there is something.
+_KEEP_HINTS: dict[KeepReason, str] = {
+    KeepReason.NO_TRANSCRIPT: "run `zotero-rag convert` first",
+    KeepReason.TRANSCRIPT_NOT_CURRENT: "run `zotero-rag convert` (--reconvert for older ones)",
+    KeepReason.NO_LINK: "add a Link to URI attachment in Zotero to make one eligible",
+}
+#: Kept reasons listed file by file even without -v: each needs a look.
+_LISTED_KEEPS = frozenset({KeepReason.UNREADABLE, KeepReason.WRITE_ERROR})
+
+
+def _print_shrink_table(entries: list[ShrinkEntry], title: str) -> None:
+    table = Table(title=title, title_justify="left")
+    table.add_column("#", justify="right", style="dim")
+    table.add_column("Title", overflow="ellipsis", max_width=44)
+    table.add_column("File", overflow="ellipsis", max_width=28)
+    table.add_column("Size", justify="right")
+    table.add_column("Recoverable from", overflow="fold", max_width=48)
+    for number, entry in enumerate(entries, start=1):
+        table.add_row(
+            str(number),
+            escape(entry.title),
+            escape(entry.candidate.source.filename or entry.candidate.source.attachment_key),
+            format_size(entry.size or 0),
+            escape(entry.link),
+        )
+    console.print(table)
+
+
+def _print_check_manually(entries: list[ShrinkEntry]) -> None:
+    if not entries:
+        return
+    console.print(
+        f"\n[yellow]Check manually ({len(entries)}):[/yellow] the web link serves a file of "
+        "the right kind, but not provably this one. Kept; compare them, and delete the file "
+        "in Zotero yourself if they are the same."
+    )
+    for entry in entries:
+        source = entry.candidate.source
+        remote = format_size(entry.remote_size) if entry.remote_size is not None else "unknown"
+        console.print(
+            f"  [yellow]•[/yellow] {escape(entry.title)} — {escape(source.filename)} "
+            f"[dim]({source.attachment_key})[/dim]\n"
+            f"    {escape(entry.link)}\n"
+            f"    [dim]here {format_size(entry.size or 0)} ({entry.size} bytes), "
+            f"there {remote}"
+            f"{f' ({entry.remote_size} bytes)' if entry.remote_size is not None else ''}[/dim]"
+        )
+
+
+def _print_kept(entries: list[ShrinkEntry], verbose: bool) -> None:
+    kept = [entry for entry in entries if entry.verdict is Verdict.KEEP]
+    if not kept:
+        return
+    console.print("\nKept:")
+    by_reason: dict[KeepReason, list[ShrinkEntry]] = {}
+    for entry in kept:
+        assert entry.reason is not None  # every kept entry has its reason
+        by_reason.setdefault(entry.reason, []).append(entry)
+    for reason in KeepReason:  # in the order the checks run
+        group = by_reason.get(reason)
+        if not group:
+            continue
+        hint = _KEEP_HINTS.get(reason, "")
+        console.print(
+            f"  [dim]{len(group):>4}[/dim]  {reason.value}"
+            + (f"  [dim]({hint})[/dim]" if hint else "")
+        )
+        if verbose or reason in _LISTED_KEEPS:
+            for entry in group:
+                detail = f": {escape(entry.detail)}" if entry.detail else ""
+                console.print(
+                    f"       [dim]{escape(entry.title)} "
+                    f"({entry.candidate.source.attachment_key}){detail}[/dim]"
+                )
+    if not verbose and any(r not in _LISTED_KEEPS for r in by_reason):
+        console.print("  [dim]-v lists every file with the reason in detail.[/dim]")
+
+
+def _print_shrink_result(entries: list[ShrinkEntry], backup_dir: Path | None) -> None:
+    trashed = [entry for entry in entries if entry.trashed]
+    if not trashed:
+        console.print("\nNothing was moved to the trash.")
+        return
+    total = sum(entry.size or 0 for entry in trashed)
+    console.print(
+        f"\n[bold green]Moved {_plural(len(trashed), 'file')} ({format_size(total)}) "
+        "to the Zotero trash.[/bold green]"
+    )
+    if trashed:
+        _print_shrink_table(trashed, "Moved to the Zotero trash")
+        console.print(
+            "[dim]Zotero frees the storage only when the trash is emptied, which is left to "
+            "you: in the Zotero application, or automatically after 30 days by default. "
+            "Until then each file can be restored from the trash.[/dim]"
+        )
+        if backup_dir is not None:
+            console.print(f"[dim]Copies are kept in {escape(str(backup_dir))}.[/dim]")
+    for entry in trashed:
+        if entry.error:
+            console.print(f"  [yellow]•[/yellow] {escape(entry.title)}: {escape(entry.error)}")
+
+
+@app.command("shrink-storage")
+def shrink_storage(
+    max_size: Annotated[
+        str,
+        typer.Option(
+            "--max-size",
+            help="Only files larger than this, e.g. 500KB, 20MB, 1.5GB (1 KB = 1024 bytes).",
+        ),
+    ],
+    collection: Annotated[
+        str | None,
+        typer.Option("--collection", help="Zotero collection path, e.g. 'Research/Legal'."),
+    ] = None,
+    collection_key: Annotated[
+        str | None,
+        typer.Option("--collection-key", help="Zotero collection key (unambiguous)."),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Check and report, but move nothing. Files are still downloaded to be measured.",
+        ),
+    ] = False,
+    assume_yes: Annotated[
+        bool, typer.Option("--yes", "-y", help="Answer yes to every confirmation.")
+    ] = False,
+    no_backup: Annotated[
+        bool,
+        typer.Option("--no-backup", help=f"Don't keep a copy of each file in {BACKUP_DIRNAME}/."),
+    ] = False,
+    jobs: Annotated[
+        int,
+        typer.Option("--jobs", help="Files checked in parallel.", min=1),
+    ] = 4,
+    report: Annotated[
+        Path | None,
+        typer.Option("--report", help="Also write every file checked to this .csv or .json file."),
+    ] = None,
+    verbose: VerboseOption = False,
+) -> None:
+    """Move large files to the Zotero trash when a transcript and a web link replace them.
+
+    A file goes only if its Markdown transcript passed the quality check, it has
+    no annotations, and a Link to URI attachment of the same item serves the
+    very same file (same type and size). Nothing is deleted: files go to the
+    Zotero trash, and a copy is kept locally unless --no-backup. Must be run
+    from an index folder.
+    """
+    _enable_verbose(verbose)
+    if collection is not None and collection_key is not None:
+        err_console.print(
+            "[bold red]Error:[/bold red] give either --collection or --collection-key, not both."
+        )
+        raise typer.Exit(code=1)
+    try:
+        limit = parse_size(max_size)
+    except ValueError as exc:
+        err_console.print(f"[bold red]Error:[/bold red] --max-size: {escape(str(exc))}")
+        raise typer.Exit(code=1) from exc
+
+    prober = LinkProber()
+    try:
+        config = load_config()
+        if config.source_dir is None:
+            raise NotAnIndexFolderError(
+                f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
+                "or change to an index folder."
+            )
+        zot = build_client(config)
+        if not dry_run:
+            # A read-only key would otherwise fail after every file was downloaded.
+            require_write_access(zot, config)
+        roots = build_collection_tree(fetch_collections(zot))
+        scope, target, _node = _resolve_target(
+            config, roots, collection, collection_key, assume_yes, verb="check"
+        )
+        fetched: list[tuple[str, list[dict[str, object]]]] = []
+        with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
+            for collection_node in scope:
+                status.update(f"[dim]Fetching items from {escape(collection_node.name)}...[/dim]")
+                fetched.append(
+                    (collection_node.name, fetch_collection_items(zot, collection_node.key))
+                )
+            status.update("[dim]Listing annotations...[/dim]")
+            annotated = fetch_annotated_attachments(zot)
+
+        plan = build_conversion_plan(
+            fetched,
+            preference=config.index.attachment_preference,
+            every_attachment=config.index.index_all_attachments,
+        )
+        candidates = shrink_candidates(plan, fetched, annotated)
+        console.print(
+            f"\nTarget: [bold]{escape(target)}[/bold] "
+            f"({_plural(len(plan.collections), 'collection')}, "
+            f"{_plural(len(candidates), 'file')} with a transcript or eligible for one); "
+            f"looking for files larger than {format_size(limit)}.\n"
+        )
+
+        cache_dir = config.source_dir / CACHE_DIRNAME
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            transient=True,
+        ) as progress:
+            task = progress.add_task("Checking...", total=len(candidates))
+
+            def on_checked(entry: ShrinkEntry) -> None:
+                progress.update(task, advance=1, description=escape(entry.title[:50]))
+
+            entries = check_candidates(
+                candidates,
+                files=FileDownloader.from_config(config),
+                cache_dir=cache_dir,
+                max_size=limit,
+                thresholds=config.markdown.quality,
+                probe=prober,
+                jobs=jobs,
+                on_done=on_checked,
+            )
+
+        eligible = [entry for entry in entries if entry.verdict is Verdict.TRASH]
+        total = sum(entry.size or 0 for entry in eligible)
+        if eligible:
+            _print_shrink_table(eligible, "Files that can move to the Zotero trash")
+            console.print(
+                f"\n[bold]{_plural(len(eligible), 'file')}[/bold], {format_size(total)} in all."
+            )
+        else:
+            console.print("[green]No file can be moved to the trash.[/green]")
+        _print_check_manually([entry for entry in entries if entry.verdict is Verdict.CHECK])
+
+        backup_dir = None if no_backup else config.source_dir / BACKUP_DIRNAME
+        if dry_run or not eligible:
+            _print_kept(entries, verbose=_is_verbose())
+            if dry_run:
+                console.print("\n[dim]Dry run: nothing was moved or written to Zotero.[/dim]")
+            if report:
+                _write_report(report, shrink_report_rows(entries), SHRINK_REPORT_FIELDS)
+            return
+
+        if not assume_yes and not typer.confirm(
+            f"\nMove {_plural(len(eligible), 'file')} ({format_size(total)}) to the Zotero trash?",
+            default=False,
+        ):
+            for entry in eligible:
+                entry.keep(KeepReason.DECLINED)
+        else:
+            with console.status("[dim]Moving files to the trash...[/dim]") as status:
+
+                def on_trashed(entry: ShrinkEntry) -> None:
+                    status.update(f"[dim]{escape(entry.title[:60])}[/dim]")
+
+                trash_files(
+                    eligible,
+                    zot=zot,
+                    backup_dir=backup_dir,
+                    today=date.today(),
+                    on_done=on_trashed,
+                )
+    except ZoteroRagError as exc:
+        _fail(exc)
+        return
+    finally:
+        prober.close()
+
+    _print_shrink_result(entries, backup_dir)
+    _print_kept(entries, verbose=_is_verbose())
+    if report:
+        _write_report(report, shrink_report_rows(entries), SHRINK_REPORT_FIELDS)
 
 
 @app.command()

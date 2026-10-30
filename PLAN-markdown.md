@@ -426,7 +426,53 @@ For each action:
 - Ctrl-C is safe: each attachment is atomic. The worst case is a converted file
   in the cache that was never uploaded, and the next run picks it up.
 
-### Phase 5 — `shrink-storage`
+### Phase 5 — `shrink-storage` — ✅ done
+
+*As built:*
+- **Two modules:**
+  - `shrink.py` is pure: size parsing, candidates, the listing checks, judging
+    a probe, and choosing among links.
+  - `shrink_run.py` holds the I/O: the `LinkProber`, `check_candidates` (a
+    thread pool) and `trash_files`. It also builds the report rows.
+- **Candidates are the conversion plan's chosen sources.** Running
+  `build_conversion_plan` gives each one its transcript state. A file that
+  `convert` passes over has no transcript, so it can't be a candidate.
+- **Check order changed:** checks that need only the listings run first
+  (transcript, quality, annotations, link), then the size, then the user's
+  Markdown, then the probe. The size needs the file, so this order never
+  downloads a file that can't go anyway. A file is reported "below size" only
+  when everything else would have allowed it.
+- **A transcript counts only when CURRENT, with a stored `pass`.** EDITED,
+  STALE and OUTDATED are kept as "transcript not up to date". User Markdown
+  (D3) is downloaded and assessed against the source. A linked-file user MD
+  can't vouch for its source.
+- **The cache is checked against Zotero's md5** before the file is measured or
+  backed up. A stale copy is downloaded again.
+- **The probe:**
+  - The HEAD request is advisory. The ranged GET decides status, type and
+    magic bytes.
+  - The size comes from the `Content-Range` total. If the server ignored the
+    range, it comes from `Content-Length`. Failing both, it comes from a
+    **200** HEAD's length, never a 206's (a test caught that).
+  - Requests send `Accept-Encoding: identity`.
+  - PDF magic may sit anywhere in the first KB. Zip-based formats are checked
+    for `PK\x03\x04`.
+- **Declining at the prompt** is not an abort. The files are reported as kept
+  ("declined at the prompt").
+- **Trash order:** backup, then trash, then the note. If the note update fails
+  after the trash, the file stays trashed and the report says so. `convert`
+  then shows the transcript as "source no longer in Zotero", which is harmless.
+- **`--dry-run` still downloads** the files it measures, into the cache.
+  Nothing is written to Zotero.
+- **Live check on the test account** (`spike/anydoc/shrink_setup.py`, four
+  arXiv-backed papers, `--max-size 1MB`):
+  - Each paper ended as designed: one trashed (same file at the link), one
+    "check manually" (v1 link, 2,128,686 vs 2,215,244 bytes), one probe failure
+    (abstract page, `text/html`), and one below size.
+  - The server shows the source `deleted: 1` and in the trash. The transcript's
+    note reads `source_removed=2026-10-30` with the link.
+  - `convert` then reports it "source removed by shrink-storage", and a rerun
+    of `shrink-storage` finds nothing more to move.
 
 Implemented as a **separate command** rather than a flag on `convert` (D1), so a
 destructive action is never a side effect of a routine one.
@@ -480,7 +526,39 @@ Then:
 URL probing gets its own `httpx.Client`: 10 s timeout, redirects followed, a
 descriptive `User-Agent`, and at most 2 concurrent requests per host.
 
-### Phase 6 — Index integration (separate milestone, gated by eval) — 🚧 built; eval pending
+### Phase 6 — Index integration (separate milestone, gated by eval) — ✅ done; default markdown-first
+
+**Eval (item 4), 2026-10-30.** The `Networking` index no longer exists, so the
+experiment ran on the KG collection: 12 items and 15 indexed documents (11
+papers with r2 transcripts, 3 notes, 1 txt).
+- **Two scratch index folders** used the same config, differing only in
+  `attachment_preference`: PDF-first gave 932 chunks, markdown-first 1,167.
+- **The golden set was neutral:** 24 questions generated from each index (2 per
+  document), merged into 48 and evaluated on both.
+
+| | PDF first | Markdown first |
+|---|---|---|
+| mean point coverage | 0.612 | 0.612 |
+| retrieval hit / cited expected | 48/48, 48/48 | 48/48, 48/48 |
+| mean grade (0–5) | 2.50 | 2.35 |
+| prompt tokens | 126k | 109k (−13%) |
+
+- 39 of 48 grades were identical. In the 9 that differ, the judge often gave a
+  4 and a 2 to answers with the same coverage, which is the variability §11.3
+  of the PRD describes.
+- Coverage was better on 12 questions and worse on 17 (sign test p = 0.46).
+  Questions from either index behaved the same way on both.
+- **Verdict:** no measurable difference in answer quality.
+- **Decided (2026-10-30), on cost:** the default becomes **markdown-first**,
+  `[markdown, pdf, docx, odt, epub, html, txt]`. Same quality, about 13% fewer
+  prompt tokens. A folder's `attachment_preference` overrides it: putting
+  `markdown` after `html` indexes the originals. Index folders created before
+  this list their own preference without `markdown`, so they keep indexing
+  originals until it is added.
+- **Limitation:** with 15 documents and `top_k` 10, every question hit, so this
+  measures answer quality and cannot separate retrieval quality. A larger
+  collection could still differ there.
+
 
 *As built (items 1–3 and 5):*
 - **`DocumentFormat.MARKDOWN`** (`markdown`, cached as `.md`) is what

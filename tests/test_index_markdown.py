@@ -21,6 +21,9 @@ from zotero_rag.vectorstore import VectorStore
 
 FileFactory = Callable[[str, bytes | str], Path]
 MARKDOWN_FIRST = ["markdown", "pdf", "docx", "odt", "epub", "html", "txt"]
+PDF_FIRST = ["pdf", "docx", "odt", "epub", "html", "markdown", "txt"]
+# What `init` wrote before Markdown was a format of its own.
+OLD_FOLDER = ["pdf", "docx", "odt", "epub", "html", "txt"]
 
 
 # --- Reading Markdown ---------------------------------------------------------------
@@ -107,12 +110,35 @@ def indexed(plan: Any) -> list[str]:
     return sorted(attachment.attachment_key for attachment in plan.attachments)
 
 
-def test_by_default_the_pdf_is_indexed_and_its_transcript_is_not() -> None:
+def test_by_default_the_transcript_is_indexed_instead_of_its_pdf() -> None:
     plan = plan_of(paper(), attachment("PDFKEY01"), transcript_of("PDFKEY01"))
+
+    assert indexed(plan) == ["MDKEY001"]
+    (skip,) = plan.skipped_for(SkipReason.SAME_DOCUMENT)
+    assert (skip.key, skip.replaced_by) == ("PDFKEY01", "MDKEY001")
+
+
+def test_config_can_put_the_originals_first() -> None:
+    plan = plan_of(paper(), attachment("PDFKEY01"), transcript_of("PDFKEY01"), preference=PDF_FIRST)
 
     assert indexed(plan) == ["PDFKEY01"]
     (skip,) = plan.skipped_for(SkipReason.SAME_DOCUMENT)
     assert (skip.key, skip.replaced_by) == ("MDKEY001", "PDFKEY01")
+
+
+def test_a_folder_made_before_markdown_existed_keeps_its_originals() -> None:
+    # Its list never mentions markdown, which therefore ranks last.
+    plan = plan_of(
+        paper(), attachment("PDFKEY01"), transcript_of("PDFKEY01"), preference=OLD_FOLDER
+    )
+
+    assert indexed(plan) == ["PDFKEY01"]
+
+
+def test_without_a_transcript_the_default_still_prefers_the_pdf() -> None:
+    plan = plan_of(paper(), attachment("PDFKEY01"), attachment("SNAPSHT1", "text/html"))
+
+    assert indexed(plan) == ["PDFKEY01"]
 
 
 def test_markdown_first_indexes_the_transcript_instead() -> None:
@@ -134,7 +160,7 @@ def test_never_both_copies_even_when_indexing_every_attachment() -> None:
         index_all_attachments=True,
     )
 
-    assert indexed(plan) == ["PDFKEY01"]
+    assert indexed(plan) == ["MDKEY001"]
 
 
 def test_a_transcript_does_not_push_out_a_supplement() -> None:

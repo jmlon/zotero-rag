@@ -251,22 +251,77 @@ about what it touches:
   after asking you (set `FIRECRAWL_API_KEY` for higher limits).
 
 **Indexing the transcripts.** A transcript and the file it came from are the
-same document, so `index` reads only one of them: by default the original. To
-index transcripts instead, put `markdown` first in `attachment_preference`:
+same document, so `index` reads only one of them, and by default the transcript:
+in a measured comparison it answered as well as the PDF for about 13% fewer
+prompt tokens. Citations still read `p. 4`, since the transcript keeps the PDF's
+page numbers. Papers without a transcript are indexed from their files as before.
+Markdown you attached yourself counts as a transcript too, and is preferred
+over the item's other files.
+
+To index the originals instead, move `markdown` after the formats it transcribes
+in the folder's `config.yaml`:
 
 ```yaml
 index:
-  attachment_preference: [markdown, pdf, docx, odt, epub, html, txt]
+  attachment_preference: [pdf, docx, odt, epub, html, markdown, txt]
 ```
 
-The next `index` run embeds the transcripts and drops the old copies' chunks, so
-no passage is retrieved twice. Citations still read `p. 4`: the transcript keeps
-the PDF's page numbers.
+Either way, the next `index` run embeds the copy now preferred and drops the
+other copy's chunks, so no passage is retrieved twice. An index folder created
+before this change lists its own `attachment_preference` without `markdown`, and
+keeps indexing the originals until `markdown` is added to that list.
 
 `--limit N` and `--only-item KEY` try it on a few papers first; `--report run.csv`
 (or `.json`) writes a row per paper with its state, outcome and quality verdict.
 Transcripts are tagged `zotero-rag:markdown`, so Zotero's tag selector shows them
 all.
+
+### Freeing Zotero storage
+
+```bash
+zotero-rag shrink-storage --max-size 20MB --dry-run   # what could go, and why the rest stays
+zotero-rag shrink-storage --max-size 20MB
+```
+
+Once a paper has a good transcript, its large PDF may be worth keeping only as a
+link. `shrink-storage` moves a stored file to the **Zotero trash** only when all
+of these hold:
+
+- it is larger than `--max-size` (`500KB`, `20MB`, `1.5GB`; 1 KB = 1024 bytes);
+- its transcript is up to date and **passed the quality check**. Markdown you
+  attached yourself is checked against the file there and then;
+- it has **no annotations**. Deleting a PDF deletes its highlights and comments
+  in Zotero, which no transcript replaces;
+- the same item has a **Link to URI attachment** that serves the very same file:
+  it must answer, with the same content type and the right file signature
+  (`%PDF`), and **exactly the same size**. The item's own URL and DOI fields are
+  not used.
+
+A link that serves a file of the right kind, but of another size (or of no
+stated size), is listed under **Check manually** with both sizes. It may be
+another version of the paper, so the file is kept and the decision is yours.
+
+The run lists the files it would move with their total size, and asks once.
+Then, for each file:
+
+- **A copy is kept** in `shrink-backup/` in the index folder (`--no-backup`
+  skips it).
+- **The file moves to the Zotero trash.** Nothing is ever deleted outright, so
+  a file can be restored from the trash.
+- **The transcript's note records** that its source was removed, and where it
+  can be downloaded again.
+
+`convert` then reports that transcript as "source removed by shrink-storage" and
+never regenerates it.
+
+**Zotero frees the storage only when the trash is emptied.** Emptying it is
+left to you, in the Zotero application; by default Zotero also empties it after
+30 days.
+
+`--dry-run` checks everything (it downloads files to measure them, and asks
+each link) but moves nothing. `--report shrink.csv` (or `.json`) writes a row
+per file: moved, check manually, or kept with the reason. Run it with `-v` to
+see every kept file and why.
 
 ### 4. Ask questions
 
@@ -463,7 +518,7 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `retrieval` | `hybrid` | `vector` (embeddings only) or `hybrid` (also BM25 keyword search) |
 | `reranker` | `null` | `cohere` re-scores retrieved passages against the question (needs `COHERE_API_KEY`) |
 | `reranker_fanout` | `4` | candidates retrieved per final passage, for the reranker to choose from |
-| `attachment_preference` | `[pdf, docx, odt, epub, html, markdown, txt]` | which attachment wins when an item has several; also whether a converted paper is indexed from its source or its transcript |
+| `attachment_preference` | `[markdown, pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several; also whether a converted paper is indexed from its source or its transcript |
 | `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
 | `index_notes` | `true` | index your Zotero notes alongside each item's file |
 | `chunk_size` / `chunk_overlap` | `1000` / `200` | characters per chunk, and overlap between them |
@@ -504,6 +559,7 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   cache/             downloaded attachments and transcripts, kept so re-indexing
                      does not re-download
   collections.json   the indexed collection tree, rewritten by every `index` run
+  shrink-backup/     copies of the files `shrink-storage` moved to the Zotero trash
   .zotero-rag-ui/    the terminal UI's prompt history (and its -v log)
 ```
 

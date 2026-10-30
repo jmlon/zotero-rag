@@ -135,8 +135,9 @@ class IndexConfig(BaseModel):
     # Which attachment to index when an item offers several readable ones. Roughly
     # a hundred items in a real library hold both a PDF and an HTML snapshot of the
     # same article, so indexing everything would embed that content twice (§11.2).
+    # `markdown` first indexes `convert`'s transcripts instead of their sources.
     attachment_preference: list[str] = Field(
-        default_factory=lambda: ["pdf", "docx", "odt", "epub", "html", "markdown", "txt"]
+        default_factory=lambda: ["markdown", "pdf", "docx", "odt", "epub", "html", "txt"]
     )
     index_all_attachments: bool = False
     # Notes complement an item's file rather than competing with it.

@@ -29,19 +29,20 @@ PDF_CONTENT_TYPE = "application/pdf"
 LINKED_URL_MODE = "linked_url"
 LINKED_FILE_MODE = "linked_file"
 
-# Order used when config gives none. PDFs first because a published PDF is the
-# authoritative copy; a snapshot of the same article is usually the abstract page
-# plus site furniture.
+# Order used when config gives none. Markdown first: a transcript made by
+# `convert` is the same document as its source, and indexing it measured equal
+# in answer quality for 13% fewer prompt tokens (PLAN-markdown, Phase 6). It only
+# chooses between the two copies of a converted document — an item without a
+# transcript still ranks its own files below. Then PDFs, because a published PDF
+# is the authoritative copy; a snapshot is usually the abstract page plus site
+# furniture.
 DEFAULT_PREFERENCE: tuple[DocumentFormat, ...] = (
+    DocumentFormat.MARKDOWN,
     DocumentFormat.PDF,
     DocumentFormat.DOCX,
     DocumentFormat.ODT,
     DocumentFormat.EPUB,
     DocumentFormat.HTML,
-    # After the formats it transcribes until `eval` shows a transcript retrieves
-    # better (PLAN-markdown, Phase 6): the order decides which copy of a converted
-    # document is indexed, the source or its transcript.
-    DocumentFormat.MARKDOWN,
     DocumentFormat.TEXT,
 )
 
