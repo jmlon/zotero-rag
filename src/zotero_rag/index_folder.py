@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from zotero_rag.config import CONFIG_FILENAME, Config, load_config
+from zotero_rag.config import CONFIG_FILENAME, Config, is_reranker_name, load_config
 from zotero_rag.errors import (
     ConfigError,
     FingerprintMismatchError,
@@ -102,15 +102,18 @@ def open_index(on_notice: NoticeFn) -> tuple[Config, VectorStore]:
 def resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | None, str | None]:
     """The reranker to use and its name, honouring `--reranker none` as "off".
 
-    Returns `(None, None)` when disabled. Building it asserts the Cohere credential,
-    so a folder that asks for reranking without a key fails immediately.
+    Returns `(None, None)` when disabled. Building it asserts the credential it
+    needs, so a folder that asks for reranking without a key fails immediately.
     """
     name = config.reranker if override is None else (None if override == "none" else override)
     if name is None:
         return None, None
-    if name != "cohere":
-        raise ConfigError(f"Unknown reranker {name!r}. Use `cohere`, or `none` to disable it.")
-    return build_reranker(config), name
+    if not is_reranker_name(name):
+        raise ConfigError(
+            f"Unknown reranker {name!r}. Use an OpenRouter reranker id such as "
+            "`cohere/rerank-4-fast`, `cohere` for Cohere's own API, or `none` to disable it."
+        )
+    return build_reranker(config, name), name
 
 
 def build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:

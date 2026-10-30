@@ -106,8 +106,9 @@ Now open `.env` and fill in `ZOTERO_LIBRARY_ID`, `ZOTERO_API_KEY`, and
 file; `config.yaml` holds the *names* of those variables, never their values, so it
 is safe to commit.
 
-`COHERE_API_KEY` is also in the template but can be left blank — it is only needed if
-you turn on reranking, and nothing asks for it until you do.
+`COHERE_API_KEY` is also in the template but can be left blank — it is only needed for
+`reranker: cohere`, which calls Cohere directly. Rerankers on OpenRouter use your
+OpenRouter key.
 
 **You don't need a copy of your keys in every index folder.** `.env` files are
 layered, nearest first — the index folder, then each parent folder, then `~/.env` —
@@ -330,7 +331,7 @@ zotero-rag query "What makes an abstract effective?"
 zotero-rag query "..." --top-k 10        # retrieve more passages
 zotero-rag query "..." --window 2        # also send each hit's neighbours
 zotero-rag query "..." --retrieval vector # embeddings only, no keyword search
-zotero-rag query "..." --reranker cohere  # re-score the passages against the question
+zotero-rag query "..." --reranker cohere/rerank-4-fast  # re-score the passages against the question
 zotero-rag query "..." --show-sources    # print the full text of each passage
 zotero-rag query "..." --json            # machine-readable answer/sources/usage
 zotero-rag query "..." -v                # prompt and completion token counts
@@ -344,7 +345,7 @@ inventing an answer — that is the point of the citations.
 
 ```bash
 zotero-rag-ui                     # from inside an index folder
-zotero-rag-ui --top-k 5 --reranker cohere   # same flags as `query`
+zotero-rag-ui --top-k 5 --reranker cohere/rerank-4-fast   # same flags as `query`
 ```
 
 The screen has three panes: the collection's folders on the left, the answers on the
@@ -515,26 +516,32 @@ are what they are:
   already retrieved, so windowing cannot help you find a paper you missed.
 
 - **Reranking is the best thing you can turn on, and it makes queries *cheaper*.**
-  With `reranker: cohere`, the tool retrieves four times as many passages as it needs,
-  has Cohere's cross-encoder score each one against your actual question, and keeps
-  only the best. Measured: `top_k: 5` with reranking matched `top_k: 10` without it on
+  With a reranker, the tool retrieves four times as many passages as it needs, has a
+  cross-encoder score each one against your actual question, and keeps only the best. Measured: `top_k: 5` with reranking matched `top_k: 10` without it on
   score, beat it on point coverage (73.8% vs 68–72%), raised the share of questions
   that found the right paper from 86% to 95% — and sent **half as much text** to the
-  answering model. It is off by default only because it needs a Cohere API key.
+  answering model. Those numbers are Cohere's Rerank 4 Fast, measured through
+  Cohere's own API; `cohere/rerank-4-fast` is the same model through OpenRouter.
 
-The shipped defaults are the best combination measured *without* extra credentials:
-`top_k: 10` with hybrid retrieval. If you have a Cohere key, the better and cheaper
-setting is `top_k: 5` with `reranker: cohere`.
+The shipped defaults leave reranking off and use `top_k: 10` with hybrid retrieval.
+The better and cheaper setting is `top_k: 5` with a reranker. Any id from the
+`rerankers` list in `config.yaml` works, called through OpenRouter on the key you
+already have; `reranker: cohere` still calls Cohere's own API with `COHERE_API_KEY`.
 
 ```yaml
 index:
     top_k: 5
     retrieval: hybrid
-    reranker: cohere      # needs COHERE_API_KEY in your .env
+    reranker: cohere/rerank-4-fast   # or voyageai/rerank-3, qwen/qwen3-reranker-8b, ...
 ```
 
+A rate-limited rerank request is retried with backoff; one that still fails falls back
+to the retrieved order for that question, and `eval` reports how many questions ran
+unreranked. An unknown model or a rejected key stops the run instead.
+
 A note on cost, since "cheaper" is easy to over-read: reranking halves the *text sent
-to the LLM*, but adds one Cohere request per question, billed separately. Whether your
+to the LLM*, but adds one rerank request per question, billed separately (Cohere per
+search, the others per million tokens; see the `rerankers` list). Whether your
 total bill goes down depends on the two providers' prices, which the tool does not yet
 track. What is measured is that you get better answers from less context.
 
@@ -548,7 +555,7 @@ automatically.
 zotero-rag eval --top-k 10                 # compare against your current setting
 zotero-rag eval --retrieval vector         # what hybrid is buying you
 zotero-rag eval --window 2                 # is windowing worth it for your library?
-zotero-rag eval --top-k 5 --reranker cohere  # better and cheaper, if you have the key
+zotero-rag eval --top-k 5 --reranker cohere/rerank-4-fast  # better and cheaper
 zotero-rag query "..." --top-k 10
 ```
 
@@ -564,7 +571,7 @@ Edit the `config.yaml` in the index folder. Useful settings:
 | `top_k` | `10` | passages retrieved per question; `5` is cheaper, `20` is not better |
 | `retrieval_window` | `0` | also send N neighbouring chunks either side of each hit |
 | `retrieval` | `hybrid` | `vector` (embeddings only) or `hybrid` (also BM25 keyword search) |
-| `reranker` | `null` | `cohere` re-scores retrieved passages against the question (needs `COHERE_API_KEY`) |
+| `reranker` | `null` | re-scores retrieved passages against the question: an OpenRouter reranker id from the `rerankers` list (e.g. `cohere/rerank-4-fast`), or `cohere` for Cohere's own API (needs `COHERE_API_KEY`) |
 | `reranker_fanout` | `4` | candidates retrieved per final passage, for the reranker to choose from |
 | `attachment_preference` | `[markdown, pdf, docx, odt, epub, html, txt]` | which attachment wins when an item has several; also whether a converted paper is indexed from its source or its transcript |
 | `index_all_attachments` | `false` | `true` indexes every readable attachment, not just the best |
@@ -632,8 +639,8 @@ This is a proof of concept, and deliberately narrow:
   miss its paper no matter how many passages you retrieve — deeper retrieval, keyword
   search and reranking were all measured against one such question and none of them
   found it.
-- Reranking needs a Cohere API key, a second provider alongside OpenRouter, and its
-  cost is not included in the token counts the tool reports.
+- Reranking cost is not included in the token counts the tool reports; the
+  `rerankers` list in `config.yaml` has each reranker's price.
 - The keyword index is rebuilt each time the tool starts, so on a very large store
   `query` pays a second or two before answering. `retrieval: vector` avoids it.
 - **Everything is remote per call:** no batching or concurrency yet, so a large

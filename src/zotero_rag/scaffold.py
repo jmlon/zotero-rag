@@ -61,8 +61,8 @@ def render_env_template(global_config: GlobalConfig) -> str:
 {global_config.api_key_env}=
 
 # Cohere — OPTIONAL, leave blank unless you set `reranker: cohere` in config.yaml.
-# Reranking measurably improves answers and sends less text to the LLM, but it is a
-# second provider: https://dashboard.cohere.com/api-keys
+# An OpenRouter reranker such as `reranker: cohere/rerank-4-fast` uses the
+# OpenRouter key above instead: https://dashboard.cohere.com/api-keys
 {global_config.cohere_api_key_env}=
 
 # Firecrawl — OPTIONAL, only for `convert --ocr hosted`, which sends scanned PDF

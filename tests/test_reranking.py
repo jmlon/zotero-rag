@@ -13,7 +13,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from zotero_rag import reranking
 from zotero_rag.config import Config
+from zotero_rag.embedding import MAX_RETRIES
 from zotero_rag.errors import MissingCredentialError
 from zotero_rag.querying import answer_question
 from zotero_rag.reranking import (
@@ -137,10 +139,18 @@ def stub_transport(handler):  # type: ignore[no-untyped-def]
     return httpx.MockTransport(handler)
 
 
+@pytest.fixture(autouse=True)
+def sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """The backoff between retries, recorded instead of slept."""
+    slept: list[float] = []
+    monkeypatch.setattr(reranking.time, "sleep", slept.append)
+    return slept
+
+
 def test_building_a_reranker_without_a_key_fails_early() -> None:
     """Before a single question is embedded, not part-way through a run."""
     with pytest.raises(MissingCredentialError, match="COHERE_API_KEY"):
-        build_reranker(cohere_config(key=""))
+        build_reranker(cohere_config(key=""), "cohere")
 
 
 def test_the_request_carries_the_model_query_and_documents(
@@ -159,7 +169,7 @@ def test_the_request_carries_the_model_query_and_documents(
         httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
     )
 
-    rerank = build_reranker(cohere_config())
+    rerank = build_reranker(cohere_config(), "cohere")
     result = rerank("what is fog?", ["doc one", "doc two"], 2)
 
     assert result == [(1, 0.9)]
@@ -186,7 +196,7 @@ def test_top_n_is_clamped_to_the_documents_sent(monkeypatch: pytest.MonkeyPatch)
         httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
     )
 
-    build_reranker(cohere_config())("q", ["only one"], 10)
+    build_reranker(cohere_config(), "cohere")("q", ["only one"], 10)
 
     body = seen["body"]
     assert isinstance(body, dict)
@@ -204,19 +214,22 @@ def test_a_client_error_is_a_configuration_fault(
     )
 
     with pytest.raises(RerankError, match="rerank-v4.0-fast"):
-        build_reranker(cohere_config())("q", ["a", "b"], 2)
+        build_reranker(cohere_config(), "cohere")("q", ["a", "b"], 2)
 
 
-def test_a_server_error_stays_transient(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_a_server_error_stays_transient(
+    monkeypatch: pytest.MonkeyPatch, sleeps: list[float]
+) -> None:
     """A 503 may well succeed next time, so it is not a RerankError."""
     transport = stub_transport(lambda request: httpx.Response(503, text="try later"))
     monkeypatch.setattr(
         httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
     )
 
-    rerank = build_reranker(cohere_config())
+    rerank = build_reranker(cohere_config(), "cohere")
     with pytest.raises(httpx.HTTPStatusError):
         rerank("q", ["a", "b"], 2)
+    assert len(sleeps) == MAX_RETRIES
 
     # And through apply_rerank it degrades rather than failing the question.
     picked, reranked = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
@@ -233,7 +246,123 @@ def test_a_malformed_result_entry_is_skipped(monkeypatch: pytest.MonkeyPatch) ->
         httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
     )
 
-    assert build_reranker(cohere_config())("q", ["a"], 1) == [(0, 0.0)]
+    assert build_reranker(cohere_config(), "cohere")("q", ["a"], 1) == [(0, 0.0)]
+
+
+# --- the OpenRouter client ------------------------------------------------
+
+
+def openrouter_config(key: str = "router-key") -> Config:
+    config = Config()
+    config.global_.api_key = key
+    return config
+
+
+def responding(monkeypatch: pytest.MonkeyPatch, *responses: httpx.Response) -> list[dict]:  # type: ignore[type-arg]
+    """Serve `responses` in turn (the last one repeats); returns each request seen."""
+    seen: list[dict] = []  # type: ignore[type-arg]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(
+            {
+                "url": str(request.url),
+                "auth": request.headers.get("Authorization"),
+                "body": json.loads(request.content),
+            }
+        )
+        return responses[min(len(seen), len(responses)) - 1]
+
+    transport = stub_transport(handler)
+    monkeypatch.setattr(
+        httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
+    )
+    return seen
+
+
+def test_an_openrouter_reranker_calls_the_openrouter_endpoint_with_its_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = responding(
+        monkeypatch,
+        httpx.Response(
+            200,
+            json={
+                "results": [{"index": 1, "relevance_score": 0.2}],
+                "usage": {"total_tokens": 56, "cost": 0},
+            },
+        ),
+    )
+
+    result = build_reranker(openrouter_config(), "voyageai/rerank-3")("fog?", ["a", "b"], 1)
+
+    assert result == [(1, 0.2)]
+    assert seen[0]["url"] == "https://openrouter.ai/api/v1/rerank"
+    # The OpenRouter key, not a Cohere one: no second provider to sign up for.
+    assert seen[0]["auth"] == "Bearer router-key"
+    assert seen[0]["body"]["model"] == "voyageai/rerank-3"
+    assert seen[0]["body"]["top_n"] == 1
+
+
+def test_an_openrouter_reranker_needs_only_the_openrouter_key() -> None:
+    with pytest.raises(MissingCredentialError, match="OPENROUTER_API_KEY"):
+        build_reranker(openrouter_config(key=""), "cohere/rerank-4-fast")
+    # No Cohere key is set, and none is asked for.
+    build_reranker(openrouter_config(), "cohere/rerank-4-fast")
+
+
+def test_a_rate_limit_is_waited_out(monkeypatch: pytest.MonkeyPatch, sleeps: list[float]) -> None:
+    seen = responding(
+        monkeypatch,
+        httpx.Response(429, headers={"Retry-After": "3"}, text="slow down"),
+        httpx.Response(429, text="slow down"),
+        httpx.Response(200, json={"results": [{"index": 0, "relevance_score": 0.9}]}),
+    )
+
+    result = build_reranker(openrouter_config(), "cohere/rerank-4-fast")("q", ["a"], 1)
+
+    assert result == [(0, 0.9)]
+    assert len(seen) == 3
+    # The provider's own wait first, then exponential backoff.
+    assert sleeps == [3.0, 1.0]
+
+
+def test_a_rate_limit_that_outlasts_the_retries_falls_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unlike a bad model name, a rate limit will pass: degrade, don't stop the run."""
+    seen = responding(monkeypatch, httpx.Response(429, text="slow down"))
+    rerank = build_reranker(openrouter_config(), "cohere/rerank-4-fast")
+
+    with pytest.raises(httpx.HTTPStatusError):
+        rerank("q", ["a", "b"], 2)
+    assert len(seen) == MAX_RETRIES + 1
+
+    picked, reranked = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
+    assert len(picked) == 2 and reranked is False
+
+
+def test_an_unknown_openrouter_model_is_a_configuration_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = responding(monkeypatch, httpx.Response(404, text="Model does not exist"))
+
+    with pytest.raises(RerankError, match="OpenRouter rejected .*nobody/reranker"):
+        build_reranker(openrouter_config(), "nobody/reranker")("q", ["a"], 1)
+    assert len(seen) == 1
+
+
+def test_reranker_names_are_validated_in_the_config() -> None:
+    assert Config.model_validate({"index": {"reranker": "cohere/rerank-4-fast"}}).reranker == (
+        "cohere/rerank-4-fast"
+    )
+    with pytest.raises(ValueError, match="unknown reranker 'magic'"):
+        Config.model_validate({"index": {"reranker": "magic"}})
+
+
+def test_the_reranker_model_follows_the_reranker() -> None:
+    config = Config()
+    assert config.reranker_model_for("cohere") == config.index.reranker_model
+    assert config.reranker_model_for("voyageai/rerank-3") == "voyageai/rerank-3"
 
 
 # --- through the query pipeline ------------------------------------------

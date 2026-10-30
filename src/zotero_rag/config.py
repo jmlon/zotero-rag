@@ -19,11 +19,11 @@ import os
 import re
 from importlib import resources
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import AfterValidator, BaseModel, ConfigDict, Field, model_validator
 
 from zotero_rag.errors import ConfigError, MissingCredentialError
 
@@ -33,13 +33,35 @@ CONFIG_FILENAME = "config.yaml"
 ENV_FILENAME = ".env"
 
 
+#: `reranker: cohere` calls Cohere's own API with `reranker_model`; any other value
+#: is a reranker id on OpenRouter (`provider/model`), called with the OpenRouter key.
+COHERE_RERANKER = "cohere"
+
+
+def is_reranker_name(name: str) -> bool:
+    """`cohere`, or something shaped like an OpenRouter id (`provider/model`)."""
+    return name == COHERE_RERANKER or "/" in name.strip("/")
+
+
+def _reranker_name(value: str | None) -> str | None:
+    if value is not None and not is_reranker_name(value):
+        raise ValueError(
+            f"unknown reranker {value!r}: use `cohere`, or an OpenRouter reranker id "
+            "such as `cohere/rerank-4-fast` (see the `rerankers` list)"
+        )
+    return value
+
+
+RerankerName = Annotated[str | None, AfterValidator(_reranker_name)]
+
+
 class Defaults(BaseModel):
     """Model / backend defaults, inherited by an index unless it overrides them."""
 
     llm_model: str = "openai/gpt-4o-mini"
     embedding_model: str = "openai/text-embedding-3-small"
     vector_db: str = "chroma"
-    reranker: str | None = None
+    reranker: RerankerName = None
 
 
 class GlobalConfig(BaseModel):
@@ -49,8 +71,8 @@ class GlobalConfig(BaseModel):
     api_key_env: str = "OPENROUTER_API_KEY"
     zotero_library_id_env: str = "ZOTERO_LIBRARY_ID"
     zotero_api_key_env: str = "ZOTERO_API_KEY"
-    #: Only needed when a reranker is enabled (§11.4.3). Cohere is a second provider
-    #: because OpenRouter proxies chat and embeddings but not reranking.
+    #: Only needed for `reranker: cohere` (§11.4.3), which calls Cohere directly. A
+    #: reranker id such as `cohere/rerank-4-fast` goes through OpenRouter instead.
     cohere_api_key_env: str = "COHERE_API_KEY"
     #: Optional, for `convert --ocr hosted`: Firecrawl Parse also works keyless,
     #: at lower limits, so a missing key is never an error.
@@ -97,7 +119,7 @@ class GlobalConfig(BaseModel):
             raise MissingCredentialError([self.api_key_env], "OpenRouter")
 
     def require_cohere(self) -> None:
-        """Asserted only when a reranker is enabled, never for an ordinary query."""
+        """Asserted only for `reranker: cohere`, never for an ordinary query."""
         if not self.cohere_api_key:
             raise MissingCredentialError([self.cohere_api_key_env], "Cohere reranking")
 
@@ -123,9 +145,12 @@ class IndexConfig(BaseModel):
     #: default because it measured better on two independent question sets at no
     #: token cost; `vector` remains available and is faster to start on a huge store.
     retrieval: Literal["vector", "hybrid"] = "hybrid"
-    #: null => inherit `global.defaults.reranker`. `cohere` reranks the candidates
+    #: null => inherit `global.defaults.reranker`. A reranker reorders the candidates
     #: before the answer is built (§11.4.3); it composes with any `retrieval` mode.
-    reranker: Literal["cohere"] | None = None
+    #: An OpenRouter reranker id (`cohere/rerank-4-fast`), or `cohere` for Cohere's
+    #: own API with `reranker_model`.
+    reranker: RerankerName = None
+    #: The model for `reranker: cohere` only; an OpenRouter reranker names its own.
     reranker_model: str = "rerank-v4.0-fast"
     #: Candidates retrieved per final passage, so the reranker has room to discard.
     #: A fanout of 1 lets it only reorder, which changes nothing about what is sent.
@@ -252,6 +277,39 @@ class EmbeddingModelSpec(BaseModel):
         return tokens * self.pricing.input / 1_000_000
 
 
+class RerankerPricing(BaseModel):
+    """What reranking costs, as the provider quotes it.
+
+    Providers quote in two units: Cohere per search (one query against up to 100
+    documents), Voyage and Qwen per million tokens of query plus documents. The
+    unit is kept, not converted, because which is cheaper depends on how many and
+    how long the documents reranked are.
+    """
+
+    currency: str = "USD"
+    unit: Literal["per_1M_tokens", "per_search"] = "per_1M_tokens"
+    input: float = Field(ge=0.0)
+
+
+class RerankerSpec(BaseModel):
+    """One entry of the `rerankers` catalogue: a reranker on OpenRouter and its price."""
+
+    id: str
+    provider: str = ""
+    #: Tokens of query plus one document; a longer document is truncated.
+    context_window: int | None = None
+    pricing: RerankerPricing | None = None
+    notes: str = ""
+
+    def cost(self, searches: int, tokens: int) -> float | None:
+        """The price of `searches` reranking calls over `tokens` in all, if listed."""
+        if self.pricing is None:
+            return None
+        if self.pricing.unit == "per_search":
+            return searches * self.pricing.input
+        return tokens * self.pricing.input / 1_000_000
+
+
 class Config(BaseModel):
     """The merged configuration for a run."""
 
@@ -263,6 +321,8 @@ class Config(BaseModel):
     markdown: MarkdownConfig = Field(default_factory=MarkdownConfig)
     #: Candidate embedding models for `compare-embeddings`, with their prices.
     embedding_models: list[EmbeddingModelSpec] = Field(default_factory=list)
+    #: Rerankers available on OpenRouter, with their prices.
+    rerankers: list[RerankerSpec] = Field(default_factory=list)
 
     # Directory the index config was loaded from, when there was one.
     source_dir: Path | None = Field(default=None, exclude=True)
@@ -286,6 +346,10 @@ class Config(BaseModel):
         """The reranker to use, or `None` for no reranking."""
         return self.index.reranker or self.global_.defaults.reranker
 
+    def reranker_model_for(self, name: str) -> str:
+        """The model `name` reranks with: its own id, or `reranker_model` for Cohere."""
+        return self.index.reranker_model if name == COHERE_RERANKER else name
+
     @property
     def embedding_model(self) -> str:
         return self.index.embedding_model or self.global_.defaults.embedding_model
@@ -297,6 +361,10 @@ class Config(BaseModel):
     def embedding_model_spec(self, model_id: str) -> EmbeddingModelSpec | None:
         """The catalogue entry for `model_id`, if it is listed."""
         return next((spec for spec in self.embedding_models if spec.id == model_id), None)
+
+    def reranker_spec(self, model_id: str) -> RerankerSpec | None:
+        """The `rerankers` catalogue entry for `model_id`, if it is listed."""
+        return next((spec for spec in self.rerankers if spec.id == model_id), None)
 
 
 def env_file_candidates(directory: Path | None = None) -> list[Path]:

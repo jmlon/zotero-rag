@@ -17,7 +17,14 @@ from langchain_openai import ChatOpenAI
 from typer.testing import CliRunner
 
 from zotero_rag import cli, evaluation
-from zotero_rag.config import Config, EmbeddingModelSpec, EmbeddingPricing, load_config
+from zotero_rag.config import (
+    Config,
+    EmbeddingModelSpec,
+    EmbeddingPricing,
+    RerankerPricing,
+    RerankerSpec,
+    load_config,
+)
 from zotero_rag.embedding import DEFAULT_BATCH_SIZE, MAX_RETRIES, build_embeddings
 from zotero_rag.embedding_comparison import (
     chunkings,
@@ -143,6 +150,29 @@ def test_the_catalogue_is_loaded_from_the_packaged_defaults(tmp_path: Path) -> N
     spec = config.embedding_model_spec("openai/text-embedding-3-small")
     assert spec is not None and spec.cost(1_000_000) == pytest.approx(0.02)
     assert config.embedding_model_spec("unknown/model") is None
+
+
+def test_the_reranker_catalogue_is_loaded_from_the_packaged_defaults(tmp_path: Path) -> None:
+    config = load_config(tmp_path)
+    assert len(config.rerankers) == len({spec.id for spec in config.rerankers}) > 0
+    assert all(spec.pricing is not None for spec in config.rerankers)
+    assert config.reranker_spec("cohere/rerank-4-pro") is not None
+    assert config.reranker_spec("unknown/reranker") is None
+
+
+def test_a_reranker_is_priced_in_its_own_unit() -> None:
+    per_search = RerankerSpec.model_validate(
+        {"id": "a", "pricing": {"unit": "per_search", "input": 0.002}}
+    )
+    per_token = RerankerSpec.model_validate(
+        {"id": "b", "pricing": {"unit": "per_1M_tokens", "input": 0.05}}
+    )
+    # 15 questions reranking 40 chunks of ~250 tokens each.
+    assert per_search.cost(searches=15, tokens=150_000) == pytest.approx(0.03)
+    assert per_token.cost(searches=15, tokens=150_000) == pytest.approx(0.0075)
+    assert RerankerSpec(id="c").cost(searches=15, tokens=150_000) is None
+    with pytest.raises(ValueError):
+        RerankerPricing.model_validate({"unit": "per_1K_searches", "input": 2.0})
 
 
 # --- the command -----------------------------------------------------------

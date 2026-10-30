@@ -12,20 +12,24 @@ order that makes sense: a window's neighbours are context for a hit, not candida
 in their own right, so they must be added to the selection the reranker has already
 made rather than competing in it.
 
-Cohere's hosted API is used rather than a local cross-encoder because a local one
-would mean `sentence-transformers` and PyTorch, which §9 forbids outright. Reaching
-it needs no new dependency either: `httpx` is already required (§14.7), and the API
-is one POST.
+A hosted reranker is used rather than a local cross-encoder because a local one
+would mean `sentence-transformers` and PyTorch, which §9 forbids outright. Two are
+supported, both one POST over `httpx` (§14.7) with the same request and response:
+OpenRouter's `/rerank`, which takes any reranker it lists (`cohere/rerank-4-fast`,
+`voyageai/rerank-3`, ...) on the OpenRouter key every other call already uses; and
+Cohere's own API, the original `reranker: cohere`, on a separate Cohere key.
 """
 
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Callable, Sequence
 
 import httpx
 
-from zotero_rag.config import Config
+from zotero_rag.config import COHERE_RERANKER, Config
+from zotero_rag.embedding import MAX_RETRIES
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.vectorstore import StoredChunk
 
@@ -33,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 COHERE_RERANK_URL = "https://api.cohere.com/v2/rerank"
 REQUEST_TIMEOUT_S = 30.0
+#: Statuses worth another attempt: rate limits and transient server faults.
+RETRYABLE_STATUS = frozenset({429, 500, 502, 503, 504})
+MAX_RETRY_DELAY_S = 8.0
 
 #: The reranking network seam: (question, documents, top_n) -> [(index, score), ...],
 #: best first, indices into `documents`.
@@ -43,39 +50,67 @@ class RerankError(ZoteroRagError):
     """The reranker is misconfigured — a bad model name, or a rejected key."""
 
 
-def build_reranker(config: Config) -> RerankFn:
-    """A reranker calling Cohere. Requires the Cohere credential.
+def build_reranker(config: Config, name: str) -> RerankFn:
+    """A reranker for `name`: `cohere`, or a reranker id on OpenRouter.
 
     The credential is asserted here, at build time, so a misconfigured folder fails
     before a single question is embedded rather than part-way through a run.
     """
-    config.global_.require_cohere()
-    model = config.index.reranker_model
-    api_key = config.global_.cohere_api_key
-
-    def rerank(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
-        response = httpx.post(
-            COHERE_RERANK_URL,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={
-                "model": model,
-                "query": question,
-                "documents": documents,
-                "top_n": min(top_n, len(documents)),
-            },
-            timeout=REQUEST_TIMEOUT_S,
+    if name == COHERE_RERANKER:
+        config.global_.require_cohere()
+        return _reranker(
+            COHERE_RERANK_URL, config.global_.cohere_api_key, config.index.reranker_model, "Cohere"
         )
-        # A 4xx is a configuration fault — an unknown model, a rejected key, a
-        # malformed request — and it will fail identically for every remaining
-        # question. Raising beats degrading silently 21 times in a row.
-        if 400 <= response.status_code < 500:
+    config.global_.require_openrouter()
+    return _reranker(
+        f"{config.global_.endpoint.rstrip('/')}/rerank", config.global_.api_key, name, "OpenRouter"
+    )
+
+
+def _retry_delay(response: httpx.Response, attempt: int) -> float:
+    """The provider's `Retry-After` when it gives one in seconds, else backoff."""
+    try:
+        return min(float(response.headers["retry-after"]), MAX_RETRY_DELAY_S)
+    except (KeyError, ValueError):
+        return min(0.5 * 2**attempt, MAX_RETRY_DELAY_S)
+
+
+def _reranker(url: str, api_key: str, model: str, provider: str) -> RerankFn:
+    def rerank(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
+        for attempt in range(MAX_RETRIES + 1):
+            response = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={
+                    "model": model,
+                    "query": question,
+                    "documents": documents,
+                    "top_n": min(top_n, len(documents)),
+                },
+                timeout=REQUEST_TIMEOUT_S,
+            )
+            # Rate limits and server errors pass; several workers reranking at once
+            # (`compare-embeddings`) or a free tier hit them routinely.
+            if response.status_code not in RETRYABLE_STATUS or attempt == MAX_RETRIES:
+                break
+            time.sleep(_retry_delay(response, attempt))
+
+        # Any other 4xx is a configuration fault — an unknown model, a rejected key,
+        # a malformed request — and it will fail identically for every remaining
+        # question. Raising beats degrading silently 21 times in a row. A rate limit
+        # that outlasted the retries is not one: it falls back like a 5xx.
+        if 400 <= response.status_code < 500 and response.status_code != 429:
             raise RerankError(
-                f"Cohere rejected the rerank request for model {model!r} "
+                f"{provider} rejected the rerank request for model {model!r} "
                 f"(HTTP {response.status_code}): {response.text[:200]}"
             )
         response.raise_for_status()
 
-        results = response.json().get("results") or []
+        payload = response.json()
+        usage = payload.get("usage") or {}
+        if usage:
+            logger.debug("rerank usage with %s: %s", model, usage)
+        results = payload.get("results") or []
         return [
             (int(entry["index"]), float(entry.get("relevance_score", 0.0)))
             for entry in results

@@ -88,7 +88,8 @@ def main(
         str | None,
         typer.Option(
             "--reranker",
-            help="none, or cohere to re-score the retrieved passages against the question.",
+            help="Re-score the retrieved passages against the question: an OpenRouter "
+            "reranker id (e.g. cohere/rerank-4-fast), cohere for Cohere's own API, or none.",
         ),
     ] = None,
     verbose: Annotated[

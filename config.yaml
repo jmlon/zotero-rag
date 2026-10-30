@@ -113,3 +113,94 @@ embedding_models:
       unit: "per_1M_tokens"
       input: 0.00
     notes: "Rate-limited, free-tier multimodal and text model on OpenRouter."
+
+rerankers:
+  - id: "cohere/rerank-v3.5"
+    provider: "Cohere"
+    context_window: 4096
+    pricing:
+      currency: "USD"
+      unit: "per_search"
+      input: 0.001
+    notes: "Multilingual (100+ languages); the shortest window here."
+
+  - id: "cohere/rerank-4-fast"
+    provider: "Cohere"
+    context_window: 32768
+    pricing:
+      currency: "USD"
+      unit: "per_search"
+      input: 0.002
+    notes: "Cohere's latency-optimized v4 reranker."
+
+  - id: "cohere/rerank-4-pro"
+    provider: "Cohere"
+    context_window: 32768
+    pricing:
+      currency: "USD"
+      unit: "per_search"
+      input: 0.0025
+    notes: "Cohere's quality-optimized v4 reranker."
+
+  - id: "voyageai/rerank-2.5-lite"
+    provider: "Voyage AI"
+    context_window: 32000
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.02
+    notes: "Optimized for latency and quality."
+
+  - id: "voyageai/rerank-2.5"
+    provider: "Voyage AI"
+    context_window: 32000
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.05
+    notes: "Optimized for quality."
+
+  - id: "voyageai/rerank-3-lite"
+    provider: "Voyage AI"
+    context_window: 32000
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.02
+    notes: "Drop-in upgrade to rerank-2.5-lite."
+
+  - id: "voyageai/rerank-3"
+    provider: "Voyage AI"
+    context_window: 32000
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.05
+    notes: "Drop-in upgrade to rerank-2.5."
+
+  - id: "qwen/qwen3-reranker-8b"
+    provider: "Alibaba"
+    context_window: 40960
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.2
+    notes: "Open-weight reranker built on Qwen3."
+
+  - id: "nvidia/nemotron-3.5-rerank-8b:free"
+    provider: "NVIDIA"
+    context_window: 32768
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.0
+    notes: "Rate-limited free tier on OpenRouter; accepts text and images."
+
+  - id: "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
+    provider: "NVIDIA"
+    context_window: 10240
+    pricing:
+      currency: "USD"
+      unit: "per_1M_tokens"
+      input: 0.0
+    notes: "Rate-limited free tier; multimodal, built for document images."

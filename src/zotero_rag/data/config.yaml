@@ -5,8 +5,8 @@ global:
     api_key_env: OPENROUTER_API_KEY
     zotero_library_id_env: ZOTERO_LIBRARY_ID
     zotero_api_key_env: ZOTERO_API_KEY
-    # Only needed if you enable a reranker below. Cohere is a separate provider
-    # because OpenRouter proxies chat and embeddings, but not reranking.
+    # Only needed for `reranker: cohere`, which calls Cohere's own API. A reranker
+    # from the `rerankers` list goes through OpenRouter on the key above.
     cohere_api_key_env: COHERE_API_KEY
     # Optional, for `convert --ocr hosted`, which sends scanned PDF pages to
     # Firecrawl Parse. It works without a key, at lower limits.
@@ -16,7 +16,8 @@ global:
         llm_model: openai/gpt-4o-mini
         embedding_model: openai/text-embedding-3-small
         vector_db: chroma
-        # null | cohere. Inherited by the index unless it sets its own.
+        # null | an OpenRouter reranker id | cohere. Inherited by the index unless
+        # it sets its own.
         reranker: null
 
 index:
@@ -50,10 +51,12 @@ index:
 
     # Reranking re-scores the retrieved passages against the question with a
     # cross-encoder, then keeps the best top_k. It works on top of any retrieval
-    # mode above. null => inherit global.defaults.reranker; `cohere` enables it and
+    # mode above. null => inherit global.defaults.reranker. Set it to a reranker id
+    # from the `rerankers` list below (e.g. cohere/rerank-4-fast), called through
+    # OpenRouter; or to `cohere` for Cohere's own API with reranker_model, which
     # requires COHERE_API_KEY.
     reranker: null
-    reranker_model: rerank-v4.0-fast
+    reranker_model: rerank-v4.0-fast # only for `reranker: cohere`
     # Candidates retrieved per final passage: with top_k 10 and fanout 4, 40 passages
     # are retrieved and the best 10 kept. A fanout of 1 would let the reranker only
     # reorder what was already going to be sent, which is close to pointless.
@@ -176,3 +179,61 @@ embedding_models:
       context_window: 32768
       pricing: { currency: USD, unit: per_1M_tokens, input: 0.00 }
       notes: Rate-limited free tier on OpenRouter.
+
+# Rerankers available on OpenRouter (output modality `rerank`), with their prices.
+# Any of these ids can be set as `reranker:` above or passed as --reranker.
+# Units differ by provider: Cohere charges per search (one query reranking up to
+# 100 documents), the others per million tokens of query plus documents, so which
+# is cheaper depends on reranker_fanout and chunk_size. context_window is per
+# query+document pair. Prices from openrouter.ai, October 2026.
+rerankers:
+    - id: cohere/rerank-v3.5
+      provider: Cohere
+      context_window: 4096
+      pricing: { currency: USD, unit: per_search, input: 0.001 }
+      notes: Multilingual (100+ languages); the shortest window here.
+    - id: cohere/rerank-4-fast
+      provider: Cohere
+      context_window: 32768
+      pricing: { currency: USD, unit: per_search, input: 0.002 }
+      notes: Cohere's latency-optimized v4 reranker.
+    - id: cohere/rerank-4-pro
+      provider: Cohere
+      context_window: 32768
+      pricing: { currency: USD, unit: per_search, input: 0.0025 }
+      notes: Cohere's quality-optimized v4 reranker.
+    - id: voyageai/rerank-2.5-lite
+      provider: Voyage AI
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.02 }
+      notes: Optimized for latency and quality.
+    - id: voyageai/rerank-2.5
+      provider: Voyage AI
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.05 }
+      notes: Optimized for quality.
+    - id: voyageai/rerank-3-lite
+      provider: Voyage AI
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.02 }
+      notes: Drop-in upgrade to rerank-2.5-lite.
+    - id: voyageai/rerank-3
+      provider: Voyage AI
+      context_window: 32000
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.05 }
+      notes: Drop-in upgrade to rerank-2.5.
+    - id: qwen/qwen3-reranker-8b
+      provider: Alibaba
+      context_window: 40960
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.20 }
+      notes: Open-weight reranker built on Qwen3.
+    - id: nvidia/nemotron-3.5-rerank-8b:free
+      provider: NVIDIA
+      context_window: 32768
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.00 }
+      notes: Rate-limited free tier on OpenRouter; accepts text and images.
+    - id: nvidia/llama-nemotron-rerank-vl-1b-v2:free
+      provider: NVIDIA
+      context_window: 10240
+      pricing: { currency: USD, unit: per_1M_tokens, input: 0.00 }
+      notes: Rate-limited free tier; multimodal, built for document images.

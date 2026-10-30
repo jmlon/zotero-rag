@@ -757,7 +757,7 @@ def test_generate_questions_dry_run_costs_nothing(
     _generation_index_folder(tmp_path, documents=2)
     monkeypatch.chdir(tmp_path)
 
-    def must_not_build(config: object) -> object:
+    def must_not_build(config: object, name: str) -> object:
         raise AssertionError("--dry-run reached the generator")
 
     monkeypatch.setattr(cli, "build_generator", must_not_build)
@@ -819,7 +819,7 @@ def test_generate_questions_refuses_to_clobber_an_existing_set(
     monkeypatch.chdir(tmp_path)
     (tmp_path / "questions.yaml").write_text("questions: []\n", encoding="utf-8")
 
-    def must_not_build(config: object) -> object:
+    def must_not_build(config: object, name: str) -> object:
         raise AssertionError("it spent a generation call before refusing")
 
     monkeypatch.setattr(cli, "build_generator", must_not_build)
@@ -1134,7 +1134,7 @@ def test_reranking_is_off_by_default(tmp_path: Path, monkeypatch: pytest.MonkeyP
     monkeypatch.chdir(tmp_path)
     _stub_seams(monkeypatch)
 
-    def must_not_build(config: object) -> object:
+    def must_not_build(config: object, name: str) -> object:
         raise AssertionError("a reranker was built without being asked for")
 
     monkeypatch.setattr(index_folder, "build_reranker", must_not_build)
@@ -1195,7 +1195,7 @@ def test_a_configured_reranker_is_recorded_in_the_report(
     monkeypatch.chdir(tmp_path)
     _stub_seams(monkeypatch)
     monkeypatch.setattr(
-        index_folder, "build_reranker", lambda config: lambda q, docs, n: [(0, 0.9)]
+        index_folder, "build_reranker", lambda config, name: lambda q, docs, n: [(0, 0.9)]
     )
 
     result = runner.invoke(cli.app, ["eval", "--reranker", "cohere", "--json"])
@@ -1205,6 +1205,28 @@ def test_a_configured_reranker_is_recorded_in_the_report(
     assert settings["reranker_model"] == "rerank-v4.0-fast"
     assert settings["reranker_fanout"] == 4
     assert json.loads(result.stdout)["results"][0]["reranked"] is True
+
+
+def test_an_openrouter_reranker_is_recorded_by_its_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+    built: list[str] = []
+
+    def build(config: object, name: str) -> object:
+        built.append(name)
+        return lambda q, docs, n: [(0, 0.9)]
+
+    monkeypatch.setattr(index_folder, "build_reranker", build)
+
+    result = runner.invoke(cli.app, ["eval", "--reranker", "voyageai/rerank-3", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert built == ["voyageai/rerank-3"]
+    settings = json.loads(result.stdout)["settings"]
+    assert settings["reranker"] == settings["reranker_model"] == "voyageai/rerank-3"
 
 
 def test_a_reranker_that_silently_fell_back_is_reported(
@@ -1218,7 +1240,7 @@ def test_a_reranker_that_silently_fell_back_is_reported(
     def flaky(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         raise RuntimeError("503")
 
-    monkeypatch.setattr(index_folder, "build_reranker", lambda config: flaky)
+    monkeypatch.setattr(index_folder, "build_reranker", lambda config, name: flaky)
 
     result = runner.invoke(cli.app, ["eval", "--reranker", "cohere"])
 

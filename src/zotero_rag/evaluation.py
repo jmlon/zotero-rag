@@ -814,7 +814,7 @@ def run_settings(
         temperature=config.index.temperature,
         judge_temperature=config.eval.judge_temperature,
         reranker=reranker,
-        reranker_model=config.index.reranker_model if reranker else None,
+        reranker_model=config.reranker_model_for(reranker) if reranker else None,
         reranker_fanout=config.index.reranker_fanout if reranker else 0,
         questions_file=str(questions_path),
         store_chunks=store.count(),
