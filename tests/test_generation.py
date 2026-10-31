@@ -16,6 +16,7 @@ from zotero_rag.evaluation import EvalQuestion, load_questions
 from zotero_rag.generation import (
     ELLIPSIS,
     MATCH_DOCUMENT,
+    SPARE_QUESTIONS,
     DocumentText,
     GeneratedQuestion,
     GenerationError,
@@ -27,6 +28,7 @@ from zotero_rag.generation import (
     dump_questions,
     file_header,
     generate_questions,
+    giveaway,
     sample_text,
     to_questions,
     write_questions,
@@ -149,23 +151,98 @@ def test_a_short_document_is_untouched() -> None:
     assert sample_text("short", 100) == ("short", False)
 
 
-def test_a_long_document_keeps_both_ends() -> None:
-    """A plain truncation would drop the conclusions, which is where the results are."""
-    text = "A" * 500 + "B" * 500 + "C" * 500
-    sampled, truncated = sample_text(text, 200)
+def test_a_long_document_is_sampled_from_beginning_to_end() -> None:
+    """Head-and-tail showed only the abstract and conclusions; the middle matters."""
+    text = "".join(letter * 2000 for letter in "ABCDEFGHIJ")
+    sampled, truncated = sample_text(text, 5000)
 
     assert truncated is True
-    assert ELLIPSIS in sampled
+    passages = sampled.split(ELLIPSIS)
+    assert len(passages) == 5
+    assert all(len(passage) == 1000 for passage in passages)
     assert sampled.startswith("A")
-    assert sampled.endswith("C")
-    assert len(sampled) == 200 + len(ELLIPSIS)
+    assert sampled.endswith("J")
+    # The middle of the document is represented, not just its ends.
+    assert len(set(sampled) & set("ABCDEFGHIJ")) >= 5
+
+
+def test_a_tiny_budget_is_one_passage_from_the_start() -> None:
+    sampled, truncated = sample_text("x" * 5000, 100)
+    assert (sampled, truncated) == ("x" * 100, True)
 
 
 def test_the_budget_is_applied_when_collecting(tmp_path: Path) -> None:
-    store = store_with(tmp_path, [chunk("ATT1:1:0", "x" * 5000)])
-    document = collect_documents(store, budget=100)[0]
+    store = store_with(tmp_path, [chunk("ATT1:1:0", "x" * 50000)])
+    document = collect_documents(store, budget=5000)[0]
     assert document.truncated is True
-    assert len(document.text) <= 100 + len(ELLIPSIS)
+    assert len(document.text) <= 5000 + 4 * len(ELLIPSIS)
+
+
+# --- questions that give their document away -----------------------------
+
+PAPER = DocumentText(
+    item_key="A",
+    title="Think-on-Graph: Deep and Responsible Reasoning of Large Language Model "
+    "on Knowledge Graph",
+    authors="Sun, Jiashuo; He, Xiaoyu",
+)
+
+
+@pytest.mark.parametrize(
+    ("question", "reason"),
+    [
+        ("How does Think-on-Graph explore relation paths?", "Think-on-Graph"),
+        ("What did Sun et al. find about beam width?", "Sun"),
+        ("How did He and colleagues prune the graph?", "He"),
+        (
+            "How does deep and responsible reasoning of large language models work?",
+            "title",
+        ),
+    ],
+)
+def test_a_question_naming_its_document_is_caught(question: str, reason: str) -> None:
+    found = giveaway(PAPER, question)
+    assert found is not None
+    assert reason in found
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        # The subject has to be named; a few title words are not the title.
+        "How can an LLM reason over a knowledge graph with beam search?",
+        # Lower-case words that happen to spell a surname or a coined name.
+        "What does the sun-like search give the model, and why does he matter?",
+    ],
+)
+def test_a_question_about_the_subject_is_kept(question: str) -> None:
+    assert giveaway(PAPER, question) is None
+
+
+def test_a_short_title_is_the_subject_not_a_giveaway() -> None:
+    document = DocumentText(item_key="A", title="Knowledge Graphs")
+    assert giveaway(document, "How are knowledge graphs completed?") is None
+
+
+def test_an_acronym_name_is_matched_by_case() -> None:
+    document = DocumentText(item_key="A", title="GIVE: Structured Reasoning with Graphs")
+    assert giveaway(document, "How does GIVE extrapolate?") is not None
+    assert giveaway(document, "What does sparse evidence give the model?") is None
+
+
+def test_giveaway_questions_are_dropped_and_counted() -> None:
+    def generate_for(document: DocumentText, count: int, language: str) -> RawGeneration:
+        return RawGeneration(
+            questions=[
+                GeneratedQuestion(question="How does Think-on-Graph work?", answer="x"),
+                GeneratedQuestion(question="How does beam search pick relations?", answer="y"),
+            ]
+        )
+
+    questions, stats = generate_questions([PAPER], generate_for, per_document=2)
+
+    assert [question.question for question in questions] == ["How does beam search pick relations?"]
+    assert stats.rejected == 1
 
 
 # --- ids -----------------------------------------------------------------
@@ -416,3 +493,76 @@ def test_a_long_title_stem_is_cut_at_a_word_boundary() -> None:
     stem = document_stem(document)
     assert stem == "traffic-engineering-with"
     assert not stem.endswith("-")
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "What limitation does the document mention about link prediction benchmarks?",
+        "How many entities does YAGO have, as stated in this paper?",
+        "How does the proposed method build prompts?",
+        "What do the authors conclude about fine-tuning?",
+    ],
+)
+def test_a_question_pointing_at_its_document_is_caught(question: str) -> None:
+    assert giveaway(PAPER, question) is not None
+
+
+def test_spare_questions_make_up_for_dropped_ones() -> None:
+    asked: list[int] = []
+
+    def generate_for(document: DocumentText, count: int, language: str) -> RawGeneration:
+        asked.append(count)
+        return RawGeneration(
+            questions=[
+                GeneratedQuestion(question="What does the paper conclude?", answer="x"),
+                GeneratedQuestion(question="How does beam search pick relations?", answer="y"),
+                GeneratedQuestion(question="Why prune paths below a threshold?", answer="z"),
+                GeneratedQuestion(question="When does a wider beam stop helping?", answer="w"),
+            ]
+        )
+
+    questions, stats = generate_questions([PAPER], generate_for, per_document=2)
+
+    assert asked == [2 + SPARE_QUESTIONS]
+    assert [question.question for question in questions] == [
+        "How does beam search pick relations?",
+        "Why prune paths below a threshold?",
+    ]
+    assert stats.rejected == 1
+
+
+def test_a_verbatim_evidence_quote_is_kept_and_a_paraphrase_is_not(tmp_path: Path) -> None:
+    document = DocumentText(
+        item_key="A",
+        title="Paths",
+        text="Setup. We set the beam width to 3 for every dataset. Results follow.",
+    )
+
+    def generate_for(document: DocumentText, count: int, language: str) -> RawGeneration:
+        return RawGeneration(
+            questions=[
+                GeneratedQuestion(
+                    question="How wide is the beam?",
+                    answer="Three.",
+                    evidence="We set the beam width to 3 for every dataset.",
+                ),
+                GeneratedQuestion(
+                    question="Is the beam the same everywhere?",
+                    answer="Yes.",
+                    evidence="The authors always use a beam of three.",
+                ),
+            ]
+        )
+
+    questions, stats = generate_questions([document], generate_for, per_document=2)
+
+    assert questions[0].expected_evidence == ["We set the beam width to 3 for every dataset."]
+    assert questions[1].expected_evidence == []
+    assert stats.without_evidence == 1
+
+    path = tmp_path / "questions.yaml"
+    path.write_text(dump_questions(questions))
+    reloaded = load_questions(path)
+    assert reloaded[0].expected_evidence == questions[0].expected_evidence
+    assert reloaded[1].expected_evidence == []

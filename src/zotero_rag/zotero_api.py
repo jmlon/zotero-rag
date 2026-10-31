@@ -24,6 +24,7 @@ from zotero_rag.config import Config
 from zotero_rag.errors import (
     AmbiguousCollectionError,
     CollectionNotFoundError,
+    RejectedCredentialError,
     ZoteroApiError,
     ZoteroConflictError,
     ZoteroWriteAccessError,
@@ -252,11 +253,13 @@ class FileDownloader:
         client: httpx.Client | None = None,
         endpoint: str = API_ENDPOINT,
         sleep: Callable[[float], None] = time.sleep,
+        key_env: str = "ZOTERO_API_KEY",
     ) -> None:
         self._base = f"{endpoint.rstrip('/')}/{library_type}s/{library_id}"
         self._headers = {"Authorization": f"Bearer {api_key}", "Zotero-API-Version": "3"}
         self._client = client or httpx.Client(timeout=httpx.Timeout(30.0, read=120.0))
         self._sleep = sleep
+        self._key_env = key_env
         self._require: Callable[[], None] = lambda: None
 
     @classmethod
@@ -270,12 +273,17 @@ class FileDownloader:
             config.global_.zotero_library_type,
             config.global_.zotero_library_id,
             config.global_.zotero_api_key,
+            key_env=config.global_.zotero_api_key_env,
         )
         downloader._require = config.global_.require_zotero
         return downloader
 
     def file(self, itemkey: str, /) -> bytes:
-        """The attachment's bytes. Raises `httpx.HTTPError` on failure."""
+        """The attachment's bytes.
+
+        Raises `RejectedCredentialError` when Zotero refuses the key, and
+        `httpx.HTTPError` on any other failure.
+        """
         self._require()
         url = f"{self._base}/items/{itemkey}/file"
         for attempt in range(1, _MAX_ATTEMPTS + 1):
@@ -285,6 +293,14 @@ class FileDownloader:
                 logger.info("Zotero asked to wait %.0fs before retrying %s", wait, itemkey)
                 self._sleep(wait)
                 continue
+            if response.status_code in (401, 403):
+                # 403 is also what a key without file access gets; either way
+                # the fix is the key, and every other download would fail too.
+                raise RejectedCredentialError(
+                    "Zotero",
+                    self._key_env,
+                    f"HTTP {response.status_code}: {response.text.strip()[:200]}",
+                )
             response.raise_for_status()
             return _uncompressed(response)
         raise AssertionError("unreachable: the last attempt returns or raises")

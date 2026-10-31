@@ -240,3 +240,125 @@ def test_empty_plan_is_a_no_op(store: VectorStore) -> None:
     assert stats.planned == 0
     assert stats.indexed == 0
     assert store.count() == 0
+
+
+def test_a_rejected_key_is_reported_without_the_unexpected_prefix(
+    store: VectorStore, pdf_factory: PdfFactory
+) -> None:
+    from zotero_rag.errors import RejectedCredentialError
+
+    pdf = pdf_factory("doc.pdf", ["Some content"])
+
+    def embed(texts: list[str]) -> list[list[float]]:
+        raise RejectedCredentialError(
+            "OpenRouter", "OPENROUTER_API_KEY", "HTTP 401: User not found."
+        )
+
+    stats = index_plan(
+        IndexPlan(attachments=[planned()]),
+        store=store,
+        download=lambda key: pdf,
+        embed=embed,
+        chunk_size=1000,
+        chunk_overlap=200,
+    )
+
+    assert stats.failed == 1
+    assert stats.failures[0].error.startswith(
+        "OpenRouter rejected the API key in OPENROUTER_API_KEY"
+    )
+
+
+def test_parallel_indexing_matches_a_serial_run(tmp_path: Path, pdf_factory: PdfFactory) -> None:
+    pdfs = {f"ATT{i}": pdf_factory(f"doc{i}.pdf", [f"Page {i} text", "More"]) for i in range(6)}
+    plan = IndexPlan(attachments=[planned(key, f"Paper {key}") for key in pdfs])
+
+    def run(workers: int, name: str) -> tuple[object, set[str]]:
+        store = VectorStore(tmp_path / name)
+        stats = index_plan(
+            plan,
+            store=store,
+            download=pdfs.__getitem__,
+            embed=fake_embed,
+            chunk_size=1000,
+            chunk_overlap=200,
+            workers=workers,
+        )
+        return stats.model_dump(exclude={"elapsed_s"}), store.attachment_keys()
+
+    assert run(4, "parallel") == run(1, "serial")
+
+
+def test_a_failing_attachment_does_not_stop_the_other_workers(
+    store: VectorStore, pdf_factory: PdfFactory
+) -> None:
+    good = pdf_factory("good.pdf", ["Fine content"])
+
+    def download(key: str) -> Path:
+        if key == "BAD":
+            raise OSError("network exploded")
+        return good
+
+    plan = IndexPlan(attachments=[planned("BAD", "Broken"), planned("OK1"), planned("OK2")])
+    stats = index_plan(
+        plan,
+        store=store,
+        download=download,
+        embed=fake_embed,
+        chunk_size=1000,
+        chunk_overlap=200,
+        workers=3,
+    )
+
+    assert (stats.indexed, stats.failed) == (2, 1)
+    assert stats.failures[0].title == "Broken"
+
+
+def test_the_store_is_written_only_from_the_calling_thread(
+    store: VectorStore, pdf_factory: PdfFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import threading
+
+    pdf = pdf_factory("doc.pdf", ["Content"])
+    writers: set[str] = set()
+    add = store.add
+
+    def recording_add(**kwargs: object) -> None:
+        writers.add(threading.current_thread().name)
+        add(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(store, "add", recording_add)
+    index_plan(
+        IndexPlan(attachments=[planned(f"ATT{i}") for i in range(4)]),
+        store=store,
+        download=lambda key: pdf,
+        embed=fake_embed,
+        chunk_size=1000,
+        chunk_overlap=200,
+        workers=4,
+    )
+
+    assert writers == {threading.current_thread().name}
+
+
+def test_an_exception_from_the_progress_hook_stops_the_run(
+    store: VectorStore, pdf_factory: PdfFactory
+) -> None:
+    class Stop(Exception):
+        pass
+
+    def on_start(attachment: PlannedAttachment) -> None:
+        raise Stop
+
+    pdf = pdf_factory("doc.pdf", ["Content"])
+    with pytest.raises(Stop):
+        index_plan(
+            IndexPlan(attachments=[planned("ATT1"), planned("ATT2")]),
+            store=store,
+            download=lambda key: pdf,
+            embed=fake_embed,
+            chunk_size=1000,
+            chunk_overlap=200,
+            on_start=on_start,
+            workers=2,
+        )

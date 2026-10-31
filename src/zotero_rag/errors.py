@@ -28,6 +28,23 @@ class MissingCredentialError(ConfigError):
         )
 
 
+class RejectedCredentialError(ConfigError):
+    """A provider refused a credential that is present: wrong, revoked, or expired.
+
+    Names the provider and the variable, because the raw provider message is not
+    enough to tell the keys apart — OpenRouter answers a bad key with a bare
+    "401 - User not found".
+    """
+
+    def __init__(self, provider: str, var_name: str, detail: str) -> None:
+        self.provider = provider
+        self.var_name = var_name
+        super().__init__(
+            f"{provider} rejected the API key in {var_name} ({detail}). "
+            f"Check or replace {var_name} in your .env file."
+        )
+
+
 class NotAnIndexFolderError(ZoteroRagError):
     """The command must be run from an index folder (one containing config.yaml)."""
 

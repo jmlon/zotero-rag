@@ -11,12 +11,13 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from zotero_rag.chunking import chunk_segments
+from zotero_rag.chunking import Chunk, chunk_segments
 from zotero_rag.embedding import count_tokens
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.extraction import extract_note, extract_segments
@@ -106,88 +107,104 @@ def index_plan(
     chunk_overlap: int,
     embedding_model: str = "",
     on_start: ProgressHook | None = None,
+    workers: int = 1,
 ) -> IndexStats:
     """Index every planned attachment, skipping those already stored and unchanged.
 
     Per PRD §10, one attachment's failure never aborts the run: it is logged as a
     warning, recorded in `stats.failures`, and the pass continues.
+
+    With `workers > 1`, attachments are downloaded, extracted and embedded on that
+    many threads, since the time goes on waiting for Zotero and the embedding
+    provider. The store is only touched from the calling thread: chromadb is not
+    safe to write from several. `on_start` runs on the worker threads, and an
+    exception it raises stops the run.
     """
     stats = IndexStats(planned=len(plan.attachments))
     # Named in each warning: `compare-embeddings` builds several models at once,
     # and a rate limit is only actionable if you know whose it was.
     embedding_with = f" with {embedding_model}" if embedding_model else ""
 
+    def prepare(attachment: PlannedAttachment) -> _Prepared:
+        if on_start is not None:
+            on_start(attachment)
+        try:
+            return _prepare_attachment(attachment, download, embed, chunk_size, chunk_overlap)
+        except ZoteroRagError as exc:
+            return _Prepared(error=str(exc))
+        except Exception as exc:  # noqa: BLE001 - an unexpected error must not abort the run
+            return _Prepared(error=f"unexpected error: {exc}")
+
     with _timed(stats):
+        to_index: list[tuple[PlannedAttachment, bool]] = []
         for attachment in plan.attachments:
-            if on_start is not None:
-                on_start(attachment)
+            replacing = store.has_attachment(attachment.attachment_key)
+            if replacing and not needs_reindex(store, attachment):
+                logger.info("%s already indexed; skipping", attachment.attachment_key)
+                stats.already_indexed += 1
+                continue
+            to_index.append((attachment, replacing))
 
-            replacing = False
-            if store.has_attachment(attachment.attachment_key):
-                if not needs_reindex(store, attachment):
-                    logger.info("%s already indexed; skipping", attachment.attachment_key)
-                    stats.already_indexed += 1
+        pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="index")
+        try:
+            futures = {
+                pool.submit(prepare, attachment): (attachment, replacing)
+                for attachment, replacing in to_index
+            }
+            for future in as_completed(futures):
+                attachment, replacing = futures[future]
+                prepared = future.result()
+                if prepared.error is not None:
+                    logger.warning(
+                        "Skipping %r%s: %s", attachment.title, embedding_with, prepared.error
+                    )
+                    stats.failed += 1
+                    stats.failures.append(
+                        AttachmentFailure(
+                            attachment_key=attachment.attachment_key,
+                            title=attachment.title,
+                            error=prepared.error,
+                        )
+                    )
                     continue
-                # Changed in Zotero: drop the old chunks first, so a shorter
-                # replacement file cannot leave orphaned tail pages behind.
-                removed = store.delete_by_attachment(attachment.attachment_key)
-                logger.info(
-                    "%s changed in Zotero; re-indexing (dropped %d stale chunk(s))",
-                    attachment.attachment_key,
-                    removed,
-                )
-                replacing = True
-
-            try:
-                _index_attachment(
-                    attachment,
-                    store,
-                    download,
-                    embed,
-                    chunk_size,
-                    chunk_overlap,
-                    embedding_model,
-                    stats,
-                )
                 if replacing:
+                    # Changed in Zotero: drop the old chunks first, so a shorter
+                    # replacement file cannot leave orphaned tail pages behind.
+                    removed = store.delete_by_attachment(attachment.attachment_key)
+                    logger.info(
+                        "%s changed in Zotero; re-indexing (dropped %d stale chunk(s))",
+                        attachment.attachment_key,
+                        removed,
+                    )
+                _store_attachment(attachment, prepared, store, embedding_model, stats)
+                if replacing and prepared.chunks:
                     stats.indexed -= 1
                     stats.reindexed += 1
-            except ZoteroRagError as exc:
-                logger.warning("Skipping %r%s: %s", attachment.title, embedding_with, exc)
-                stats.failed += 1
-                stats.failures.append(
-                    AttachmentFailure(
-                        attachment_key=attachment.attachment_key,
-                        title=attachment.title,
-                        error=str(exc),
-                    )
-                )
-            except Exception as exc:  # noqa: BLE001 - an unexpected error must not abort the run
-                logger.warning(
-                    "Skipping %r%s: unexpected error: %s", attachment.title, embedding_with, exc
-                )
-                stats.failed += 1
-                stats.failures.append(
-                    AttachmentFailure(
-                        attachment_key=attachment.attachment_key,
-                        title=attachment.title,
-                        error=f"unexpected error: {exc}",
-                    )
-                )
+        finally:
+            # On Ctrl-C or a failing hook, threads finish the attachment in hand
+            # and the rest never start; what was stored stays for the next run.
+            pool.shutdown(wait=True, cancel_futures=True)
 
     return stats
 
 
-def _index_attachment(
+class _Prepared(BaseModel):
+    """One attachment, ready to store: its chunks and their vectors, or why not."""
+
+    segments: int = 0
+    chunks: list[Chunk] = Field(default_factory=list)
+    embeddings: list[list[float]] = Field(default_factory=list)
+    tokens: int = 0
+    error: str | None = None
+
+
+def _prepare_attachment(
     attachment: PlannedAttachment,
-    store: VectorStore,
     download: Downloader,
     embed: Embedder,
     chunk_size: int,
     chunk_overlap: int,
-    embedding_model: str,
-    stats: IndexStats,
-) -> None:
+) -> _Prepared:
     if attachment.needs_download:
         path = download(attachment.attachment_key)
         segments = extract_segments(path, attachment.document_format)
@@ -195,16 +212,11 @@ def _index_attachment(
         # A note's body travels in the item payload, so there is nothing to fetch.
         segments = extract_note(attachment.note_html)
 
-    if not segments:
-        # No OCR yet: a scanned PDF yields nothing to embed, and an empty snapshot
-        # is indistinguishable from one.
-        stats.no_text += 1
-        return
-
-    chunks = chunk_segments(segments, chunk_size, chunk_overlap)
+    # No OCR yet: a scanned PDF yields nothing to embed, and an empty snapshot
+    # is indistinguishable from one.
+    chunks = chunk_segments(segments, chunk_size, chunk_overlap) if segments else []
     if not chunks:
-        stats.no_text += 1
-        return
+        return _Prepared(segments=len(segments))
 
     texts = [chunk.text for chunk in chunks]
     embeddings = embed(texts)
@@ -212,11 +224,30 @@ def _index_attachment(
         raise ZoteroRagError(
             f"Embedding returned {len(embeddings)} vectors for {len(chunks)} chunks"
         )
+    return _Prepared(
+        segments=len(segments),
+        chunks=chunks,
+        embeddings=embeddings,
+        tokens=count_tokens(texts),
+    )
+
+
+def _store_attachment(
+    attachment: PlannedAttachment,
+    prepared: _Prepared,
+    store: VectorStore,
+    embedding_model: str,
+    stats: IndexStats,
+) -> None:
+    chunks = prepared.chunks
+    if not chunks:
+        stats.no_text += 1
+        return
 
     store.add(
         ids=[chunk_id(attachment.attachment_key, c.locator, c.index) for c in chunks],
-        embeddings=embeddings,
-        documents=texts,
+        embeddings=prepared.embeddings,
+        documents=[c.text for c in chunks],
         metadatas=[
             attachment.chunk_metadata(c.locator, c.index, embedding_model, c.kind, c.label)
             for c in chunks
@@ -224,9 +255,9 @@ def _index_attachment(
     )
 
     stats.indexed += 1
-    stats.pages += len(segments)
+    stats.pages += prepared.segments
     stats.chunks += len(chunks)
-    stats.embedding_tokens += count_tokens(texts)
+    stats.embedding_tokens += prepared.tokens
 
 
 def find_orphans(store: VectorStore, plan: IndexPlan) -> set[str]:

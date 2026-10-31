@@ -212,8 +212,8 @@ class EvalConfig(BaseModel):
     generator_model: str | None = None
     questions_per_document: int = Field(default=3, gt=0)
     #: Characters of each document shown to the generator. A long paper is
-    #: sampled head-and-tail rather than merely truncated, so the conclusions
-    #: reach the model along with the abstract.
+    #: sampled as evenly spaced passages rather than merely truncated, so the
+    #: method, the experiments and the conclusions reach the model too.
     document_char_budget: int = Field(default=30000, gt=0)
 
 

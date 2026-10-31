@@ -7,12 +7,15 @@ OpenRouter endpoint. Embeddings are always remote — no local models, no torch.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
+import openai
 import tiktoken
 from langchain_openai import OpenAIEmbeddings
 from pydantic import SecretStr
 
 from zotero_rag.config import Config
+from zotero_rag.errors import RejectedCredentialError
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +40,39 @@ def count_tokens(texts: list[str]) -> int:
     return sum(len(_ENCODING.encode(text)) for text in texts)
 
 
+class OpenRouterEmbeddings(OpenAIEmbeddings):
+    """`OpenAIEmbeddings` that names the rejected key instead of a bare 401.
+
+    Without this a bad key reached the user as "unexpected error: Error code: 401
+    - User not found", which does not say whether Zotero or OpenRouter refused it.
+    """
+
+    key_env: str = "OPENROUTER_API_KEY"
+
+    def embed_documents(
+        self, texts: list[str], chunk_size: int | None = None, **kwargs: Any
+    ) -> list[list[float]]:
+        try:
+            return super().embed_documents(texts, chunk_size, **kwargs)
+        except openai.AuthenticationError as exc:
+            raise self._rejected(exc) from exc
+
+    def embed_query(self, text: str, **kwargs: Any) -> list[float]:
+        try:
+            return super().embed_query(text, **kwargs)
+        except openai.AuthenticationError as exc:
+            raise self._rejected(exc) from exc
+
+    def _rejected(self, exc: openai.AuthenticationError) -> RejectedCredentialError:
+        return RejectedCredentialError("OpenRouter", self.key_env, exc.message)
+
+
 def build_embeddings(config: Config) -> OpenAIEmbeddings:
     """Build the embedding client. Requires an OpenRouter key."""
     config.global_.require_openrouter()
     spec = config.embedding_model_spec(config.embedding_model)
-    return OpenAIEmbeddings(
+    return OpenRouterEmbeddings(
+        key_env=config.global_.api_key_env,
         model=config.embedding_model,
         # LangChain's name for texts per request, not our characters per chunk.
         chunk_size=spec.batch_size if spec and spec.batch_size else DEFAULT_BATCH_SIZE,

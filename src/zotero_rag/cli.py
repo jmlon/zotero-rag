@@ -8,6 +8,7 @@ import logging
 import os
 import shutil
 import threading
+import time
 from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -181,6 +182,15 @@ app = typer.Typer(
 # Those messages are not actionable, and they interleave with the progress bar; a
 # page we genuinely cannot read is reported by `extraction.py` itself.
 NOISY_LOGGERS = ("pypdf",)
+
+#: Documents `index` prepares at once. The time goes on waiting for Zotero and the
+#: embedding provider, so a few threads overlap it; both clients back off on a 429,
+#: and a handful stays well under the free tiers' limits.
+INDEX_JOBS = 4
+
+#: Questions `eval` answers and grades at once. Each one is a chat request to the
+#: answering model and another to the judge, both of which back off on a 429.
+EVAL_JOBS = 4
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -466,6 +476,7 @@ def _run_index(
     store: VectorStore,
     embeddings: Any,
     cache_dir: Path,
+    jobs: int = 1,
 ) -> IndexStats:
     """Run the indexing pass with a progress bar over the planned attachments."""
     # The cache suffix depends on the format, so the downloader needs to know which
@@ -498,6 +509,7 @@ def _run_index(
             chunk_overlap=config.index.chunk_overlap,
             embedding_model=config.embedding_model,
             on_start=on_start,
+            workers=jobs,
         )
 
 
@@ -670,6 +682,15 @@ def index(
         bool,
         typer.Option("--prune", help="Delete chunks whose attachment left the collection."),
     ] = False,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            "--jobs",
+            help="Documents downloaded and embedded in parallel. Raise with care: "
+            "more means more concurrent requests to Zotero and the embedding provider.",
+            min=1,
+        ),
+    ] = INDEX_JOBS,
     verbose: VerboseOption = False,
 ) -> None:
     """Index the PDF attachments of the pinned Zotero collection.
@@ -741,7 +762,7 @@ def index(
             if repair:
                 _run_repair(store, config, embeddings)
 
-        stats = _run_index(plan, config, store, embeddings, cache_dir)
+        stats = _run_index(plan, config, store, embeddings, cache_dir, jobs)
         store.write_fingerprint(
             StoreFingerprint.intended(config, embedding_dim=store.derived_dimension() or 0)
         )
@@ -1630,6 +1651,10 @@ def _eval_table(outcomes: list[QuestionOutcome]) -> Table:
     table.add_column("Grade")
     table.add_column("Points", justify="right")
     table.add_column("Hit", justify="center")
+    # Only when the set has evidence quotes: an all-dash column says nothing.
+    passages = any(outcome.passage_hit is not None for outcome in outcomes)
+    if passages:
+        table.add_column("Passage", justify="center")
     table.add_column("Cited", justify="center")
     table.add_column("Tokens", justify="right", style="dim")
     table.add_column("Time", justify="right", style="dim")
@@ -1654,6 +1679,7 @@ def _eval_table(outcomes: list[QuestionOutcome]) -> Table:
             f"[{style}]{outcome.grade}[/]",
             points,
             _flag(outcome.hit),
+            *([_flag(outcome.passage_hit)] if passages else []),
             _flag(outcome.cited_expected),
             str(tokens),
             f"{outcome.elapsed_s:.1f}s",
@@ -1667,10 +1693,15 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
     console.print(_eval_table(report.results))
 
     # PRD §11.3 asks for "a table plus one summary line". This is that line.
+    passage = (
+        f"passage hit {_percent(summary.passage_hit_rate)}  ·  "
+        if summary.passage_hit_rate is not None
+        else ""
+    )
     console.print(
         f"\n[bold]{summary.mean_score:.2f}/{MAX_SCORE}[/bold] mean score over "
         f"{_plural(summary.questions, 'question')}  ·  "
-        f"retrieval hit {_percent(summary.hit_rate)}  ·  "
+        f"retrieval hit {_percent(summary.hit_rate)}  ·  {passage}"
         f"expected item cited {_percent(summary.citation_rate)}  ·  "
         f"point coverage {_percent(summary.mean_coverage)}  ·  "
         f"{summary.total_tokens} tokens  ·  {summary.elapsed_s:.1f}s"
@@ -1754,6 +1785,15 @@ def eval_command(
             "the expected answer. One extra call per question.",
         ),
     ] = False,
+    jobs: Annotated[
+        int,
+        typer.Option(
+            "--jobs",
+            help="Questions answered and graded in parallel. More means more concurrent "
+            "requests to the answering and grading models; 1 runs them in turn.",
+            min=1,
+        ),
+    ] = EVAL_JOBS,
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit the full report as JSON instead of a table.")
     ] = False,
@@ -1813,7 +1853,9 @@ def eval_command(
             def on_start(question: EvalQuestion) -> None:
                 progress.update(task, advance=1, description=escape(question.question[:48]))
 
-            outcomes = evaluate(questions, answer_one, verdict_of, assessor, on_start)
+            started = time.perf_counter()
+            outcomes = evaluate(questions, answer_one, verdict_of, assessor, on_start, workers=jobs)
+            elapsed = time.perf_counter() - started
 
         report = EvalReport(
             settings=run_settings(
@@ -1825,7 +1867,7 @@ def eval_command(
                 mode=mode,
                 reranker=rerank_name,
             ),
-            aggregate=aggregate(outcomes),
+            aggregate=aggregate(outcomes, elapsed),
             results=outcomes,
         )
     except ZoteroRagError as exc:
@@ -2174,6 +2216,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
     table.add_column("Index $", justify="right")
     table.add_column("Score", justify="right")
     table.add_column("Hit", justify="right")
+    table.add_column("Passage", justify="right")
     table.add_column("Cited", justify="right")
     table.add_column("Coverage", justify="right")
     table.add_column("Ans tok/q", justify="right", style="dim")
@@ -2193,7 +2236,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
                 str(variant.chunk_overlap),
                 *["[dim]—[/dim]"] * 2,
                 "[bold red]error[/bold red]",
-                *["[dim]—[/dim]"] * 5,
+                *["[dim]—[/dim]"] * 6,
             )
             continue
         score = f"{summary.mean_score:.2f}"
@@ -2208,6 +2251,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
             _money(variant.index_cost),
             score,
             _percent(summary.hit_rate),
+            _percent(summary.passage_hit_rate),
             _percent(summary.citation_rate),
             _percent(summary.mean_coverage),
             f"{per_question:.0f}" if per_question is not None else "—",
@@ -2615,8 +2659,8 @@ def _print_generation_plan(documents: list[DocumentText], per_document: int) -> 
     )
     if any(document.truncated for document in documents):
         console.print(
-            "  [dim]* sampled head-and-tail to fit eval.document_char_budget; "
-            "the middle of the document is not shown to the generator.[/dim]"
+            "  [dim]* sampled as evenly spaced passages to fit "
+            "eval.document_char_budget; the parts between them are not shown.[/dim]"
         )
     console.print("\n[dim]Dry run: nothing was generated and nothing was written.[/dim]")
 
@@ -2633,10 +2677,20 @@ def _print_generation_summary(
         console.print(
             f"  [dim]{expected} were requested; the generator returned {stats.questions}.[/dim]"
         )
+    if stats.rejected:
+        console.print(
+            f"  [dim]{stats.rejected} dropped for naming their document or pointing at "
+            f'it ("the study"); -v lists them.[/dim]'
+        )
+    if stats.without_evidence:
+        console.print(
+            f"  [dim]{stats.without_evidence} have no evidence quote (the generator's was "
+            f"not found verbatim), so eval cannot check their passage.[/dim]"
+        )
     if stats.truncated:
         console.print(
             f"  [dim]{stats.truncated} document(s) were longer than "
-            f"eval.document_char_budget and were sampled head-and-tail.[/dim]"
+            f"eval.document_char_budget and were sampled in passages.[/dim]"
         )
     if stats.failures:
         console.print(f"\n[yellow]{_plural(len(stats.failures), 'document')} produced nothing:")

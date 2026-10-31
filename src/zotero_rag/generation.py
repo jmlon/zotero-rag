@@ -44,19 +44,20 @@ from pydantic import BaseModel, Field, SecretStr
 
 from zotero_rag.config import Config
 from zotero_rag.embedding import count_tokens
-from zotero_rag.evaluation import EvalQuestion, QuestionSetError, load_questions
+from zotero_rag.evaluation import EvalQuestion, QuestionSetError, evidence_found, load_questions
 from zotero_rag.llm import usage_from_message
 from zotero_rag.vectorstore import StoredChunk, VectorStore, reading_order_key
 
 logger = logging.getLogger(__name__)
 
-#: Where the head/tail sample is joined when a document exceeds the budget.
+#: Where the sampled passages are joined when a document exceeds the budget.
 ELLIPSIS = "\n\n[...]\n\n"
 
-#: Fraction of the character budget taken from the start of a long document. The
-#: remainder comes from the end, because "the main points of this article" live in
-#: the abstract and the conclusions and a plain truncation drops the second.
-HEAD_SHARE = 0.7
+#: Evenly spaced passages a long document is sampled into. Head-and-tail alone
+#: showed the generator only the abstract, introduction and conclusions, so every
+#: question it wrote was "what problem / approach / results"; the method and the
+#: experiments in the middle are where the specific, checkable details live.
+SAMPLE_PASSAGES = 5
 
 
 class GenerationError(QuestionSetError):
@@ -94,12 +95,20 @@ class DocumentText(BaseModel):
 
 
 def sample_text(text: str, budget: int) -> tuple[str, bool]:
-    """Fit `text` into `budget` characters, keeping both ends if it must be cut."""
+    """Fit `text` into `budget` characters as evenly spaced passages.
+
+    The first passage starts at the beginning (the abstract) and the last ends at
+    the end (the conclusions); the rest are spread across the middle.
+    """
     if len(text) <= budget:
         return text, False
-    head = int(budget * HEAD_SHARE)
-    tail = max(budget - head, 0)
-    return text[:head] + ELLIPSIS + (text[-tail:] if tail else ""), True
+    passages = max(1, min(SAMPLE_PASSAGES, budget // 1000))
+    width = budget // passages
+    if passages == 1:
+        return text[:width], True
+    step = (len(text) - width) / (passages - 1)
+    starts = [round(index * step) for index in range(passages)]
+    return ELLIPSIS.join(text[start : start + width] for start in starts), True
 
 
 def collect_documents(store: VectorStore, budget: int) -> list[DocumentText]:
@@ -147,10 +156,34 @@ def collect_documents(store: VectorStore, budget: int) -> list[DocumentText]:
 # --- the generator -------------------------------------------------------
 
 
+#: The kinds of question the generator spreads a document's questions across. The
+#: first version asked for "the main points", and every document came back as the
+#: same three: what problem, what approach, what results. Those test little beyond
+#: whether retrieval finds the abstract.
+QUESTION_KINDS = {
+    "detail": "a specific fact: a number, a dataset, a parameter, a named component",
+    "mechanism": "how one particular step or component works",
+    "rationale": "why a design choice was made, or what it is meant to avoid",
+    "comparison": "how the work compares with a baseline or alternative it discusses",
+    "limitation": "a weakness, failure case or open problem the text states",
+    "condition": "when or under what circumstances something holds, helps or fails",
+}
+
+
 class GeneratedQuestion(BaseModel):
     """One question the model wrote about a document."""
 
+    kind: str = Field(
+        default="",
+        description="Which kind of question this is: " + ", ".join(QUESTION_KINDS) + ".",
+    )
     question: str = Field(description="The question, answerable from this document alone.")
+    evidence: str = Field(
+        default="",
+        description="The one or two sentences of the document that answer the "
+        "question, copied exactly, character for character: no paraphrase, no "
+        "ellipsis, nothing added.",
+    )
     answer: str = Field(
         description="A complete reference answer, drawn only from the document text."
     )
@@ -168,32 +201,65 @@ class GeneratedSet(BaseModel):
     questions: list[GeneratedQuestion] = Field(default_factory=list)
 
 
-GENERATOR_SYSTEM_PROMPT = """You write evaluation questions for a \
-retrieval-augmented search system over a library of academic documents.
+_KIND_LINES = "\n".join(f"- {kind}: {meaning}" for kind, meaning in QUESTION_KINDS.items())
 
-Given one document, write questions about its MAIN POINTS: the problem it \
-addresses, the approach or mechanism it proposes, how the two fit together, and \
-what its results or conclusions were. Alongside each question write a reference \
-answer and the list of distinct claims that answer makes.
+GENERATOR_SYSTEM_PROMPT = f"""You write evaluation questions for a \
+retrieval-augmented search system over a library of academic documents. The system \
+must find the right passages among many papers on related subjects, so a good \
+question is one a researcher would really ask, that this document answers better \
+than any of its neighbours, and that does not hand the search engine the answer.
+
+Given one document, write questions alongside a reference answer for each and the \
+list of distinct claims that answer makes. Spread the questions across these kinds:
+{_KIND_LINES}
 
 Rules:
+- Ask ONE thing per question, in at most 25 words, the way a researcher would \
+type it into a search box. No "and how / and why / and what" second halves.
+- Ask in your own words. Do not copy distinctive phrases, identifiers, \
+equation symbols or numbers from the text into the question: the system has to \
+find the passage from what the question means, not from an exact string it \
+contains. The answer may of course be a number; the question must not give it.
+- For each question, copy into `evidence` the one or two sentences of the text \
+that answer it, exactly as they appear: same words, same order, no ellipsis. \
+They are matched against the text automatically, so a paraphrase is useless.
 - Use ONLY the supplied document text. Never add outside knowledge, and never \
 invent a result, a number, or a citation that is not there.
-- Each question must be answerable from this document's content alone, and must \
-be substantive: prefer "what problem does X address and how" over "what does \
-Table 3 show".
+- Draw on the whole text, not just the opening: the method and the experiments \
+are where the specific, checkable details are.
+- Do NOT write generic questions that fit any paper: no "what problem does the \
+research address", "what approach does the study propose", "what are the main \
+results or conclusions", "what is this paper about".
+- Do NOT name the document's title or any part of it, its authors, or the name \
+the document coins for its own method, system, model, framework or dataset. \
+Describe the idea instead ("a method that has the LLM iteratively explore paths \
+in a knowledge graph" rather than its name). Established names that the document \
+did not coin (BERT, Wikidata, RAG) are fine.
+- Each question must still stand on its own and point to this document's \
+content: never "the proposed method", "the study", "this paper", "its \
+experiments" or "the benchmark datasets" without saying what they are, and never \
+"according to the document" or "as the authors state". A reader who has not seen \
+the document must know what is being asked.
 - Do NOT ask about the document as an artefact — no questions about page numbers, \
 section titles, figure or table numbers, the reference list, or formatting.
-- Do NOT mention "the document", "the text", "the article" or "this paper" in a \
-way that only makes sense to someone already holding it. The question should read \
-as a question a researcher would ask about the subject.
 - The expected points must be independently checkable and must each be stated by \
 your own reference answer. Between 3 and 7 per question.
 - If the supplied text is too short or too fragmentary to support a real question, \
 return fewer questions, or none at all, rather than inventing content.
 
-The text may be a head-and-tail sample of a longer document, marked with [...]. \
-Do not ask about anything that would have been in the omitted middle."""
+Long documents are sampled as several passages from beginning to end, joined by \
+[...]. Do not ask about anything that would have been in an omitted part.
+
+Bad: "What results does the study present regarding the performance of its \
+proposed method?" (generic, and names nothing)
+Bad: "How does Think-on-Graph improve LLM reasoning?" (the document's own name \
+for its method makes the search trivial)
+Bad: "In the ablation with GPT3.5-turbo, how does accuracy change as entities per \
+concept group go from 0 to 3, and how large is the sparse graph used?" (two \
+questions, and it copies the passage's own terms)
+Good: "How deep does an LLM need to search a knowledge graph before its answers \
+stop improving?"
+"""
 
 
 #: The generation network seam: (document, count, language) -> questions + usage.
@@ -232,12 +298,15 @@ def build_generator(config: Config) -> GeneratorFn:
                     ("system", GENERATOR_SYSTEM_PROMPT),
                     (
                         "human",
-                        f"Write exactly {count} question(s) about the main points of "
-                        f"the following document. Write the questions, the reference "
-                        f"answers and the expected points in {language}.\n\n"
+                        f"Write exactly {count} question(s) about the following "
+                        f"document, spread across as many kinds as you can. Write the "
+                        f"questions, the reference answers and the expected points in "
+                        f"{language}.\n\n"
+                        f"So that you can avoid them, the document's title and authors "
+                        f"are below. Never use them, or a name coined in the title, in "
+                        f"a question.\n"
                         f"TITLE: {document.title}\n"
-                        f"AUTHORS: {document.authors or '(unknown)'}\n"
-                        f"YEAR: {document.year or '(unknown)'}\n\n"
+                        f"AUTHORS: {document.authors or '(unknown)'}\n\n"
                         f"DOCUMENT TEXT:\n{document.text}",
                     ),
                 ]
@@ -332,9 +401,119 @@ def to_questions(
             expected_points=[point.strip() for point in question.expected_points if point.strip()],
             # The whole point: provenance is known exactly, not guessed.
             expected_items=[document.item_key],
+            expected_evidence=[question.evidence.strip()] if question.evidence.strip() else [],
         )
         for identifier, question in zip(ids, usable, strict=True)
     ]
+
+
+#: Words too common to make a run of title words a giveaway.
+_STOPWORDS = frozenset(
+    {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "how",
+        "in",
+        "into",
+        "is",
+        "it",
+        "of",
+        "on",
+        "or",
+        "over",
+        "the",
+        "to",
+        "towards",
+        "under",
+        "via",
+        "what",
+        "when",
+        "with",
+        "without",
+    }
+)
+
+#: Consecutive content words of the title that count as quoting it. Shorter runs
+#: ("knowledge graph completion") are the subject, which a question has to name;
+#: so is the whole of a title shorter than `_MIN_TITLE_RUN` ("Knowledge Graphs").
+_TITLE_RUN = 5
+_MIN_TITLE_RUN = 3
+
+#: Longest title prefix (before a colon) treated as a coined name: "GIVE",
+#: "Think-on-Graph", "WikiGraphs".
+_COINED_NAME_WORDS = 3
+
+_WORD = re.compile(r"[\w-]+")
+
+#: A question that points at "the document" or "the proposed method" only makes
+#: sense to someone already holding it, and gives retrieval nothing to search for.
+_SELF_REFERENCE = re.compile(
+    r"\b(?:(?:the|this) (?:document|paper|study|article|text|work|research)\b"
+    r"|the authors\b|(?:the|this|its) proposed\b)",
+    re.IGNORECASE,
+)
+
+#: Questions asked for beyond the ones wanted, so that dropping a giveaway does
+#: not leave a document short.
+SPARE_QUESTIONS = 2
+
+
+def _content_words(text: str) -> list[str]:
+    return [word for word in _WORD.findall(text.casefold()) if word not in _STOPWORDS]
+
+
+def _coined_name(title: str) -> str | None:
+    """The short name before a title's colon, which papers use for their method."""
+    head, colon, _ = title.partition(":")
+    head = head.strip()
+    if not colon or not head or len(head.split()) > _COINED_NAME_WORDS:
+        return None
+    return head
+
+
+def _surnames(authors: str) -> list[str]:
+    """Surnames from a `Last, First; Last, First` author string."""
+    return [name for entry in authors.split(";") if (name := entry.split(",")[0].strip())]
+
+
+def _contains_word(text: str, word: str) -> bool:
+    """Whole-word, case-sensitive: "GIVE" is a name, "give" is a verb; "He" is a
+    surname, "he" a pronoun."""
+    return re.search(rf"(?<![\w-]){re.escape(word)}(?![\w-])", text) is not None
+
+
+def giveaway(document: DocumentText, question: str) -> str | None:
+    """Why `question` hands retrieval its document, or `None` if it does not.
+
+    The prompt forbids these, but a rule a model only usually follows is not
+    one a golden set can rest on: a question that names its paper measures a
+    keyword match, not retrieval, and one that says "the document" names nothing
+    for retrieval to find.
+    """
+    if match := _SELF_REFERENCE.search(question):
+        return f"refers to {match.group(0)!r} without saying what it is"
+    for surname in _surnames(document.authors):
+        if _contains_word(question, surname):
+            return f"names the author {surname!r}"
+    if (name := _coined_name(document.title)) and _contains_word(question, name):
+        return f"names the document's own {name!r}"
+
+    title = _content_words(document.title)
+    run = min(_TITLE_RUN, len(title))
+    if run >= _MIN_TITLE_RUN:
+        asked = " ".join(_content_words(question))
+        for start in range(len(title) - run + 1):
+            if " ".join(title[start : start + run]) in asked:
+                return "quotes the title"
+    return None
 
 
 class GenerationStats(BaseModel):
@@ -343,6 +522,10 @@ class GenerationStats(BaseModel):
     documents: int = 0
     questions: int = 0
     truncated: int = 0
+    #: Questions dropped for naming their document; see `giveaway`.
+    rejected: int = 0
+    #: Questions kept without an evidence quote, so without a passage check.
+    without_evidence: int = 0
     prompt_tokens: int = 0
     completion_tokens: int = 0
     elapsed_s: float = 0.0
@@ -378,14 +561,29 @@ def generate_questions(
         if document.truncated:
             stats.truncated += 1
         try:
-            raw = generate_for(document, per_document, language)
+            raw = generate_for(document, per_document + SPARE_QUESTIONS, language)
         except Exception as exc:  # noqa: BLE001 - the provider raises assorted errors
             logger.warning("could not generate questions for %s: %s", document.label, exc)
             stats.failures.append(f"{document.label}: {exc}")
             continue
         stats.prompt_tokens += raw.prompt_tokens
         stats.completion_tokens += raw.completion_tokens
-        produced = to_questions(document, raw.questions, taken)
+        kept: list[GeneratedQuestion] = []
+        for generated in raw.questions:
+            if reason := giveaway(document, generated.question):
+                logger.info("dropped a question that %s: %s", reason, generated.question)
+                stats.rejected += 1
+                continue
+            if generated.evidence and not evidence_found(generated.evidence, [document.text]):
+                # A paraphrase cannot be matched against retrieved chunks, so it
+                # would score as a miss for every chunking alike. The question is
+                # still good; only its passage check is lost.
+                logger.info("evidence not found verbatim, dropped it: %s", generated.evidence)
+                generated = generated.model_copy(update={"evidence": ""})
+            kept.append(generated)
+        kept = kept[:per_document]
+        stats.without_evidence += sum(1 for generated in kept if not generated.evidence)
+        produced = to_questions(document, kept, taken)
         if not produced:
             logger.warning("the generator produced nothing usable for %s", document.label)
             stats.failures.append(f"{document.label}: no usable question was returned")
@@ -434,6 +632,11 @@ def dump_questions(questions: Sequence[EvalQuestion], header: str = "") -> str:
                 "id": question.id,
                 "question": _clean(question.question),
                 "expected_items": list(question.expected_items),
+                **(
+                    {"expected_evidence": [_clean(quote) for quote in question.expected_evidence]}
+                    if question.expected_evidence
+                    else {}
+                ),
                 "expected_points": [_clean(point) for point in question.expected_points],
                 "answer": _clean(question.answer),
             }

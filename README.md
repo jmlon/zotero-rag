@@ -208,6 +208,11 @@ until you ask: every run tells you how many chunks belong to attachments the
 collection no longer has, and `--prune` removes them. Deleting data during an
 ordinary index run would be a poor surprise.
 
+`index` works on four documents at a time — downloading, extracting and embedding
+them in parallel — since most of the time goes on waiting for Zotero and the
+embedding provider. `--jobs N` changes that; both clients back off when rate
+limited, but a large `N` on a free tier mostly buys retries.
+
 Every run also records which sub-folders each item is filed in, which is what the
 terminal UI's folder filter uses. Moving an item between folders in Zotero is picked
 up by the next `index` without re-embedding anything.
@@ -389,6 +394,7 @@ it has already indexed:
 ```bash
 zotero-rag generate-questions --dry-run    # what it would read, and the token cost
 zotero-rag generate-questions              # writes questions.yaml
+zotero-rag generate-questions --foce       # Overwrite questions.yaml
 zotero-rag generate-questions --language Spanish --per-document 5
 zotero-rag generate-questions --only-item TR6MHCJ2   # try one paper first
 ```
@@ -398,6 +404,17 @@ the points a correct answer should make, and — the useful part — the exact Z
 item the text came from, so retrieval can be scored against the right paper without
 you looking any keys up. It will not overwrite an existing set unless you pass
 `--force`.
+
+The questions are meant to make retrieval work for its answer. Each of a
+document's questions is a different kind — a specific detail, how a component
+works, why a design choice was made, a comparison with a baseline, a limitation,
+or when something holds — drawn from passages spread across the whole paper, not
+just its abstract. None may name the paper's title, its authors, or the name it
+coins for its own method or dataset: those make retrieval a keyword lookup. The
+prompt forbids it, and a question that does it anyway is dropped and counted
+(`-v` lists them), as is one that says "the study" or "the proposed method"
+without saying what it is. A couple of spare questions are asked for per document
+to make up for those, but a run can still come back short.
 
 **Read the result and edit it.** Every question is written from one document, so the
 set measures whether retrieval can find that document; it won't test pulling an
@@ -417,6 +434,10 @@ questions:
       # Optional: the Zotero item a correct answer should rest on. Titles work too
       # (expected_titles), matched case-insensitively as substrings.
       expected_items: [JSIBCSBW]
+      # Optional: the sentence(s) that answer it, copied exactly from the paper.
+      # Enables the passage-hit check; generated sets fill it in for you.
+      expected_evidence:
+          - Fog nodes are deployed between end devices and the cloud data centre.
 ```
 
 ```bash
@@ -424,7 +445,12 @@ zotero-rag eval                      # table of results plus one summary line
 zotero-rag eval --top-k 10           # same questions, more passages — compare
 zotero-rag eval --json > run.json    # the full report, for diffing two runs
 zotero-rag eval --only fog-node -v   # one question, with the judge's reasoning
+zotero-rag eval --jobs 1             # one question at a time (default: 4 at once)
 ```
+
+Questions are answered and graded four at a time, since nearly all the time goes on
+waiting for the two models; the report keeps the file's order either way. Lower
+`--jobs` if the LLM provider returns rate-limit errors.
 
 Each run reports four things per question — the grade, how many expected points
 were covered, whether an expected item was **retrieved**, and whether the answer
@@ -433,6 +459,14 @@ comparable. The retrieval and citation columns are mechanical rather than
 model-judged, which makes them the ones worth trusting when you compare runs:
 they separate "retrieval never found the paper" from "retrieval found it and the
 answer ignored it", and those have different fixes.
+
+A question with `expected_evidence` also gets a **passage** column: did the retrieved
+chunks contain the sentences that answer it? That is stricter than the hit, which
+any chunk of the right paper satisfies — in a small library the right paper is
+nearly always found, but the passage that holds the answer often is not, and that
+is the failure chunk size and `top_k` actually change. Matching ignores case,
+punctuation and line breaks, and a quote split across two retrieved chunks still
+counts. It is mechanical too, so it is the number to compare chunkings by.
 
 Two ready-made sets live in `questions/` — a 3-question `Writing` smoke test and a
 21-question `Networking` set. A 3-question set turned out too small to resolve any

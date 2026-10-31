@@ -23,8 +23,11 @@ API access.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -107,6 +110,9 @@ class EvalQuestion(BaseModel):
     #: Item titles, matched case-insensitively as substrings. For a hand-written
     #: set where looking up keys is more work than the metric is worth.
     expected_titles: list[str] = Field(default_factory=list)
+    #: Short verbatim quotes of the text that answers the question. Each must
+    #: turn up in the retrieved chunks for a passage hit; see `evidence_hit`.
+    expected_evidence: list[str] = Field(default_factory=list)
 
     @property
     def ground_truth(self) -> str:
@@ -208,6 +214,9 @@ def parse_questions(raw: Any, path: Path) -> list[EvalQuestion]:
                 expected_titles=_as_str_list(
                     entry.get("expected_titles"), path, question_id, "expected_titles"
                 ),
+                expected_evidence=_as_str_list(
+                    entry.get("expected_evidence"), path, question_id, "expected_evidence"
+                ),
             )
         )
 
@@ -283,6 +292,65 @@ def cited_expected(sources: Sequence[Source], question: EvalQuestion) -> bool | 
     if not question.has_expected_source:
         return None
     return any(source.cited and source_matches(source, question) for source in sources)
+
+
+#: Share of an evidence quote that the retrieved chunks must hold, between them,
+#: for it to count as retrieved. Below 1 so that a quote cut by a chunk boundary
+#: still counts when the chunks either side were both retrieved, and so that a
+#: stray character from PDF extraction does not fail an otherwise exact match.
+EVIDENCE_COVERAGE = 0.8
+
+_NOT_WORD = re.compile(r"\W+")
+
+
+def normalize_passage(text: str) -> str:
+    """Lowercase words separated by single spaces: punctuation, quote style and
+    line breaks differ between a quote and the chunk it came from."""
+    return _NOT_WORD.sub(" ", text.casefold()).strip()
+
+
+def evidence_coverage(evidence: str, chunks: Sequence[str]) -> float:
+    """The share of `evidence` that appears verbatim in `chunks`.
+
+    Each chunk contributes its longest run in common with the quote, and runs
+    from different chunks are merged, so a quote split across two retrieved
+    chunks is still covered.
+    """
+    quote = normalize_passage(evidence)
+    if not quote:
+        return 0.0
+    covered: list[tuple[int, int]] = []
+    for chunk in chunks:
+        text = normalize_passage(chunk)
+        matcher = SequenceMatcher(None, quote, text, autojunk=False)
+        match = matcher.find_longest_match(0, len(quote), 0, len(text))
+        if match.size:
+            covered.append((match.a, match.a + match.size))
+    total, end = 0, 0
+    for start, stop in sorted(covered):
+        start = max(start, end)
+        if stop > start:
+            total += stop - start
+            end = stop
+    return total / len(quote)
+
+
+def evidence_found(evidence: str, chunks: Sequence[str]) -> bool:
+    return evidence_coverage(evidence, chunks) >= EVIDENCE_COVERAGE
+
+
+def evidence_hit(sources: Sequence[Source], question: EvalQuestion) -> bool | None:
+    """Did the retrieved chunks include the passage that answers the question?
+
+    Stricter than `retrieval_hit`, which a chunk from anywhere in the right paper
+    satisfies. This is the metric that responds to chunking: whether the answer
+    itself reached the model, not just its document. Every quote must be found,
+    so a question that needs two passages needs both. `None` without evidence.
+    """
+    if not question.expected_evidence:
+        return None
+    chunks = [excerpt for source in sources for excerpt in source.excerpts]
+    return all(evidence_found(evidence, chunks) for evidence in question.expected_evidence)
 
 
 # --- the judge -----------------------------------------------------------
@@ -574,6 +642,8 @@ class QuestionOutcome(BaseModel):
     #: False when a configured reranker did not actually apply to this question.
     reranked: bool = False
     hit: bool | None = None
+    #: Whether the passage that answers it was retrieved; see `evidence_hit`.
+    passage_hit: bool | None = None
     cited_expected: bool | None = None
     cited_sources: int = 0
     context_sufficiency: str | None = None
@@ -653,6 +723,7 @@ def evaluate_question(
         candidates_considered=result.candidates_considered,
         reranked=result.reranked,
         hit=retrieval_hit(result.sources, question),
+        passage_hit=evidence_hit(result.sources, question),
         cited_expected=cited_expected(result.sources, question),
         cited_sources=sum(1 for source in result.sources if source.cited),
         context_sufficiency=sufficiency,
@@ -671,14 +742,33 @@ def evaluate(
     verdict_of: VerdictFn,
     assess_context: ContextAssessor | None = None,
     on_start: Callable[[EvalQuestion], None] | None = None,
+    workers: int = 1,
 ) -> list[QuestionOutcome]:
-    """Run and grade every question, in file order."""
-    outcomes: list[QuestionOutcome] = []
-    for question in questions:
+    """Run and grade every question, returning the outcomes in file order.
+
+    With `workers > 1`, that many questions are answered and graded at once: the
+    time goes on waiting for the answering and grading models, and nothing on the
+    query path is written to after start-up. `on_start` runs on the worker
+    threads, and an exception it raises stops the run.
+    """
+
+    def run(question: EvalQuestion) -> QuestionOutcome:
         if on_start is not None:
             on_start(question)
-        outcomes.append(evaluate_question(question, ask, verdict_of, assess_context))
-    return outcomes
+        return evaluate_question(question, ask, verdict_of, assess_context)
+
+    if workers <= 1:
+        # On the caller's thread: `compare-embeddings` already gives each variant one.
+        return [run(question) for question in questions]
+
+    pool = ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="eval")
+    try:
+        # `map` yields in submission order, so the report keeps the file's order.
+        return list(pool.map(run, questions))
+    finally:
+        # On Ctrl-C or a failing hook, questions in flight finish and the rest
+        # never start.
+        pool.shutdown(wait=True, cancel_futures=True)
 
 
 # --- the report ----------------------------------------------------------
@@ -701,6 +791,7 @@ class EvalAggregate(BaseModel):
     grade_counts: dict[str, int] = Field(default_factory=dict)
     #: Over the questions that name an expected item; `None` when none do.
     hit_rate: float | None = None
+    passage_hit_rate: float | None = None
     citation_rate: float | None = None
     #: Over the questions that list expected points.
     mean_coverage: float | None = None
@@ -724,8 +815,12 @@ class EvalAggregate(BaseModel):
         )
 
 
-def aggregate(outcomes: Sequence[QuestionOutcome]) -> EvalAggregate:
-    """Summarise the rows. Metrics with no applicable question stay `None`."""
+def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = None) -> EvalAggregate:
+    """Summarise the rows. Metrics with no applicable question stay `None`.
+
+    `elapsed_s` is the run's wall-clock time. Without it the questions' own times
+    are summed, which is only right when they ran one after another.
+    """
     if not outcomes:
         return EvalAggregate()
 
@@ -744,6 +839,7 @@ def aggregate(outcomes: Sequence[QuestionOutcome]) -> EvalAggregate:
         mean_score=sum(outcome.score for outcome in outcomes) / len(outcomes),
         grade_counts={label: count for label, count in grade_counts.items() if count},
         hit_rate=_rate([o.hit for o in outcomes if o.hit is not None]),
+        passage_hit_rate=_rate([o.passage_hit for o in outcomes if o.passage_hit is not None]),
         citation_rate=_rate([o.cited_expected for o in outcomes if o.cited_expected is not None]),
         mean_coverage=_mean(coverages),
         graded_questions=len(coverages),
@@ -752,7 +848,7 @@ def aggregate(outcomes: Sequence[QuestionOutcome]) -> EvalAggregate:
         completion_tokens=sum(o.completion_tokens for o in outcomes),
         embedding_tokens=sum(o.embedding_tokens for o in outcomes),
         judge_tokens=sum(o.judge_tokens for o in outcomes),
-        elapsed_s=sum(o.elapsed_s for o in outcomes),
+        elapsed_s=elapsed_s if elapsed_s is not None else sum(o.elapsed_s for o in outcomes),
         errors=sum(1 for o in outcomes if o.grade is Grade.ERROR),
         reranked_questions=sum(1 for o in outcomes if o.reranked),
     )

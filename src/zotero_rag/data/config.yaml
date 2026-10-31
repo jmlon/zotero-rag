@@ -109,7 +109,7 @@ eval:
     generator_model: null
     questions_per_document: 3
     # Characters of each document shown to the generator. A paper longer than this
-    # is sampled head-and-tail, so the conclusions arrive with the abstract.
+    # is sampled as evenly spaced passages, so the method and results arrive too.
     document_char_budget: 30000
 
 markdown:

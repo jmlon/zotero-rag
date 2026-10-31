@@ -14,6 +14,7 @@ import pytest
 from zotero_rag.config import Config
 from zotero_rag.errors import ZoteroRagError
 from zotero_rag.evaluation import (
+    EVIDENCE_COVERAGE,
     SCORES,
     Coverage,
     EvalQuestion,
@@ -26,6 +27,9 @@ from zotero_rag.evaluation import (
     cited_expected,
     evaluate,
     evaluate_question,
+    evidence_coverage,
+    evidence_found,
+    evidence_hit,
     judge_answer,
     load_questions,
     parse_questions,
@@ -199,6 +203,77 @@ def test_citing_an_expected_item_is_stricter_than_retrieving_it() -> None:
 
 
 # --- the judge -----------------------------------------------------------
+
+
+# --- passage hits ----------------------------------------------------------
+
+QUOTE = "The beam width is set to 3 and the maximum depth to 3 for all datasets."
+
+
+def chunk_source(*excerpts: str) -> Source:
+    return Source(number=1, item_key="ITEM1", excerpts=list(excerpts))
+
+
+def test_a_quote_inside_a_retrieved_chunk_is_a_passage_hit() -> None:
+    question = EvalQuestion(id="q", question="?", answer="x", expected_evidence=[QUOTE])
+    chunk = f"We run every experiment the same way. {QUOTE} Results follow."
+    assert evidence_hit([chunk_source(chunk)], question) is True
+
+
+def test_case_punctuation_and_line_breaks_do_not_matter() -> None:
+    reflowed = "the beam\nwidth is set to 3, and the maximum depth to 3 for all data-\nsets"
+    assert evidence_coverage(QUOTE, [reflowed]) >= EVIDENCE_COVERAGE
+
+
+def test_a_quote_split_across_two_retrieved_chunks_still_counts() -> None:
+    half = len(QUOTE) // 2
+    chunks = [f"Earlier text. {QUOTE[:half]}", f"{QUOTE[half:]} Later text."]
+    assert evidence_found(QUOTE, chunks)
+    # Only one of the two halves reached the model: the answer did not.
+    assert not evidence_found(QUOTE, chunks[:1])
+
+
+def test_another_passage_of_the_right_paper_is_not_a_passage_hit() -> None:
+    question = EvalQuestion(
+        id="q", question="?", answer="x", expected_items=["ITEM1"], expected_evidence=[QUOTE]
+    )
+    sources = [chunk_source("The method explores relation paths with an LLM.")]
+    assert retrieval_hit(sources, question) is True
+    assert evidence_hit(sources, question) is False
+
+
+def test_every_quote_must_be_retrieved() -> None:
+    other = "Pruning with Sentence-BERT cuts the number of LLM calls in half."
+    question = EvalQuestion(id="q", question="?", answer="x", expected_evidence=[QUOTE, other])
+    assert evidence_hit([chunk_source(QUOTE)], question) is False
+    assert evidence_hit([chunk_source(QUOTE, other)], question) is True
+
+
+def test_a_question_without_evidence_has_no_passage_hit() -> None:
+    question = EvalQuestion(id="q", question="?", answer="x")
+    assert evidence_hit([chunk_source(QUOTE)], question) is None
+
+
+def test_expected_evidence_is_read_from_the_file(tmp_path: Path) -> None:
+    path = write_questions(
+        tmp_path,
+        "questions:\n"
+        "  - id: q\n"
+        "    question: How wide is the beam?\n"
+        "    answer: Three.\n"
+        f'    expected_evidence: ["{QUOTE}"]\n',
+    )
+    assert load_questions(path)[0].expected_evidence == [QUOTE]
+
+
+def test_the_passage_hit_rate_ignores_questions_without_evidence() -> None:
+    outcomes = [
+        QuestionOutcome(id="a", question="?", grade=Grade.GOOD, score=3, passage_hit=True),
+        QuestionOutcome(id="b", question="?", grade=Grade.GOOD, score=3, passage_hit=False),
+        QuestionOutcome(id="c", question="?", grade=Grade.GOOD, score=3),
+    ]
+    assert aggregate(outcomes).passage_hit_rate == 0.5
+    assert aggregate(outcomes[2:]).passage_hit_rate is None
 
 
 def verdict_fn(
@@ -393,6 +468,40 @@ def test_evaluate_runs_every_question_in_file_order() -> None:
     assert started == ["a", "b"]
 
 
+def test_parallel_evaluation_overlaps_questions_and_keeps_file_order() -> None:
+    import threading
+    import time
+
+    questions = [EvalQuestion(id=name, question=f"{name}?", answer="x") for name in "abcd"]
+    # Every answer waits until all four are in flight, so a sequential run would
+    # time out here; the first question also finishes last.
+    barrier = threading.Barrier(4, timeout=5)
+
+    def ask(question: str) -> QueryResult:
+        barrier.wait()
+        if question == "a?":
+            time.sleep(0.05)
+        return result_with([source()])
+
+    outcomes = evaluate(questions, ask, verdict_fn(), workers=4)
+
+    assert [outcome.id for outcome in outcomes] == ["a", "b", "c", "d"]
+
+
+def test_an_exception_from_the_progress_hook_stops_a_parallel_run() -> None:
+    class Stop(Exception):
+        pass
+
+    def on_start(question: EvalQuestion) -> None:
+        raise Stop
+
+    questions = [EvalQuestion(id=name, question=f"{name}?", answer="x") for name in "ab"]
+    with pytest.raises(Stop):
+        evaluate(
+            questions, lambda _: result_with([source()]), verdict_fn(), on_start=on_start, workers=2
+        )
+
+
 # --- aggregation ---------------------------------------------------------
 
 
@@ -541,3 +650,12 @@ def test_the_networking_set_maps_three_questions_to_each_of_its_seven_articles()
     assert set(per_item.values()) == {3}
     # The saved Bing search page that looks like the CFR-RL paper is not a hit.
     assert "KJFG9YUE" not in per_item
+
+
+def test_a_parallel_run_reports_its_wall_clock_time_not_the_sum() -> None:
+    outcomes = [
+        QuestionOutcome(id=name, question="?", grade=Grade.GOOD, score=3, elapsed_s=4.0)
+        for name in "abcd"
+    ]
+    assert aggregate(outcomes).elapsed_s == 16.0
+    assert aggregate(outcomes, elapsed_s=4.5).elapsed_s == 4.5

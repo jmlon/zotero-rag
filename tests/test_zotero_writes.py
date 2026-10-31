@@ -454,3 +454,25 @@ def test_credentials_are_required_at_the_first_download_not_before() -> None:
 
     with pytest.raises(MissingCredentialError):
         files.file("ODT00001")
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_key_names_zotero_and_the_variable(status: int) -> None:
+    from zotero_rag.errors import RejectedCredentialError
+
+    files = FileDownloader(
+        "user",
+        "123",
+        "bad-key",
+        client=httpx.Client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(status, text="Invalid key")
+            )
+        ),
+        key_env="MY_ZOTERO_KEY",
+    )
+
+    with pytest.raises(
+        RejectedCredentialError, match="Zotero rejected the API key in MY_ZOTERO_KEY"
+    ):
+        files.file("ODT00001")

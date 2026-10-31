@@ -723,7 +723,7 @@ def _stub_generator(monkeypatch: pytest.MonkeyPatch, per_call: int = 2) -> list[
         return RawGeneration(
             questions=[
                 GeneratedQuestion(
-                    question=f"What does {document.title} propose ({number})?",
+                    question=f"What does item {document.item_key} propose ({number})?",
                     answer=f"It proposes a fog node: number {number}.",
                     expected_points=["it sits between edge and cloud", "it is close to the data"],
                 )
