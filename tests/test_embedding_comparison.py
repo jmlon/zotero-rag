@@ -707,3 +707,22 @@ def test_the_judge_defaults_globally_and_a_folder_can_override_it() -> None:
     assert config.judge_model == "anthropic/claude-sonnet-5-5"
     config.eval.judge_model = "google/gemini-3-pro"
     assert config.judge_model == "google/gemini-3-pro"
+
+
+def test_every_scored_variant_is_logged_in_one_batch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _index_folder(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _stub_network(monkeypatch)
+
+    result = runner.invoke(cli.app, ["compare-embeddings", "--model", "cheap/model", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    logs = list((tmp_path / "reports").glob("experiments-questions-*.json"))
+    assert len(logs) == 1
+    runs = json.loads(logs[0].read_text(encoding="utf-8"))["runs"]
+    assert [run["baseline"] for run in runs] == [True, False]
+    assert [run["settings"]["embedding_model"] for run in runs][1:] == ["cheap/model"]
+    assert len({run["batch_id"] for run in runs}) == 1
+    assert all(run["command"] == "compare-embeddings" for run in runs)

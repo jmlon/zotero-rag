@@ -81,19 +81,30 @@ from zotero_rag.errors import (
 )
 from zotero_rag.evaluation import (
     MAX_SCORE,
+    CostSpread,
     EvalQuestion,
     EvalReport,
     Grade,
     QuestionOutcome,
     QuestionSetError,
+    RunSettings,
     TimeSpread,
     aggregate,
     build_context_assessor,
     build_verdict_fn,
     evaluate,
-    load_questions,
+    load_question_set,
     resolve_questions_path,
     run_settings,
+)
+from zotero_rag.experiments import (
+    ExperimentLogError,
+    ExperimentRun,
+    log_path,
+    make_run,
+    new_batch_id,
+    question_set_info,
+    record_runs,
 )
 from zotero_rag.fingerprint import StoreFingerprint
 from zotero_rag.generation import (
@@ -102,6 +113,7 @@ from zotero_rag.generation import (
     GenerationStats,
     build_generator,
     collect_documents,
+    default_version_id,
     file_header,
     generate_questions,
     write_questions,
@@ -1626,6 +1638,32 @@ def _flag(value: bool | None) -> str:
     return "[green]yes[/green]" if value else "[red]no[/red]"
 
 
+def _price_embedding(result: QueryResult, config: Config) -> QueryResult:
+    """Price the question's embedding from the catalogue.
+
+    The embeddings client does not pass the provider's reported cost through, and
+    at a few tokens per question a catalogue price is accurate enough.
+    """
+    spec = config.embedding_model_spec(config.embedding_model)
+    if spec is not None:
+        result.usage.embedding_cost = spec.cost(result.usage.embedding_tokens)
+    return result
+
+
+def _usd(value: float | None) -> str:
+    """Dollars at a precision that still shows a fraction of a cent."""
+    if value is None:
+        return "n/a"
+    return f"${value:.3f}" if value >= 0.01 else f"${value:.5f}"
+
+
+def _cost_spread(spread: CostSpread | None) -> str:
+    """`$0.00031 ($0.00028–$0.00035)`: the median query, and the middle half."""
+    if spread is None:
+        return "—"
+    return f"{_usd(spread.median)} ({_usd(spread.p25)}–{_usd(spread.p75)})"
+
+
 def _time_spread(spread: TimeSpread | None) -> str:
     """`2.9s (2.4–3.4)`: the median question, and the middle half of them."""
     if spread is None:
@@ -1721,6 +1759,15 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
         for label, count in summary.grade_counts.items()
     )
     console.print(f"  {grades}")
+    if summary.query_cost is not None:
+        unpriced = summary.questions - summary.priced_questions
+        console.print(
+            f"  [dim]cost:[/dim] {_cost_spread(summary.query_cost)} per query, "
+            f"{_usd(summary.query_cost_total)} for {summary.priced_questions} "
+            f"{'query' if summary.priced_questions == 1 else 'queries'}"
+            f"  ·  grading {_usd(summary.judge_cost_total)}"
+            + (f"  [dim]({unpriced} unpriced)[/dim]" if unpriced else "")
+        )
     if summary.context_counts:
         listed = ", ".join(f"{count} {label}" for label, count in summary.context_counts.items())
         console.print(f"  [dim]retrieved context:[/dim] {listed}")
@@ -1760,6 +1807,41 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
             console.print(f"  [dim]{escape(outcome.rationale)}[/dim]")
             if outcome.error:
                 console.print(f"  [red]{escape(outcome.error)}[/red]")
+
+
+NoRecordOption = Annotated[
+    bool,
+    typer.Option(
+        "--no-record",
+        help="Do not add this run to reports/experiments-questions-<version_id>.json "
+        "(for quick checks).",
+    ),
+]
+
+
+def _record_experiments(index_dir: Path, runs: list[ExperimentRun]) -> None:
+    """Append runs to the experiment log; a failure to record never fails the run."""
+    if not runs:
+        return
+    # Every run of one command answered the same question set.
+    path = log_path(index_dir / REPORTS_DIRNAME, runs[0].question_set)
+    try:
+        warnings = record_runs(path, runs)
+    except (ExperimentLogError, OSError) as exc:
+        err_console.print(f"[yellow]Warning:[/yellow] {escape(str(exc))}")
+        return
+    for warning in warnings:
+        err_console.print(f"[yellow]Warning:[/yellow] {escape(warning)}")
+    err_console.print(
+        f"[dim]Recorded {_plural(len(runs), 'run')} in "
+        f"{escape(str(path.relative_to(index_dir)))}.[/dim]"
+    )
+    if runs[0].question_set.version_id is None:
+        err_console.print(
+            "[dim]The question set has no `version_id:`, so its runs are logged under its "
+            "fingerprint. Add one at the top of the file (e.g. `version_id: kg-v1`) to "
+            "name the log; runs from then on go to that file.[/dim]"
+        )
 
 
 @app.command("eval")
@@ -1806,6 +1888,7 @@ def eval_command(
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit the full report as JSON instead of a table.")
     ] = False,
+    no_record: NoRecordOption = False,
     verbose: VerboseOption = False,
 ) -> None:
     """Score the index against a golden set of questions.
@@ -1819,7 +1902,8 @@ def eval_command(
     try:
         config, store = open_index(_print_notice)
         questions_path = resolve_questions_path(config, questions_file)
-        questions = _select_questions(load_questions(questions_path), only or [])
+        question_set = load_question_set(questions_path)
+        questions = _select_questions(question_set.questions, only or [])
 
         chosen_top_k = top_k if top_k is not None else config.index.top_k
         chosen_window = window if window is not None else config.index.retrieval_window
@@ -1835,7 +1919,7 @@ def eval_command(
             return cast(AIMessage, chat.invoke(messages))
 
         def answer_one(question: str) -> QueryResult:
-            return answer_question(
+            result = answer_question(
                 question,
                 store=store,
                 embed_query=embeddings.embed_query,
@@ -1847,6 +1931,7 @@ def eval_command(
                 rerank=rerank,
                 rerank_fanout=config.index.reranker_fanout,
             )
+            return _price_embedding(result, config)
 
         # Progress on stderr, so --json on stdout is never contaminated.
         with Progress(
@@ -1886,8 +1971,15 @@ def eval_command(
     if as_json:
         # Plain print: rich would wrap and highlight the JSON.
         print(report.model_dump_json(indent=2))  # noqa: T201
-        return
-    _print_eval_report(report, verbose=_is_verbose())
+    else:
+        _print_eval_report(report, verbose=_is_verbose())
+    if not no_record:
+        batch = new_batch_id()
+        info = question_set_info(question_set, questions_path, [q.id for q in questions])
+        _record_experiments(
+            config.source_dir or Path.cwd(),
+            [make_run("eval", batch, info, report.settings, report.aggregate, report.results)],
+        )
 
 
 def _money(value: float | None) -> str:
@@ -2229,6 +2321,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
     table.add_column("Cited", justify="right")
     table.add_column("Coverage", justify="right")
     table.add_column("Ans tok/q", justify="right", style="dim")
+    table.add_column("$/query", justify="right")
     table.add_column("s/q (IQR)", justify="right", style="dim")
 
     scores = [v.aggregate.mean_score for v in report.variants if v.aggregate is not None]
@@ -2245,7 +2338,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
                 str(variant.chunk_overlap),
                 *["[dim]—[/dim]"] * 2,
                 "[bold red]error[/bold red]",
-                *["[dim]—[/dim]"] * 6,
+                *["[dim]—[/dim]"] * 7,
             )
             continue
         score = f"{summary.mean_score:.2f}"
@@ -2264,6 +2357,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
             _percent(summary.citation_rate),
             _percent(summary.mean_coverage),
             f"{per_question:.0f}" if per_question is not None else "—",
+            _usd(summary.query_cost.median) if summary.query_cost else "—",
             _time_spread(summary.question_time),
         )
     return table
@@ -2434,6 +2528,7 @@ def compare_embeddings_command(
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit the full comparison as JSON instead of a table.")
     ] = False,
+    no_record: NoRecordOption = False,
     verbose: VerboseOption = False,
 ) -> None:
     """Compare embedding models, chunk sizes and overlaps on the eval question set.
@@ -2451,7 +2546,8 @@ def compare_embeddings_command(
     try:
         config, baseline_store = open_index(_print_notice)
         questions_path = resolve_questions_path(config, questions_file)
-        questions = _select_questions(load_questions(questions_path), only or [])
+        question_set = load_question_set(questions_path)
+        questions = _select_questions(question_set.questions, only or [])
 
         chosen_models = models or [spec.id for spec in config.embedding_models]
         chosen_sizes = chunk_sizes or [config.index.chunk_size]
@@ -2536,7 +2632,7 @@ def compare_embeddings_command(
                     keyword_index = build_keyword_index(store, mode)
 
                     def answer_one(question: str) -> QueryResult:
-                        return answer_question(
+                        result = answer_question(
                             question,
                             store=store,
                             embed_query=embeddings.embed_query,
@@ -2548,6 +2644,7 @@ def compare_embeddings_command(
                             rerank=rerank,
                             rerank_fanout=config.index.reranker_fanout,
                         )
+                        return _price_embedding(result, settings)
 
                     def on_start(question: EvalQuestion) -> None:
                         if stop.is_set():
@@ -2609,6 +2706,52 @@ def compare_embeddings_command(
     err_console.print(
         f"[dim]Saved to {escape(str(text_path.relative_to(index_dir)))} "
         f"and {escape(json_path.name)}.[/dim]"
+    )
+    if not no_record:
+        batch = new_batch_id()
+        info = question_set_info(question_set, questions_path, [q.id for q in questions])
+        _record_experiments(
+            index_dir,
+            [
+                make_run(
+                    "compare-embeddings",
+                    batch,
+                    info,
+                    _variant_settings(config, report.settings, variant),
+                    variant.aggregate,
+                    variant.results,
+                    baseline=variant.baseline,
+                )
+                for variant in report.variants
+                # A variant that failed to build or score has nothing to analyse.
+                if variant.aggregate is not None
+            ],
+        )
+
+
+def _variant_settings(
+    config: Config, shared: ComparisonSettings, variant: VariantResult
+) -> RunSettings:
+    """The settings one comparison row ran with, in the shape `eval` records."""
+    return RunSettings(
+        collection_name=shared.collection_name,
+        collection_key=shared.collection_key,
+        llm_model=shared.llm_model,
+        embedding_model=variant.embedding_model,
+        judge_model=shared.judge_model,
+        top_k=shared.top_k,
+        retrieval_window=shared.retrieval_window,
+        chunk_size=variant.chunk_size,
+        chunk_overlap=variant.chunk_overlap,
+        temperature=config.index.temperature,
+        judge_temperature=config.eval.judge_temperature,
+        retrieval=shared.retrieval,
+        reranker=shared.reranker,
+        reranker_model=config.reranker_model_for(shared.reranker) if shared.reranker else None,
+        reranker_fanout=config.index.reranker_fanout if shared.reranker else 0,
+        questions_file=shared.questions_file,
+        store_chunks=variant.store_chunks,
+        embedding_dim=variant.embedding_dim,
     )
 
 
@@ -2823,7 +2966,11 @@ def generate_questions_command(
             )
 
         write_questions(
-            destination, questions, header=file_header(config, stats, language), force=True
+            destination,
+            questions,
+            header=file_header(config, stats, language),
+            force=True,
+            version_id=default_version_id(config),
         )
     except ZoteroRagError as exc:
         _fail(exc)

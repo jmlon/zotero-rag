@@ -1377,3 +1377,55 @@ def test_skips_the_user_can_fix_name_the_items_and_say_how() -> None:
     assert "Exploring LLMs (F6CRQDYK)" in text
     assert "Settings → Sync" in text
     assert "Convert Linked Files to Stored Files" in text
+
+
+def test_eval_logs_each_run_under_its_question_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, "version_id: kg-v1\n" + ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    first = runner.invoke(cli.app, ["eval"])
+    second = runner.invoke(cli.app, ["eval", "--top-k", "1"])
+    skipped = runner.invoke(cli.app, ["eval", "--no-record"])
+
+    assert first.exit_code == second.exit_code == skipped.exit_code == 0
+    assert "Recorded 1 run in reports/experiments-questions-kg-v1.json" in first.output
+    log = json.loads((tmp_path / "reports" / "experiments-questions-kg-v1.json").read_text())
+    runs = log["runs"]
+    assert [run["settings"]["top_k"] for run in runs] == [3, 1]
+    assert runs[0]["command"] == "eval"
+    assert runs[0]["question_set"]["version_id"] == "kg-v1"
+    assert runs[0]["aggregate"]["questions"] == 1
+    assert runs[0]["results"][0]["id"] == "fog"
+    assert runs[0]["batch_id"] != runs[1]["batch_id"]
+
+
+def test_eval_without_a_version_id_logs_by_fingerprint_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval"])
+
+    assert result.exit_code == 0
+    assert "no `version_id:`" in result.output
+    assert len(list((tmp_path / "reports").glob("experiments-questions-fp-*.json"))) == 1
+
+
+def test_cost_from_message_reads_the_providers_charge() -> None:
+    from langchain_core.messages import AIMessage
+
+    from zotero_rag.llm import cost_from_message
+
+    assert (
+        cost_from_message(
+            AIMessage(content="x", response_metadata={"token_usage": {"cost": 4.35e-06}})
+        )
+        == 4.35e-06
+    )
+    assert cost_from_message(AIMessage(content="x", response_metadata={"token_usage": {}})) is None
+    assert cost_from_message(AIMessage(content="x")) is None

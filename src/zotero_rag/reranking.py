@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import httpx
 
@@ -44,6 +45,15 @@ MAX_RETRY_DELAY_S = 8.0
 #: The reranking network seam: (question, documents, top_n) -> [(index, score), ...],
 #: best first, indices into `documents`.
 RerankFn = Callable[[str, list[str], int], list[tuple[int, float]]]
+
+
+class Ranking(list[tuple[int, float]]):
+    """A reranker's (index, score) pairs, best first, and what the call cost.
+
+    A list, so a reranker that only returns pairs still satisfies `RerankFn`.
+    """
+
+    cost: float | None = None
 
 
 class RerankError(ZoteroRagError):
@@ -111,11 +121,15 @@ def _reranker(url: str, api_key: str, model: str, provider: str) -> RerankFn:
         if usage:
             logger.debug("rerank usage with %s: %s", model, usage)
         results = payload.get("results") or []
-        return [
+        ranking = Ranking(
             (int(entry["index"]), float(entry.get("relevance_score", 0.0)))
             for entry in results
             if "index" in entry
-        ]
+        )
+        # OpenRouter reports the charge; Cohere's own API reports billed units only.
+        cost = usage.get("cost")
+        ranking.cost = float(cost) if isinstance(cost, int | float) else None
+        return ranking
 
     return rerank
 
@@ -131,15 +145,23 @@ def candidate_count(top_k: int, fanout: int) -> int:
     return max(top_k * max(fanout, 1), top_k)
 
 
+class RerankOutcome(NamedTuple):
+    hits: list[StoredChunk]
+    #: Whether reranking actually applied, rather than falling back.
+    reranked: bool
+    #: What the rerank call cost, when the provider reported it.
+    cost: float | None = None
+
+
 def apply_rerank(
     candidates: Sequence[StoredChunk],
     question: str,
     top_k: int,
     rerank: RerankFn | None,
-) -> tuple[list[StoredChunk], bool]:
+) -> RerankOutcome:
     """Reorder `candidates` by relevance and cut to `top_k`.
 
-    Returns the chunks and whether reranking actually applied. A transient failure
+    Returns the chunks, whether reranking actually applied, and its cost. A transient failure
     falls back to the retrieved order rather than losing the question (§10) — but it
     is reported as *not* reranked, because a run that silently half-reranked would
     make two `eval` reports incomparable while looking identical.
@@ -149,7 +171,7 @@ def apply_rerank(
     """
     ordered = list(candidates[:top_k])
     if rerank is None or not candidates:
-        return ordered, False
+        return RerankOutcome(ordered, False)
 
     try:
         ranked = rerank(question, [chunk.text for chunk in candidates], top_k)
@@ -157,13 +179,14 @@ def apply_rerank(
         raise
     except Exception as exc:  # noqa: BLE001 - transport and provider errors vary
         logger.warning("reranking failed, keeping the retrieved order: %s", exc)
-        return ordered, False
+        return RerankOutcome(ordered, False)
 
+    cost = ranked.cost if isinstance(ranked, Ranking) else None
     picked = [candidates[index] for index, _ in ranked if 0 <= index < len(candidates)]
     if not picked:
         # A provider that answers 200 with nothing usable must not empty the context.
         logger.warning("the reranker returned no usable result, keeping the retrieved order")
-        return ordered, False
+        return RerankOutcome(ordered, False, cost)
 
     logger.info("reranked %d candidate(s) down to %d", len(candidates), min(len(picked), top_k))
-    return picked[:top_k], True
+    return RerankOutcome(picked[:top_k], True, cost)

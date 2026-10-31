@@ -68,7 +68,7 @@ def test_fanout_widens_the_candidate_pool() -> None:
 
 
 def test_reranking_reorders_and_cuts() -> None:
-    picked, reranked = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=reranker([2, 0, 3, 1]))
+    picked, reranked, _ = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=reranker([2, 0, 3, 1]))
 
     assert reranked is True
     assert [c.id for c in picked] == ["C:1:0", "A:1:0"]
@@ -76,18 +76,18 @@ def test_reranking_reorders_and_cuts() -> None:
 
 def test_reranking_can_discard_a_candidate_retrieval_ranked_first() -> None:
     """The whole point: relevance to the question, not similarity of the embedding."""
-    picked, _ = apply_rerank(CANDIDATES, "fog?", top_k=1, rerank=reranker([2]))
+    picked, _, _ = apply_rerank(CANDIDATES, "fog?", top_k=1, rerank=reranker([2]))
     assert [c.id for c in picked] == ["C:1:0"]
 
 
 def test_no_reranker_keeps_the_retrieved_order() -> None:
-    picked, reranked = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=None)
+    picked, reranked, _ = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=None)
     assert [c.id for c in picked] == ["A:1:0", "B:1:0"]
     assert reranked is False
 
 
 def test_no_candidates_is_not_an_error() -> None:
-    assert apply_rerank([], "fog?", top_k=5, rerank=reranker([0])) == ([], False)
+    assert apply_rerank([], "fog?", top_k=5, rerank=reranker([0])) == ([], False, None)
 
 
 def test_a_transient_failure_falls_back_to_the_retrieved_order() -> None:
@@ -96,7 +96,7 @@ def test_a_transient_failure_falls_back_to_the_retrieved_order() -> None:
     def failing(question: str, documents: list[str], top_n: int) -> list[tuple[int, float]]:
         raise httpx.ReadTimeout("too slow")
 
-    picked, reranked = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=failing)
+    picked, reranked, _ = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=failing)
 
     assert [c.id for c in picked] == ["A:1:0", "B:1:0"]
     # Reported as not reranked, so a half-reranked run cannot pass for a reranked one.
@@ -115,13 +115,13 @@ def test_a_misconfiguration_is_raised_not_swallowed() -> None:
 
 def test_an_empty_ranking_does_not_empty_the_context() -> None:
     """A provider answering 200 with nothing usable must not lose every passage."""
-    picked, reranked = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=reranker([]))
+    picked, reranked, _ = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=reranker([]))
     assert [c.id for c in picked] == ["A:1:0", "B:1:0"]
     assert reranked is False
 
 
 def test_out_of_range_indices_are_ignored() -> None:
-    picked, reranked = apply_rerank(CANDIDATES, "fog?", top_k=3, rerank=reranker([99, 1, -1, 0]))
+    picked, reranked, _ = apply_rerank(CANDIDATES, "fog?", top_k=3, rerank=reranker([99, 1, -1, 0]))
     assert [c.id for c in picked] == ["B:1:0", "A:1:0"]
     assert reranked is True
 
@@ -232,7 +232,7 @@ def test_a_server_error_stays_transient(
     assert len(sleeps) == MAX_RETRIES
 
     # And through apply_rerank it degrades rather than failing the question.
-    picked, reranked = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
+    picked, reranked, _ = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
     assert len(picked) == 2 and reranked is False
 
 
@@ -337,7 +337,7 @@ def test_a_rate_limit_that_outlasts_the_retries_falls_back(
         rerank("q", ["a", "b"], 2)
     assert len(seen) == MAX_RETRIES + 1
 
-    picked, reranked = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
+    picked, reranked, _ = apply_rerank(CANDIDATES, "q", top_k=2, rerank=rerank)
     assert len(picked) == 2 and reranked is False
 
 
@@ -440,3 +440,35 @@ def test_reranking_runs_before_windowing(store: VectorStore) -> None:
     texts = [excerpt for source in result.sources for excerpt in source.excerpts]
     assert "the actual answer" in texts
     assert "third" in texts
+
+
+def test_the_reported_cost_travels_with_the_ranking(monkeypatch: pytest.MonkeyPatch) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "results": [
+                    {"index": 1, "relevance_score": 0.9},
+                    {"index": 0, "relevance_score": 0.2},
+                ],
+                "usage": {"total_tokens": 10, "cost": 2e-07},
+            },
+        )
+
+    transport = stub_transport(handler)
+    monkeypatch.setattr(
+        httpx, "post", lambda url, **kw: httpx.Client(transport=transport).post(url, **kw)
+    )
+    rerank = build_reranker(cohere_config(), "cohere")
+
+    outcome = apply_rerank(CANDIDATES[:2], "fog?", top_k=1, rerank=rerank)
+
+    assert outcome.reranked is True
+    assert outcome.cost == 2e-07
+    assert outcome.hits == [CANDIDATES[1]]
+
+
+def test_a_reranker_that_reports_no_cost_is_unpriced() -> None:
+    outcome = apply_rerank(CANDIDATES, "fog?", top_k=2, rerank=reranker([2, 0]))
+    assert outcome.reranked is True
+    assert outcome.cost is None

@@ -24,7 +24,7 @@ from pydantic import BaseModel, Field
 
 from zotero_rag.documents import LocatorKind
 from zotero_rag.embedding import count_tokens
-from zotero_rag.llm import LLMError, message_text, usage_from_message
+from zotero_rag.llm import LLMError, cost_from_message, message_text, usage_from_message
 from zotero_rag.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
 from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore
@@ -113,6 +113,11 @@ class Usage(BaseModel):
     completion_tokens: int = 0
     embedding_tokens: int = 0
     elapsed_s: float = 0.0
+    #: USD, as the provider reported it; `None` when it did not. The question's
+    #: embedding is priced by the caller, from the `embedding_models` catalogue.
+    answer_cost: float | None = None
+    rerank_cost: float | None = None
+    embedding_cost: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -321,10 +326,10 @@ def _prepare(
     embedding = embed_query(question)
     depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
     candidates = retrieve(store, embedding, question, depth, mode, keyword_index, scope)
-    hits, reranked = apply_rerank(candidates, question, top_k, rerank)
+    hits, reranked, rerank_cost = apply_rerank(candidates, question, top_k, rerank)
     chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
-    usage = Usage(embedding_tokens=count_tokens([question]))
+    usage = Usage(embedding_tokens=count_tokens([question]), rerank_cost=rerank_cost)
 
     messages = None
     if hits:
@@ -336,6 +341,7 @@ def _prepare(
 
 def _no_context(prepared: _Prepared) -> QueryResult:
     prepared.usage.elapsed_s = time.perf_counter() - prepared.start
+    prepared.usage.answer_cost = 0.0  # the model is never called
     return QueryResult(question=prepared.question, answer=NO_CONTEXT_ANSWER, usage=prepared.usage)
 
 
@@ -343,6 +349,7 @@ def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
     """Turn the model's reply into the result: citations, usage, counts."""
     usage = prepared.usage
     usage.prompt_tokens, usage.completion_tokens = usage_from_message(message)
+    usage.answer_cost = cost_from_message(message)
     usage.elapsed_s = time.perf_counter() - prepared.start
     text = message_text(message).strip()
 

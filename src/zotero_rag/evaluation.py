@@ -22,6 +22,8 @@ API access.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 import statistics
@@ -41,7 +43,7 @@ from pydantic import BaseModel, Field, SecretStr, computed_field
 from zotero_rag.config import Config
 from zotero_rag.embedding import MAX_RETRIES
 from zotero_rag.errors import ZoteroRagError
-from zotero_rag.llm import usage_from_message
+from zotero_rag.llm import cost_from_message, usage_from_message
 from zotero_rag.querying import QueryResult, Source
 from zotero_rag.vectorstore import VectorStore
 
@@ -226,8 +228,34 @@ def parse_questions(raw: Any, path: Path) -> list[EvalQuestion]:
     return questions
 
 
-def load_questions(path: Path) -> list[EvalQuestion]:
-    """Read and validate the golden set at `path`."""
+_VERSION_ID = re.compile(r"[A-Za-z0-9._-]+")
+
+
+class QuestionSet(BaseModel):
+    """A loaded golden set and the identity its runs are recorded under."""
+
+    questions: list[EvalQuestion]
+    #: The `version_id:` at the top of the file, if it has one. Bumped by hand
+    #: when the set is edited, so runs on different sets are never pooled.
+    version_id: str | None = None
+
+    @property
+    def fingerprint(self) -> str:
+        """A hash of the questions' content, ignoring comments and layout.
+
+        Recorded beside `version_id` because a version is only a promise: an edit
+        that forgot to bump it shows up as a second fingerprint under one version.
+        """
+        payload = json.dumps(
+            [question.model_dump() for question in self.questions],
+            sort_keys=True,
+            ensure_ascii=False,
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def load_question_set(path: Path) -> QuestionSet:
+    """Read and validate the golden set at `path`, with its version."""
     if not path.is_file():
         raise QuestionSetError(
             f"No question set at {path}. Create it with a `questions:` list of "
@@ -241,7 +269,22 @@ def load_questions(path: Path) -> list[EvalQuestion]:
         raise QuestionSetError(f"Invalid YAML in {path}: {exc}") from exc
     if raw is None:
         raise QuestionSetError(f"{path}: the question set is empty.")
-    return parse_questions(raw, path)
+
+    version = raw.get("version_id") if isinstance(raw, dict) else None
+    if version is not None and not isinstance(version, str | int | float):
+        raise QuestionSetError(f"{path}: `version_id:` must be a single value, such as v1.")
+    version_id = str(version).strip() if version is not None else ""
+    if version_id and not _VERSION_ID.fullmatch(version_id):
+        raise QuestionSetError(
+            f"{path}: `version_id: {version_id}` names the file its runs are recorded in, "
+            "so use only letters, digits, '.', '_' and '-' (e.g. kg-v1)."
+        )
+    return QuestionSet(questions=parse_questions(raw, path), version_id=version_id or None)
+
+
+def load_questions(path: Path) -> list[EvalQuestion]:
+    """Read and validate the golden set at `path`."""
+    return load_question_set(path).questions
 
 
 def resolve_questions_path(config: Config, override: Path | None) -> Path:
@@ -418,6 +461,7 @@ class RawVerdict(BaseModel):
     verdict: JudgeVerdict
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cost: float | None = None
 
 
 #: The grading network seam: (question, ground truth, answer) -> verdict.
@@ -474,6 +518,11 @@ def _usage(response: dict[str, Any]) -> tuple[int, int]:
     return usage_from_message(raw) if isinstance(raw, AIMessage) else (0, 0)
 
 
+def _cost(response: dict[str, Any]) -> float | None:
+    raw = response.get("raw")
+    return cost_from_message(raw) if isinstance(raw, AIMessage) else None
+
+
 def build_verdict_fn(config: Config) -> VerdictFn:
     """The live judge, calling the configured grading model."""
     structured = _structured(config, JudgeVerdict)
@@ -499,7 +548,10 @@ def build_verdict_fn(config: Config) -> VerdictFn:
             )
         prompt_tokens, completion_tokens = _usage(response)
         return RawVerdict(
-            verdict=parsed, prompt_tokens=prompt_tokens, completion_tokens=completion_tokens
+            verdict=parsed,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cost=_cost(response),
         )
 
     return verdict_of
@@ -579,6 +631,7 @@ class Judgement(BaseModel):
     coverage: Coverage = Field(default_factory=Coverage)
     prompt_tokens: int = 0
     completion_tokens: int = 0
+    cost: float | None = None
 
     @property
     def score(self) -> int:
@@ -614,6 +667,7 @@ def judge_answer(
             coverage=_tally_points(raw.verdict, total),
             prompt_tokens=raw.prompt_tokens,
             completion_tokens=raw.completion_tokens,
+            cost=raw.cost,
         )
 
     logger.warning("could not grade %s after %d attempts: %s", question.id, attempts, last_error)
@@ -654,8 +708,30 @@ class QuestionOutcome(BaseModel):
     embedding_tokens: int = 0
     judge_tokens: int = 0
     elapsed_s: float = 0.0
+    #: USD, as the providers reported it; `None` where one did not. See `query_cost`.
+    answer_cost: float | None = None
+    rerank_cost: float | None = None
+    embedding_cost: float | None = None
+    judge_cost: float | None = None
+    #: What answering this question cost, as a user's query would: embedding,
+    #: reranking and the answer, but not the grading, which only evaluation pays.
+    #: `None` when a part that ran went unpriced, rather than a silent undercount.
+    query_cost: float | None = None
     #: Set when answering the question failed outright.
     error: str = ""
+
+
+def query_cost(result: QueryResult) -> float | None:
+    """Embedding + reranking + answering, or `None` if a part that ran is unpriced.
+
+    The question's embedding counts as free when unpriced: at a few tokens it is
+    a millionth of a cent, and refusing to price every query over it would hide
+    the costs that matter.
+    """
+    usage = result.usage
+    if usage.answer_cost is None or (result.reranked and usage.rerank_cost is None):
+        return None
+    return usage.answer_cost + (usage.rerank_cost or 0.0) + (usage.embedding_cost or 0.0)
 
 
 def _context_of(result: QueryResult) -> str:
@@ -734,6 +810,11 @@ def evaluate_question(
         embedding_tokens=result.usage.embedding_tokens,
         judge_tokens=judgement.prompt_tokens + judgement.completion_tokens,
         elapsed_s=time.perf_counter() - start,
+        answer_cost=result.usage.answer_cost,
+        rerank_cost=result.usage.rerank_cost,
+        embedding_cost=result.usage.embedding_cost,
+        judge_cost=judgement.cost,
+        query_cost=query_cost(result),
     )
 
 
@@ -794,6 +875,14 @@ def _quartiles(values: list[float]) -> tuple[float, float, float] | None:
     return low, median, high
 
 
+class CostSpread(BaseModel):
+    """USD per query: the median and the middle half around it, like `TimeSpread`."""
+
+    p25: float
+    median: float
+    p75: float
+
+
 class TimeSpread(BaseModel):
     """How long one question took: the median and the middle half around it.
 
@@ -828,6 +917,14 @@ class EvalAggregate(BaseModel):
     elapsed_s: float = 0.0
     #: Per-question time, robust to the occasional stalled request.
     question_time: TimeSpread | None = None
+    #: USD per query (embedding + reranking + answer), over the questions whose
+    #: cost is known; `priced_questions` says how many that was.
+    query_cost: CostSpread | None = None
+    query_cost_mean: float | None = None
+    query_cost_total: float | None = None
+    priced_questions: int = 0
+    #: What grading cost: evaluation overhead, never part of a query's price.
+    judge_cost_total: float | None = None
     errors: int = 0
     #: Questions where a configured reranker silently fell back to the retrieved
     #: order. Reported because a half-reranked run must not pass for a reranked one.
@@ -861,6 +958,9 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
 
     coverages = [score for outcome in outcomes if (score := outcome.coverage.score) is not None]
     quartiles = _quartiles([outcome.elapsed_s for outcome in outcomes])
+    costs = [cost for outcome in outcomes if (cost := outcome.query_cost) is not None]
+    cost_quartiles = _quartiles(costs)
+    judge_costs = [cost for outcome in outcomes if (cost := outcome.judge_cost) is not None]
     return EvalAggregate(
         questions=len(outcomes),
         mean_score=sum(outcome.score for outcome in outcomes) / len(outcomes),
@@ -879,6 +979,15 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
         question_time=TimeSpread(p25_s=quartiles[0], median_s=quartiles[1], p75_s=quartiles[2])
         if quartiles
         else None,
+        query_cost=CostSpread(
+            p25=cost_quartiles[0], median=cost_quartiles[1], p75=cost_quartiles[2]
+        )
+        if cost_quartiles
+        else None,
+        query_cost_mean=_mean(costs),
+        query_cost_total=sum(costs) if costs else None,
+        priced_questions=len(costs),
+        judge_cost_total=sum(judge_costs) if judge_costs else None,
         errors=sum(1 for o in outcomes if o.grade is Grade.ERROR),
         reranked_questions=sum(1 for o in outcomes if o.reranked),
     )

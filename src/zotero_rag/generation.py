@@ -35,6 +35,7 @@ import re
 import time
 import unicodedata
 from collections.abc import Callable, Iterable, Sequence
+from datetime import datetime
 from typing import Any, cast
 
 import yaml
@@ -624,25 +625,26 @@ def _clean(text: str) -> str:
     return "\n".join(lines).strip()
 
 
-def dump_questions(questions: Sequence[EvalQuestion], header: str = "") -> str:
+def dump_questions(
+    questions: Sequence[EvalQuestion], header: str = "", version_id: str | None = None
+) -> str:
     """Serialise a golden set to YAML in the §11.3 schema."""
-    payload = {
-        "questions": [
-            {
-                "id": question.id,
-                "question": _clean(question.question),
-                "expected_items": list(question.expected_items),
-                **(
-                    {"expected_evidence": [_clean(quote) for quote in question.expected_evidence]}
-                    if question.expected_evidence
-                    else {}
-                ),
-                "expected_points": [_clean(point) for point in question.expected_points],
-                "answer": _clean(question.answer),
-            }
-            for question in questions
-        ]
-    }
+    payload: dict[str, Any] = {} if version_id is None else {"version_id": version_id}
+    payload["questions"] = [
+        {
+            "id": question.id,
+            "question": _clean(question.question),
+            "expected_items": list(question.expected_items),
+            **(
+                {"expected_evidence": [_clean(quote) for quote in question.expected_evidence]}
+                if question.expected_evidence
+                else {}
+            ),
+            "expected_points": [_clean(point) for point in question.expected_points],
+            "answer": _clean(question.answer),
+        }
+        for question in questions
+    ]
     body = yaml.dump(
         payload,
         Dumper=_BlockDumper,
@@ -653,6 +655,12 @@ def dump_questions(questions: Sequence[EvalQuestion], header: str = "") -> str:
         indent=4,
     )
     return f"{header}\n{body}" if header else body
+
+
+def default_version_id(config: Config, now: datetime | None = None) -> str:
+    """`kg-20261031-1105`: the collection and when the set was generated."""
+    stem = _slug(config.index.collection_name or "") or "questions"
+    return f"{stem}-{(now or datetime.now()):%Y%m%d-%H%M}"
 
 
 def file_header(config: Config, stats: GenerationStats, language: str) -> str:
@@ -673,13 +681,21 @@ def file_header(config: Config, stats: GenerationStats, language: str) -> str:
             "#   - `expected_items` is exact — it is the item the text came from — but",
             "#     the questions and points are a model's reading and deserve a review.",
             "#",
+            "# Runs are logged in reports/experiments-questions-<version_id>.json. Once",
+            "# runs are logged, change `version_id` whenever you edit the questions, so",
+            "# results on the old and the new set land in separate logs.",
+            "#",
             "# Then: zotero-rag eval",
         ]
     )
 
 
 def write_questions(
-    path: Any, questions: Sequence[EvalQuestion], header: str = "", force: bool = False
+    path: Any,
+    questions: Sequence[EvalQuestion],
+    header: str = "",
+    force: bool = False,
+    version_id: str | None = None,
 ) -> None:
     """Write the set to `path`, refusing to clobber an existing file.
 
@@ -691,7 +707,7 @@ def write_questions(
             f"{path} already exists. Generated questions would overwrite a set you may "
             "have edited; pass --force to replace it, or --out to write elsewhere."
         )
-    text = dump_questions(questions, header)
+    text = dump_questions(questions, header, version_id)
     try:
         path.write_text(text, encoding="utf-8")
     except OSError as exc:

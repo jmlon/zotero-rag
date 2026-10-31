@@ -52,6 +52,18 @@ def usage_from_message(message: AIMessage) -> tuple[int, int]:
     return int(usage.get("input_tokens", 0)), int(usage.get("output_tokens", 0))
 
 
+def cost_from_message(message: AIMessage) -> float | None:
+    """What the provider says the call cost, in USD, or `None` if it did not say.
+
+    OpenRouter reports it in `usage.cost`, which LangChain passes through in the
+    response metadata. The actual charge beats a price list kept by hand: it
+    follows price changes and the provider OpenRouter routed to.
+    """
+    usage = (message.response_metadata or {}).get("token_usage") or {}
+    cost = usage.get("cost") if isinstance(usage, dict) else None
+    return float(cost) if isinstance(cost, int | float) else None
+
+
 def message_text(message: AIMessage) -> str:
     """The message content as plain text.
 

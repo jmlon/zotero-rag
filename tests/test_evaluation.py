@@ -33,6 +33,7 @@ from zotero_rag.evaluation import (
     judge_answer,
     load_questions,
     parse_questions,
+    query_cost,
     resolve_questions_path,
     retrieval_hit,
     run_settings,
@@ -681,3 +682,62 @@ def test_a_single_question_has_a_degenerate_spread() -> None:
     assert spread is not None
     assert (spread.p25_s, spread.median_s, spread.p75_s) == (4.0, 4.0, 4.0)
     assert aggregate([]).question_time is None
+
+
+# --- cost ------------------------------------------------------------------
+
+
+def priced_result(
+    answer: float | None,
+    rerank: float | None = None,
+    embedding: float | None = None,
+    reranked: bool = False,
+) -> QueryResult:
+    result = result_with([source()])
+    result.reranked = reranked
+    result.usage.answer_cost = answer
+    result.usage.rerank_cost = rerank
+    result.usage.embedding_cost = embedding
+    return result
+
+
+def test_a_query_costs_its_embedding_reranking_and_answer() -> None:
+    cost = query_cost(priced_result(3e-4, rerank=2e-5, embedding=1e-7, reranked=True))
+    assert cost == pytest.approx(3e-4 + 2e-5 + 1e-7)
+
+
+def test_an_unpriced_answer_or_rerank_leaves_the_query_unpriced() -> None:
+    assert query_cost(priced_result(None)) is None
+    assert query_cost(priced_result(3e-4, rerank=None, reranked=True)) is None
+    # No reranker ran, so there is no rerank cost to miss.
+    assert query_cost(priced_result(3e-4)) == pytest.approx(3e-4)
+
+
+def test_grading_is_recorded_but_not_part_of_the_query_cost() -> None:
+    def verdict(question: str, ground_truth: str, answer: str) -> RawVerdict:
+        return RawVerdict(verdict=JudgeVerdict(grade="good", rationale="ok"), cost=1e-4)
+
+    question = EvalQuestion(id="q", question="?", answer="x")
+    outcome = evaluate_question(question, lambda _: priced_result(3e-4), verdict)
+
+    assert outcome.judge_cost == 1e-4
+    assert outcome.query_cost == pytest.approx(3e-4)
+
+
+def test_query_cost_is_summarised_by_median_and_quartiles() -> None:
+    costs = [1e-4, 2e-4, 3e-4, 4e-4, 9e-3, None]
+    outcomes = [
+        QuestionOutcome(
+            id=str(n), question="?", grade=Grade.GOOD, score=3, query_cost=c, judge_cost=1e-4
+        )
+        for n, c in enumerate(costs)
+    ]
+    summary = aggregate(outcomes)
+
+    assert summary.priced_questions == 5
+    assert summary.query_cost is not None
+    assert summary.query_cost.median == pytest.approx(3e-4)
+    assert (summary.query_cost.p25, summary.query_cost.p75) == pytest.approx((2e-4, 4e-4))
+    assert summary.query_cost_total == pytest.approx(sum(c for c in costs if c))
+    assert summary.judge_cost_total == pytest.approx(6e-4)
+    assert aggregate(outcomes[-1:]).query_cost is None

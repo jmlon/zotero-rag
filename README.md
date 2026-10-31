@@ -448,6 +448,15 @@ zotero-rag eval --only fog-node -v   # one question, with the judge's reasoning
 zotero-rag eval --jobs 1             # one question at a time (default: 4 at once)
 ```
 
+Each run also reports what it cost: the median **cost per query** with its middle
+half (25th–75th percentile), the total, and what grading cost on top. A query's
+cost is embedding the question, reranking (when on) and answering — grading is
+evaluation overhead and is kept apart. The charges are the ones OpenRouter
+reports for each call, not a price list, so they follow price changes and the
+provider a request was routed to; the question's embedding, a few tokens, is
+priced from the `embedding_models` list. `compare-embeddings` shows the median
+in its `$/query` column, and every figure goes into the experiment log.
+
 Questions are answered and graded four at a time, since nearly all the time goes on
 waiting for the two models; the report keeps the file's order either way. Lower
 `--jobs` if the LLM provider returns rate-limit errors.
@@ -529,6 +538,32 @@ score was measured on different documents.
 Every run is also saved to `reports/compare-embeddings-<date>-<time>.txt` (the
 table as printed) and `.json` (every question's result), so runs can be compared
 later.
+
+### The experiment log
+
+Every scored configuration — each `eval` run, and each row of a
+`compare-embeddings` run — is also appended to an experiment log for its question
+set, `reports/experiments-questions-<version_id>.json`. The log is meant for a
+notebook: each entry holds the full settings (models, chunk size and overlap,
+`top_k`, window, retrieval mode, reranker, temperatures), the summary numbers and
+every question's result, so
+
+```python
+import json, pandas as pd
+runs = json.load(open("reports/experiments-questions-kg-v1.json"))["runs"]
+df = pd.json_normalize(runs)                      # one row per run
+per_question = pd.json_normalize(runs, "results", ["run_id", ["settings", "chunk_size"]])
+```
+
+Rows of one `compare-embeddings` run share a `batch_id`. Pass `--no-record` for a
+quick check you don't want logged.
+
+Results on different question sets are not comparable, so each set has its own
+log, named by the `version_id:` at the top of `questions.yaml` (generated sets get
+one automatically; a set without one is logged under its content fingerprint).
+Each entry also records that fingerprint: **when you edit the questions, change
+`version_id`** — if you forget, the next run warns that the set has changed under
+the same version.
 
 Grade with a different model from the one answering, so no model marks its own
 work. Set `judge_model` once under `global.defaults` for every folder, or under
@@ -660,7 +695,8 @@ Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defau
   questions.yaml  optional golden set for `eval` — worth committing
   chroma/            the vector store
   embeddings/        stores built by `compare-embeddings`, one per model and chunking
-  reports/           a copy of every `compare-embeddings` table, as text and JSON
+  reports/           a copy of every `compare-embeddings` table, as text and JSON,
+                     and one experiment log per question set
   cache/             downloaded attachments and transcripts, kept so re-indexing
                      does not re-download
   collections.json   the indexed collection tree, rewritten by every `index` run
