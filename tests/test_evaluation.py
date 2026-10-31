@@ -659,3 +659,25 @@ def test_a_parallel_run_reports_its_wall_clock_time_not_the_sum() -> None:
     ]
     assert aggregate(outcomes).elapsed_s == 16.0
     assert aggregate(outcomes, elapsed_s=4.5).elapsed_s == 4.5
+
+
+def test_question_time_is_reported_as_median_and_quartiles() -> None:
+    """One stalled request must not move the typical time."""
+    times = [2.0, 2.5, 3.0, 3.5, 146.0]
+    outcomes = [
+        QuestionOutcome(id=str(n), question="?", grade=Grade.GOOD, score=3, elapsed_s=t)
+        for n, t in enumerate(times)
+    ]
+    spread = aggregate(outcomes).question_time
+
+    assert spread is not None
+    assert spread.median_s == 3.0
+    assert (spread.p25_s, spread.p75_s) == (2.5, 3.5)
+
+
+def test_a_single_question_has_a_degenerate_spread() -> None:
+    outcome = QuestionOutcome(id="a", question="?", grade=Grade.GOOD, score=3, elapsed_s=4.0)
+    spread = aggregate([outcome]).question_time
+    assert spread is not None
+    assert (spread.p25_s, spread.median_s, spread.p75_s) == (4.0, 4.0, 4.0)
+    assert aggregate([]).question_time is None

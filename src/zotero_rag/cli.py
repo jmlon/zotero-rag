@@ -86,6 +86,7 @@ from zotero_rag.evaluation import (
     Grade,
     QuestionOutcome,
     QuestionSetError,
+    TimeSpread,
     aggregate,
     build_context_assessor,
     build_verdict_fn,
@@ -1625,6 +1626,13 @@ def _flag(value: bool | None) -> str:
     return "[green]yes[/green]" if value else "[red]no[/red]"
 
 
+def _time_spread(spread: TimeSpread | None) -> str:
+    """`2.9s (2.4–3.4)`: the median question, and the middle half of them."""
+    if spread is None:
+        return "—"
+    return f"{spread.median_s:.1f}s ({spread.p25_s:.1f}–{spread.p75_s:.1f})"
+
+
 def _percent(value: float | None) -> str:
     return "[dim]n/a[/dim]" if value is None else f"{value * 100:.0f}%"
 
@@ -1704,7 +1712,8 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
         f"retrieval hit {_percent(summary.hit_rate)}  ·  {passage}"
         f"expected item cited {_percent(summary.citation_rate)}  ·  "
         f"point coverage {_percent(summary.mean_coverage)}  ·  "
-        f"{summary.total_tokens} tokens  ·  {summary.elapsed_s:.1f}s"
+        f"{summary.total_tokens} tokens  ·  {summary.elapsed_s:.1f}s total, "
+        f"{_time_spread(summary.question_time)} per question"
     )
 
     grades = "  ".join(
@@ -2220,7 +2229,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
     table.add_column("Cited", justify="right")
     table.add_column("Coverage", justify="right")
     table.add_column("Ans tok/q", justify="right", style="dim")
-    table.add_column("Time", justify="right", style="dim")
+    table.add_column("s/q (IQR)", justify="right", style="dim")
 
     scores = [v.aggregate.mean_score for v in report.variants if v.aggregate is not None]
     best = max(scores, default=None)
@@ -2255,7 +2264,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
             _percent(summary.citation_rate),
             _percent(summary.mean_coverage),
             f"{per_question:.0f}" if per_question is not None else "—",
-            f"{summary.elapsed_s:.0f}s",
+            _time_spread(summary.question_time),
         )
     return table
 

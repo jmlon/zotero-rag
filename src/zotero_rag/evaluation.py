@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 import time
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -783,6 +784,29 @@ def _mean(values: list[float]) -> float | None:
     return sum(values) / len(values) if values else None
 
 
+def _quartiles(values: list[float]) -> tuple[float, float, float] | None:
+    """(25th percentile, median, 75th percentile), or `None` without values."""
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0], values[0], values[0]
+    low, median, high = statistics.quantiles(values, n=4, method="inclusive")
+    return low, median, high
+
+
+class TimeSpread(BaseModel):
+    """How long one question took: the median and the middle half around it.
+
+    Reported instead of a mean because answering time has a long tail: one
+    request stalled on a provider for two minutes moves a 36-question mean by
+    several seconds and the median not at all.
+    """
+
+    p25_s: float
+    median_s: float
+    p75_s: float
+
+
 class EvalAggregate(BaseModel):
     """Query-time metrics across the whole set."""
 
@@ -802,6 +826,8 @@ class EvalAggregate(BaseModel):
     embedding_tokens: int = 0
     judge_tokens: int = 0
     elapsed_s: float = 0.0
+    #: Per-question time, robust to the occasional stalled request.
+    question_time: TimeSpread | None = None
     errors: int = 0
     #: Questions where a configured reranker silently fell back to the retrieved
     #: order. Reported because a half-reranked run must not pass for a reranked one.
@@ -834,6 +860,7 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
             context_counts[outcome.context_sufficiency] += 1
 
     coverages = [score for outcome in outcomes if (score := outcome.coverage.score) is not None]
+    quartiles = _quartiles([outcome.elapsed_s for outcome in outcomes])
     return EvalAggregate(
         questions=len(outcomes),
         mean_score=sum(outcome.score for outcome in outcomes) / len(outcomes),
@@ -849,6 +876,9 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
         embedding_tokens=sum(o.embedding_tokens for o in outcomes),
         judge_tokens=sum(o.judge_tokens for o in outcomes),
         elapsed_s=elapsed_s if elapsed_s is not None else sum(o.elapsed_s for o in outcomes),
+        question_time=TimeSpread(p25_s=quartiles[0], median_s=quartiles[1], p75_s=quartiles[2])
+        if quartiles
+        else None,
         errors=sum(1 for o in outcomes if o.grade is Grade.ERROR),
         reranked_questions=sum(1 for o in outcomes if o.reranked),
     )
