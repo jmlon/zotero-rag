@@ -248,7 +248,7 @@ def _stub_network(monkeypatch: pytest.MonkeyPatch) -> list[str]:
         def invoke(self, messages: object) -> AIMessage:
             return AIMessage(content="It sits between the edge and the cloud [1].")
 
-    def verdict_of(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def verdict_of(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         return RawVerdict(
             verdict=JudgeVerdict(grade="good", covered_points=[1], rationale="Right.")
         )

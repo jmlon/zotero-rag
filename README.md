@@ -448,14 +448,25 @@ zotero-rag eval --only fog-node -v   # one question, with the judge's reasoning
 zotero-rag eval --jobs 1             # one question at a time (default: 4 at once)
 ```
 
-Each run also reports what it cost: the median **cost per query** with its middle
-half (25th–75th percentile), the total, and what grading cost on top. A query's
-cost is embedding the question, reranking (when on) and answering — grading is
-evaluation overhead and is kept apart. The charges are the ones OpenRouter
-reports for each call, not a price list, so they follow price changes and the
-provider a request was routed to; the question's embedding, a few tokens, is
-priced from the `embedding_models` list. `compare-embeddings` shows the median
-in its `$/query` column, and every figure goes into the experiment log.
+Each run also reports what it cost. The headline is the median **cost per query at
+list price**, with its middle half (25th–75th percentile): embedding the question,
+reranking (when on) and answering, priced at the answering model's published
+OpenRouter rate. Beside it is what was actually **charged**, which is often lower:
+providers discount input they have recently seen, and an `eval` repeats the same
+prompts minutes apart — two identical runs were charged four times apart. Real
+queries are rarely repeats, so list price is the figure to compare configurations
+by; the line says what share of the input came from the cache. Grading is
+evaluation overhead and is reported apart. `compare-embeddings` shows the median
+list price in its `$/query list` column, and every figure goes into the
+experiment log.
+
+**The judge sees what the system saw.** It grades against the reference answer
+*and* the passages the answer was written from, so a true statement from the
+paper that the reference happens to leave out is not marked as fabricated, and a
+concise answer that gives exactly what was asked is not marked down for leaving
+out background. Runs record this as `judge_protocol: reference+passages`; scores
+from runs logged before it (`reference`) are not comparable with later ones.
+Showing the passages roughly doubles the cost of grading.
 
 Questions are answered and graded four at a time, since nearly all the time goes on
 waiting for the two models; the report keeps the file's order either way. Lower

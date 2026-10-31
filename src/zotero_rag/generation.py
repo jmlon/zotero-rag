@@ -186,13 +186,14 @@ class GeneratedQuestion(BaseModel):
         "ellipsis, nothing added.",
     )
     answer: str = Field(
-        description="A complete reference answer, drawn only from the document text."
+        description="A reference answer that answers exactly what the question asks, "
+        "drawn only from the document text."
     )
     expected_points: list[str] = Field(
         default_factory=list,
-        description="The distinct checkable claims the reference answer makes, one "
-        "short sentence each, 3 to 7 of them. Each must be supported by the "
-        "document; do not add anything the answer does not state.",
+        description="The facts a complete answer to this question must contain, one "
+        "short sentence each: 1 or 2 for a question about a single fact, at most 5 "
+        "otherwise. Only what the question asks for; no background or context.",
     )
 
 
@@ -243,8 +244,15 @@ experiments" or "the benchmark datasets" without saying what they are, and never
 the document must know what is being asked.
 - Do NOT ask about the document as an artefact — no questions about page numbers, \
 section titles, figure or table numbers, the reference list, or formatting.
-- The expected points must be independently checkable and must each be stated by \
-your own reference answer. Between 3 and 7 per question.
+- The reference answer and its expected points cover what the question ASKS, \
+nothing more. An answer that gives exactly that is a perfect answer, and every \
+expected point is something it would be wrong to leave out. Background, method \
+details, motivation or caveats the question does not ask about are not expected \
+points: "How large is the test subset?" expects its size, not where the split \
+came from or why it is that size.
+- Each expected point must be independently checkable and stated by your own \
+reference answer: one or two for a question about a single fact (a number, a \
+name, a setting), at most five otherwise.
 - If the supplied text is too short or too fragmentary to support a real question, \
 return fewer questions, or none at all, rather than inventing content.
 

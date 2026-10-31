@@ -9,9 +9,10 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+import httpx
 from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
-from pydantic import SecretStr
+from pydantic import BaseModel, SecretStr
 
 from zotero_rag.config import Config
 from zotero_rag.embedding import MAX_RETRIES
@@ -62,6 +63,47 @@ def cost_from_message(message: AIMessage) -> float | None:
     usage = (message.response_metadata or {}).get("token_usage") or {}
     cost = usage.get("cost") if isinstance(usage, dict) else None
     return float(cost) if isinstance(cost, int | float) else None
+
+
+def cached_tokens_from_message(message: AIMessage) -> int:
+    """Input tokens the provider served from its prompt cache, 0 if it did not say."""
+    usage: dict[str, Any] = dict(message.usage_metadata or {})
+    details = usage.get("input_token_details") or {}
+    return int(details.get("cache_read", 0) or 0)
+
+
+class ModelPrice(BaseModel):
+    """A chat model's list price, USD per token, as OpenRouter publishes it."""
+
+    prompt: float
+    completion: float
+
+    def cost(self, prompt_tokens: int, completion_tokens: int) -> float:
+        """The call's price with nothing served from the prompt cache."""
+        return prompt_tokens * self.prompt + completion_tokens * self.completion
+
+
+def fetch_price(endpoint: str, model: str) -> ModelPrice | None:
+    """`model`'s list price from OpenRouter's public model list, or `None`.
+
+    The charge a run reports depends on what the provider still had cached from
+    the run before: two identical runs minutes apart differed by a factor of
+    four. A query from a user is rarely a repeat, so the list price, with no
+    cache discount, is the cost to compare configurations by.
+    """
+    try:
+        response = httpx.get(f"{endpoint.rstrip('/')}/models", timeout=30.0)
+        response.raise_for_status()
+        listed = {entry.get("id"): entry.get("pricing") or {} for entry in response.json()["data"]}
+    except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+        logger.warning("could not fetch model prices: %s", exc)
+        return None
+    pricing: dict[str, Any] = listed.get(model) or {}
+    try:
+        return ModelPrice(prompt=float(pricing["prompt"]), completion=float(pricing["completion"]))
+    except (KeyError, ValueError):
+        logger.warning("no list price for %s", model)
+        return None
 
 
 def message_text(message: AIMessage) -> str:

@@ -24,7 +24,13 @@ from pydantic import BaseModel, Field
 
 from zotero_rag.documents import LocatorKind
 from zotero_rag.embedding import count_tokens
-from zotero_rag.llm import LLMError, cost_from_message, message_text, usage_from_message
+from zotero_rag.llm import (
+    LLMError,
+    cached_tokens_from_message,
+    cost_from_message,
+    message_text,
+    usage_from_message,
+)
 from zotero_rag.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
 from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore
@@ -118,6 +124,10 @@ class Usage(BaseModel):
     answer_cost: float | None = None
     rerank_cost: float | None = None
     embedding_cost: float | None = None
+    #: Input tokens served from the provider's prompt cache, which it charges less
+    #: for; and what the answer would cost at list price, without that discount.
+    cached_tokens: int = 0
+    answer_list_cost: float | None = None
 
     @property
     def total_tokens(self) -> int:
@@ -341,7 +351,7 @@ def _prepare(
 
 def _no_context(prepared: _Prepared) -> QueryResult:
     prepared.usage.elapsed_s = time.perf_counter() - prepared.start
-    prepared.usage.answer_cost = 0.0  # the model is never called
+    prepared.usage.answer_cost = prepared.usage.answer_list_cost = 0.0  # no model call
     return QueryResult(question=prepared.question, answer=NO_CONTEXT_ANSWER, usage=prepared.usage)
 
 
@@ -350,6 +360,7 @@ def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
     usage = prepared.usage
     usage.prompt_tokens, usage.completion_tokens = usage_from_message(message)
     usage.answer_cost = cost_from_message(message)
+    usage.cached_tokens = cached_tokens_from_message(message)
     usage.elapsed_s = time.perf_counter() - prepared.start
     text = message_text(message).strip()
 

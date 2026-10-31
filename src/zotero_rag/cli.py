@@ -80,8 +80,10 @@ from zotero_rag.errors import (
     ZoteroRagError,
 )
 from zotero_rag.evaluation import (
+    JUDGE_PROTOCOL,
     MAX_SCORE,
     CostSpread,
+    EvalAggregate,
     EvalQuestion,
     EvalReport,
     Grade,
@@ -136,7 +138,7 @@ from zotero_rag.indexer import (
     refresh_collection_keys,
     repair_embeddings,
 )
-from zotero_rag.llm import build_chat
+from zotero_rag.llm import ModelPrice, build_chat, fetch_price
 from zotero_rag.planning import (
     IndexPlan,
     PlannedAttachment,
@@ -1638,16 +1640,38 @@ def _flag(value: bool | None) -> str:
     return "[green]yes[/green]" if value else "[red]no[/red]"
 
 
-def _price_embedding(result: QueryResult, config: Config) -> QueryResult:
-    """Price the question's embedding from the catalogue.
+def _price_query(result: QueryResult, config: Config, price: ModelPrice | None) -> QueryResult:
+    """Fill in the costs the providers' charges do not give directly.
 
-    The embeddings client does not pass the provider's reported cost through, and
-    at a few tokens per question a catalogue price is accurate enough.
+    The question's embedding is priced from the catalogue: the embeddings client
+    does not pass the reported charge through, and at a few tokens per question a
+    catalogue price is accurate enough. The answer is also priced at the model's
+    list price, without the prompt-cache discount the charge may include.
     """
+    usage = result.usage
     spec = config.embedding_model_spec(config.embedding_model)
     if spec is not None:
-        result.usage.embedding_cost = spec.cost(result.usage.embedding_tokens)
+        usage.embedding_cost = spec.cost(usage.embedding_tokens)
+    if price is not None and usage.answer_list_cost is None:
+        usage.answer_list_cost = price.cost(usage.prompt_tokens, usage.completion_tokens)
     return result
+
+
+def _answer_price(config: Config) -> ModelPrice | None:
+    price = fetch_price(config.global_.endpoint, config.llm_model)
+    if price is None:
+        err_console.print(
+            f"[yellow]Warning:[/yellow] no list price found for {escape(config.llm_model)}; "
+            "the cost at list price will be missing from this run."
+        )
+    return price
+
+
+def _cached_share(summary: EvalAggregate) -> str:
+    """`, 41% of input cached`: why the charge is below the list price."""
+    if not summary.cached_tokens or not summary.prompt_tokens:
+        return ""
+    return f", {summary.cached_tokens / summary.prompt_tokens:.0%} of input cached"
 
 
 def _usd(value: float | None) -> str:
@@ -1762,10 +1786,10 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
     if summary.query_cost is not None:
         unpriced = summary.questions - summary.priced_questions
         console.print(
-            f"  [dim]cost:[/dim] {_cost_spread(summary.query_cost)} per query, "
-            f"{_usd(summary.query_cost_total)} for {summary.priced_questions} "
-            f"{'query' if summary.priced_questions == 1 else 'queries'}"
-            f"  ·  grading {_usd(summary.judge_cost_total)}"
+            f"  [dim]cost:[/dim] {_cost_spread(summary.query_list_cost)} per query at list "
+            f"price  ·  charged {_usd(summary.query_cost_total)} for "
+            f"{summary.priced_questions} {'query' if summary.priced_questions == 1 else 'queries'}"
+            f"{_cached_share(summary)}  ·  grading {_usd(summary.judge_cost_total)}"
             + (f"  [dim]({unpriced} unpriced)[/dim]" if unpriced else "")
         )
     if summary.context_counts:
@@ -1912,6 +1936,7 @@ def eval_command(
         keyword_index = _build_keyword_index(store, mode)
         embeddings = build_embeddings(config)
         chat = build_chat(config)
+        answer_price = _answer_price(config)
         verdict_of = build_verdict_fn(config)
         assessor = build_context_assessor(config) if assess_context else None
 
@@ -1931,7 +1956,7 @@ def eval_command(
                 rerank=rerank,
                 rerank_fanout=config.index.reranker_fanout,
             )
-            return _price_embedding(result, config)
+            return _price_query(result, config, answer_price)
 
         # Progress on stderr, so --json on stdout is never contaminated.
         with Progress(
@@ -2321,7 +2346,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
     table.add_column("Cited", justify="right")
     table.add_column("Coverage", justify="right")
     table.add_column("Ans tok/q", justify="right", style="dim")
-    table.add_column("$/query", justify="right")
+    table.add_column("$/query list", justify="right")
     table.add_column("s/q (IQR)", justify="right", style="dim")
 
     scores = [v.aggregate.mean_score for v in report.variants if v.aggregate is not None]
@@ -2357,7 +2382,7 @@ def _comparison_table(report: ComparisonReport) -> Table:
             _percent(summary.citation_rate),
             _percent(summary.mean_coverage),
             f"{per_question:.0f}" if per_question is not None else "—",
-            _usd(summary.query_cost.median) if summary.query_cost else "—",
+            _usd(summary.query_list_cost.median) if summary.query_list_cost else "—",
             _time_spread(summary.question_time),
         )
     return table
@@ -2592,6 +2617,8 @@ def compare_embeddings_command(
             built, build_errors = _build_variants(plan, config, to_build, workers)
 
         chat = build_chat(config)
+        # Every variant answers with the same model, so one price serves them all.
+        answer_price = _answer_price(config)
         verdict_of = build_verdict_fn(config)
 
         def ask(messages: list[BaseMessage]) -> AIMessage:
@@ -2644,7 +2671,7 @@ def compare_embeddings_command(
                             rerank=rerank,
                             rerank_fanout=config.index.reranker_fanout,
                         )
-                        return _price_embedding(result, settings)
+                        return _price_query(result, settings, answer_price)
 
                     def on_start(question: EvalQuestion) -> None:
                         if stop.is_set():
@@ -2749,6 +2776,7 @@ def _variant_settings(
         reranker=shared.reranker,
         reranker_model=config.reranker_model_for(shared.reranker) if shared.reranker else None,
         reranker_fanout=config.index.reranker_fanout if shared.reranker else 0,
+        judge_protocol=JUDGE_PROTOCOL,
         questions_file=shared.questions_file,
         store_chunks=variant.store_chunks,
         embedding_dim=variant.embedding_dim,

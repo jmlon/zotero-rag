@@ -25,13 +25,62 @@ index:
 
     chunk_size: 1000 # characters
     chunk_overlap: 200 # characters
-    top_k: 10
+    # Passages retrieved per question. 10 rather than 5 because every measured metric
+    # improved — mean score 1.81 -> 2.38, retrieval hit 86% -> 95% — for roughly 1.9x
+    # the tokens per query. Returns flatten by 20 and stop entirely past it. Lower it
+    # to 5 if cost matters more than accuracy for your questions.
+    top_k: 7
+    # Neighbouring chunks pulled in either side of each hit, in reading order, so a
+    # claim arrives with the sentences that give it meaning. 0 disables it. Raising
+    # it multiplies the passages sent to the model, so measure with `eval` first.
+    retrieval_window: 0
+    # vector = embeddings only. hybrid also runs a BM25 keyword search and fuses the
+    # two rankings, which helps where embeddings are weakest: acronyms, author names
+    # and exact phrases. Query-time only — switching it needs no re-indexing.
+    #
+    # hybrid is the default because it measured better on two independent question
+    # sets for no extra tokens. It pays off most with top_k >= 10: at top_k 5 roughly
+    # half the slots go to each retriever, which can push out a passage the vectors
+    # had ranked well. Set `vector` to skip building the keyword index, which costs
+    # ~0.2s per 1,000 chunks at start-up.
+    retrieval: hybrid
+
+    # Reranking re-scores the retrieved passages against the question with a
+    # cross-encoder, then keeps the best top_k. It works on top of any retrieval
+    # mode above. null => inherit global.defaults.reranker. Set it to a reranker id
+    # from the `rerankers` list below (e.g. cohere/rerank-4-fast), called through
+    # OpenRouter; or to `cohere` for Cohere's own API with reranker_model, which
+    # requires COHERE_API_KEY.
+    #reranker: null
+    #reranker_model: rerank-v4.0-fast # only for `reranker: cohere`
+
+    # Candidates retrieved per final passage: with top_k 10 and fanout 4, 40 passages
+    # are retrieved and the best 10 kept. A fanout of 1 would let the reranker only
+    # reorder what was already going to be sent, which is close to pointless.
+    reranker_fanout: 4
+
     temperature: 0.0
+
+    # Which attachment wins when an item has several readable ones. Many items
+    # hold both a published PDF and an HTML snapshot of the same article; indexing
+    # both would embed that content twice and let the copies compete in retrieval.
+    # Formats: markdown, pdf, docx, odt, epub, html, txt (plain text, CSV).
+    # A transcript made by `convert` and its source are one document, and only the
+    # copy ranked higher here is indexed. `markdown` first indexes transcripts:
+    # equal answer quality for ~13% fewer prompt tokens. To index the originals
+    # instead, move `markdown` after the formats it transcribes, e.g.
+    #   attachment_preference: [pdf, docx, odt, epub, html, markdown, txt]
+    attachment_preference: [markdown, pdf, docx, odt, epub, html, txt]
+    # true indexes every readable attachment of an item instead of just the best.
+    index_all_attachments: false
+    # Zotero notes are indexed alongside their item's file, never instead of it.
+    index_notes: true
 
     # null => inherit from global.defaults
     llm_model: null
     embedding_model: null
     vector_db: null
+
 
 eval:
     # Golden set for `zotero-rag eval`: questions, expected points, and the items

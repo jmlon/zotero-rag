@@ -432,27 +432,39 @@ class JudgeVerdict(BaseModel):
 
 JUDGE_SYSTEM_PROMPT = """You are a careful, fair grader for a question-answering \
 benchmark over a library of academic documents. Decide how well the SYSTEM ANSWER \
-answers the QUESTION, using the GROUND TRUTH as the reference for what is correct.
+answers the QUESTION, using the GROUND TRUTH as the reference for what is correct \
+and the RETRIEVED PASSAGES, which the system answered from, as evidence.
 
 Method:
-1. Break the QUESTION into the parts it actually asks for.
+1. Break the QUESTION into the parts it actually asks for. Grade those parts only.
 2. For each part, check whether the SYSTEM ANSWER is correct and consistent with \
 the GROUND TRUTH. Judge semantic meaning, not wording: paraphrases, reordering, \
 and a different language from the ground truth are all fine.
-3. The GROUND TRUTH may elaborate beyond what the question asks. Omitting that \
-extra detail is NOT an error. Only penalise content missing for a part the \
-question explicitly asks for, or content that is incorrect.
-4. If the GROUND TRUTH lists numbered expected points, report which of those the \
+3. The GROUND TRUTH and its expected points may go beyond what the question asks. \
+Omitting that extra detail is NOT an error and must not lower the grade: a short \
+answer that fully answers every part asked is 'perfect'. Only penalise content \
+missing for a part the question explicitly asks for, or content that is incorrect.
+4. A claim that is not in the GROUND TRUTH but is supported by the RETRIEVED \
+PASSAGES is correct, not fabricated. Do not penalise it.
+5. If the GROUND TRUTH lists numbered expected points, report which of those the \
 answer covers fully (covered_points) and which it only touches on \
-(partial_points), by their numbers.
+(partial_points), by their numbers. This is recorded separately and does not set \
+the grade.
 
 Distinguish OMISSION (leaving out non-essential detail — not penalised) from \
-CONTRADICTION or FABRICATION (stating something false — penalised). Any fabricated \
-or incorrect content caps the grade at 'partial' or below, never 'good' or \
-'perfect'. Ignore inline citation markers such as [1] or [2]; they are not part of \
-the claim being graded. An answer that declines to answer, or says it does not \
+CONTRADICTION or FABRICATION — a claim that contradicts the GROUND TRUTH, or that \
+neither the GROUND TRUTH nor the RETRIEVED PASSAGES support (penalised). Any \
+fabricated or incorrect content caps the grade at 'partial' or below, never 'good' \
+or 'perfect'. Ignore inline citation markers such as [1] or [2]; they are not part \
+of the claim being graded. An answer that declines to answer, or says it does not \
 know, is 'no answer' rather than 'wrong' — abstaining is not the same failure as \
 being confidently incorrect."""
+
+#: How grading works, recorded with every run: scores from different protocols are
+#: not comparable. `reference` graded against the ground truth alone, so a true
+#: claim from the passages that the reference happened to omit counted as
+#: fabricated; `reference+passages` also shows the judge what the system retrieved.
+JUDGE_PROTOCOL = "reference+passages"
 
 
 class RawVerdict(BaseModel):
@@ -464,8 +476,9 @@ class RawVerdict(BaseModel):
     cost: float | None = None
 
 
-#: The grading network seam: (question, ground truth, answer) -> verdict.
-VerdictFn = Callable[[str, str, str], RawVerdict]
+#: The grading network seam: (question, ground truth, answer, retrieved passages)
+#: -> verdict.
+VerdictFn = Callable[[str, str, str, str], RawVerdict]
 
 #: The retrieval-sufficiency seam: (question, ground truth, context) -> label.
 ContextAssessor = Callable[[str, str, str], str]
@@ -527,7 +540,9 @@ def build_verdict_fn(config: Config) -> VerdictFn:
     """The live judge, calling the configured grading model."""
     structured = _structured(config, JudgeVerdict)
 
-    def verdict_of(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def verdict_of(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
+        # Every passage the system saw, untrimmed: a claim drawn from a passage the
+        # judge was not shown would be graded as fabricated.
         response = cast(
             dict[str, Any],
             structured.invoke(
@@ -536,6 +551,7 @@ def build_verdict_fn(config: Config) -> VerdictFn:
                     (
                         "human",
                         f"QUESTION:\n{question}\n\nGROUND TRUTH:\n{ground_truth}\n\n"
+                        f"RETRIEVED PASSAGES:\n{passages or '(none)'}\n\n"
                         f"SYSTEM ANSWER:\n{answer}",
                     ),
                 ]
@@ -642,6 +658,7 @@ def judge_answer(
     question: EvalQuestion,
     answer: str,
     verdict_of: VerdictFn,
+    passages: str = "",
     attempts: int = 3,
 ) -> Judgement:
     """Grade one answer, retrying a failed grading call.
@@ -654,7 +671,7 @@ def judge_answer(
     last_error: Exception | None = None
     for attempt in range(1, attempts + 1):
         try:
-            raw = verdict_of(question.question, question.ground_truth, answer)
+            raw = verdict_of(question.question, question.ground_truth, answer, passages)
         except Exception as exc:  # noqa: BLE001 - the provider raises assorted errors
             last_error = exc
             logger.debug(
@@ -717,21 +734,30 @@ class QuestionOutcome(BaseModel):
     #: reranking and the answer, but not the grading, which only evaluation pays.
     #: `None` when a part that ran went unpriced, rather than a silent undercount.
     query_cost: float | None = None
+    #: The same at the answering model's list price, without the prompt-cache
+    #: discount: what a query that is not a repeat costs, independent of what
+    #: ran just before. The fair figure for comparing configurations.
+    query_list_cost: float | None = None
+    answer_list_cost: float | None = None
+    cached_tokens: int = 0
     #: Set when answering the question failed outright.
     error: str = ""
 
 
-def query_cost(result: QueryResult) -> float | None:
+def query_cost(result: QueryResult, list_price: bool = False) -> float | None:
     """Embedding + reranking + answering, or `None` if a part that ran is unpriced.
 
-    The question's embedding counts as free when unpriced: at a few tokens it is
-    a millionth of a cent, and refusing to price every query over it would hide
-    the costs that matter.
+    `list_price` prices the answer without the prompt-cache discount; reranking
+    and embedding are not cached, so their charges are list prices already. The
+    question's embedding counts as free when unpriced: at a few tokens it is a
+    millionth of a cent, and refusing to price every query over it would hide the
+    costs that matter.
     """
     usage = result.usage
-    if usage.answer_cost is None or (result.reranked and usage.rerank_cost is None):
+    answer = usage.answer_list_cost if list_price else usage.answer_cost
+    if answer is None or (result.reranked and usage.rerank_cost is None):
         return None
-    return usage.answer_cost + (usage.rerank_cost or 0.0) + (usage.embedding_cost or 0.0)
+    return answer + (usage.rerank_cost or 0.0) + (usage.embedding_cost or 0.0)
 
 
 def _context_of(result: QueryResult) -> str:
@@ -777,7 +803,7 @@ def evaluate_question(
             coverage=Coverage(total=len(question.expected_points)),
         )
     else:
-        judgement = judge_answer(question, result.answer, verdict_of)
+        judgement = judge_answer(question, result.answer, verdict_of, _context_of(result))
 
     sufficiency: str | None = None
     if assess_context is not None:
@@ -815,6 +841,9 @@ def evaluate_question(
         embedding_cost=result.usage.embedding_cost,
         judge_cost=judgement.cost,
         query_cost=query_cost(result),
+        query_list_cost=query_cost(result, list_price=True),
+        answer_list_cost=result.usage.answer_list_cost,
+        cached_tokens=result.usage.cached_tokens,
     )
 
 
@@ -883,6 +912,13 @@ class CostSpread(BaseModel):
     p75: float
 
 
+def _cost_spread(values: list[float]) -> CostSpread | None:
+    quartiles = _quartiles(values)
+    if quartiles is None:
+        return None
+    return CostSpread(p25=quartiles[0], median=quartiles[1], p75=quartiles[2])
+
+
 class TimeSpread(BaseModel):
     """How long one question took: the median and the middle half around it.
 
@@ -923,6 +959,12 @@ class EvalAggregate(BaseModel):
     query_cost_mean: float | None = None
     query_cost_total: float | None = None
     priced_questions: int = 0
+    #: The same at list price, without the prompt-cache discount; see
+    #: `QuestionOutcome.query_list_cost`.
+    query_list_cost: CostSpread | None = None
+    query_list_cost_mean: float | None = None
+    query_list_cost_total: float | None = None
+    cached_tokens: int = 0
     #: What grading cost: evaluation overhead, never part of a query's price.
     judge_cost_total: float | None = None
     errors: int = 0
@@ -959,8 +1001,8 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
     coverages = [score for outcome in outcomes if (score := outcome.coverage.score) is not None]
     quartiles = _quartiles([outcome.elapsed_s for outcome in outcomes])
     costs = [cost for outcome in outcomes if (cost := outcome.query_cost) is not None]
-    cost_quartiles = _quartiles(costs)
     judge_costs = [cost for outcome in outcomes if (cost := outcome.judge_cost) is not None]
+    list_costs = [c for outcome in outcomes if (c := outcome.query_list_cost) is not None]
     return EvalAggregate(
         questions=len(outcomes),
         mean_score=sum(outcome.score for outcome in outcomes) / len(outcomes),
@@ -979,15 +1021,15 @@ def aggregate(outcomes: Sequence[QuestionOutcome], elapsed_s: float | None = Non
         question_time=TimeSpread(p25_s=quartiles[0], median_s=quartiles[1], p75_s=quartiles[2])
         if quartiles
         else None,
-        query_cost=CostSpread(
-            p25=cost_quartiles[0], median=cost_quartiles[1], p75=cost_quartiles[2]
-        )
-        if cost_quartiles
-        else None,
+        query_cost=_cost_spread(costs),
         query_cost_mean=_mean(costs),
         query_cost_total=sum(costs) if costs else None,
         priced_questions=len(costs),
         judge_cost_total=sum(judge_costs) if judge_costs else None,
+        query_list_cost=_cost_spread(list_costs),
+        query_list_cost_mean=_mean(list_costs),
+        query_list_cost_total=sum(list_costs) if list_costs else None,
+        cached_tokens=sum(o.cached_tokens for o in outcomes),
         errors=sum(1 for o in outcomes if o.grade is Grade.ERROR),
         reranked_questions=sum(1 for o in outcomes if o.reranked),
     )
@@ -1020,6 +1062,8 @@ class RunSettings(BaseModel):
     reranker: str | None = None
     reranker_model: str | None = None
     reranker_fanout: int = 0
+    #: See `JUDGE_PROTOCOL`. Runs logged before it was recorded used `reference`.
+    judge_protocol: str = "reference"
     questions_file: str = ""
     store_chunks: int = 0
     embedding_dim: int | None = None
@@ -1051,6 +1095,7 @@ def run_settings(
         reranker=reranker,
         reranker_model=config.reranker_model_for(reranker) if reranker else None,
         reranker_fanout=config.index.reranker_fanout if reranker else 0,
+        judge_protocol=JUDGE_PROTOCOL,
         questions_file=str(questions_path),
         store_chunks=store.count(),
         embedding_dim=store.derived_dimension(),

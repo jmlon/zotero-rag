@@ -23,6 +23,7 @@ from zotero_rag.evaluation import (
     QuestionOutcome,
     QuestionSetError,
     RawVerdict,
+    RunSettings,
     aggregate,
     cited_expected,
     evaluate,
@@ -285,7 +286,7 @@ def verdict_fn(
 ):  # type: ignore[no-untyped-def]
     """A grading seam that always returns the same verdict."""
 
-    def call(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def call(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         return RawVerdict(
             verdict=JudgeVerdict(
                 grade=grade,  # type: ignore[arg-type]
@@ -339,7 +340,7 @@ def test_the_judge_is_retried_and_then_reported_as_an_error() -> None:
     """A grading outage must not be recorded as a retrieval regression."""
     calls: list[int] = []
 
-    def failing(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def failing(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         calls.append(1)
         raise RuntimeError("503 from the provider")
 
@@ -357,11 +358,11 @@ def test_a_transient_judge_failure_is_recovered() -> None:
     attempts: list[int] = []
     working = verdict_fn("perfect", covered=[1, 2, 3])
 
-    def flaky(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def flaky(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         attempts.append(1)
         if len(attempts) == 1:
             raise RuntimeError("timeout")
-        return working(question, ground_truth, answer)
+        return working(question, ground_truth, answer, passages)
 
     judgement = judge_answer(THREE_POINTS, "an answer", flaky)
     assert judgement.grade is Grade.PERFECT
@@ -714,7 +715,7 @@ def test_an_unpriced_answer_or_rerank_leaves_the_query_unpriced() -> None:
 
 
 def test_grading_is_recorded_but_not_part_of_the_query_cost() -> None:
-    def verdict(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def verdict(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         return RawVerdict(verdict=JudgeVerdict(grade="good", rationale="ok"), cost=1e-4)
 
     question = EvalQuestion(id="q", question="?", answer="x")
@@ -741,3 +742,60 @@ def test_query_cost_is_summarised_by_median_and_quartiles() -> None:
     assert summary.query_cost_total == pytest.approx(sum(c for c in costs if c))
     assert summary.judge_cost_total == pytest.approx(6e-4)
     assert aggregate(outcomes[-1:]).query_cost is None
+
+
+def test_the_judge_sees_every_passage_the_answer_was_written_from() -> None:
+    seen: list[str] = []
+
+    def verdict(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
+        seen.append(passages)
+        return RawVerdict(verdict=JudgeVerdict(grade="perfect", rationale="ok"))
+
+    long_passage = "a company's founder, headquarters, key executives. " * 400  # past any budget
+    result = result_with([chunk_source("Fog nodes sit at the edge.", long_passage)])
+    evaluate_question(EvalQuestion(id="q", question="?", answer="x"), lambda _: result, verdict)
+
+    assert "Fog nodes sit at the edge." in seen[0]
+    assert long_passage.strip() in seen[0]  # untrimmed
+
+
+def test_runs_record_that_the_judge_saw_the_passages(tmp_path: Path) -> None:
+    from zotero_rag.config import Config
+    from zotero_rag.evaluation import JUDGE_PROTOCOL, run_settings
+
+    settings = run_settings(Config(), VectorStore(tmp_path / "chroma"), 7, tmp_path / "q.yaml")
+    assert settings.judge_protocol == JUDGE_PROTOCOL == "reference+passages"
+    # Runs logged earlier, without the field, read back as the old protocol.
+    assert RunSettings().judge_protocol == "reference"
+
+
+def test_list_price_ignores_the_prompt_cache_discount() -> None:
+    result = priced_result(3e-5, embedding=1e-7)  # charged: mostly served from cache
+    result.usage.answer_list_cost = 2.8e-4
+    result.usage.cached_tokens = 2217
+
+    assert query_cost(result) == pytest.approx(3e-5 + 1e-7)
+    assert query_cost(result, list_price=True) == pytest.approx(2.8e-4 + 1e-7)
+
+
+def test_list_price_is_summarised_beside_the_charge() -> None:
+    outcomes = [
+        QuestionOutcome(
+            id=str(n),
+            question="?",
+            grade=Grade.GOOD,
+            score=3,
+            query_cost=charged,
+            query_list_cost=listed,
+            cached_tokens=cached,
+        )
+        for n, (charged, listed, cached) in enumerate(
+            [(1e-4, 3e-4, 1000), (3e-4, 3e-4, 0), (2e-4, 4e-4, 500)]
+        )
+    ]
+    summary = aggregate(outcomes)
+
+    assert summary.query_list_cost is not None
+    assert summary.query_list_cost.median == pytest.approx(3e-4)
+    assert summary.query_list_cost_total == pytest.approx(1e-3)
+    assert summary.cached_tokens == 1500

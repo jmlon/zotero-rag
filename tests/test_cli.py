@@ -538,7 +538,7 @@ def _stub_seams(monkeypatch: pytest.MonkeyPatch, grade: str = "good") -> None:
         def invoke(self, messages: object) -> AIMessage:
             return AIMessage(content="A fog node sits between the edge and the cloud [1].")
 
-    def verdict_of(question: str, ground_truth: str, answer: str) -> RawVerdict:
+    def verdict_of(question: str, ground_truth: str, answer: str, passages: str) -> RawVerdict:
         return RawVerdict(
             verdict=JudgeVerdict(
                 grade=grade,  # type: ignore[arg-type]
@@ -1429,3 +1429,53 @@ def test_cost_from_message_reads_the_providers_charge() -> None:
     )
     assert cost_from_message(AIMessage(content="x", response_metadata={"token_usage": {}})) is None
     assert cost_from_message(AIMessage(content="x")) is None
+
+
+def test_a_list_price_is_read_from_openrouters_model_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    from zotero_rag import llm
+
+    listing = {
+        "data": [
+            {
+                "id": "openai/gpt-4o-mini",
+                "pricing": {"prompt": "0.00000015", "completion": "0.0000006"},
+            },
+            {"id": "free/model", "pricing": {}},
+        ]
+    }
+    seen: list[str] = []
+
+    def get(url: str, **kwargs: object) -> httpx.Response:
+        seen.append(url)
+        return httpx.Response(200, json=listing, request=httpx.Request("GET", url))
+
+    monkeypatch.setattr(httpx, "get", get)
+
+    price = llm.fetch_price("https://openrouter.ai/api/v1/", "openai/gpt-4o-mini")
+    assert price is not None
+    assert price.cost(1000, 100) == pytest.approx(1000 * 1.5e-7 + 100 * 6e-7)
+    assert seen == ["https://openrouter.ai/api/v1/models"]
+    assert llm.fetch_price("https://openrouter.ai/api/v1", "free/model") is None
+    assert llm.fetch_price("https://openrouter.ai/api/v1", "missing/model") is None
+
+
+def test_cached_tokens_are_read_from_the_usage_metadata() -> None:
+    from langchain_core.messages import AIMessage
+
+    from zotero_rag.llm import cached_tokens_from_message
+
+    message = AIMessage(
+        content="x",
+        usage_metadata={
+            "input_tokens": 2220,
+            "output_tokens": 3,
+            "total_tokens": 2223,
+            "input_token_details": {"cache_read": 2217},
+        },
+    )
+    assert cached_tokens_from_message(message) == 2217
+    assert cached_tokens_from_message(AIMessage(content="x")) == 0
