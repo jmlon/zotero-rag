@@ -10,7 +10,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
 
 from langchain_core.messages import (
@@ -57,6 +57,26 @@ placed right after the statement they support. The numbers refer to the \
 numbered passages.
 - Be concise.
 - Answer in the same language as the question."""
+
+#: Appended to `SYSTEM_PROMPT` only when earlier turns are sent. Their citation
+#: markers are stripped (`strip_citations`), and this keeps the model from
+#: numbering against passages it can no longer see.
+HISTORY_RULE = """
+- Earlier turns of this conversation are context for the latest question only. \
+Cite only the numbered passages given with the latest question."""
+
+# Turns a follow-up into a question retrieval can work with: "and what did the
+# second paper find?" embeds as nothing in particular.
+CONDENSE_PROMPT = """You rewrite the latest question of a conversation about a \
+collection of academic documents so that it can be understood on its own.
+
+Rules:
+- Replace references such as "it", "they", "that method" or "the second paper" \
+with what they refer to in the conversation.
+- Keep the language of the latest question.
+- If the question already stands on its own, return it unchanged.
+- Do not answer it. Return only the rewritten question, with no preamble and no \
+quotation marks."""
 
 NO_CONTEXT_ANSWER = (
     "I don't know — no indexed passages matched this question, "
@@ -134,6 +154,24 @@ class Usage(BaseModel):
         return self.prompt_tokens + self.completion_tokens
 
 
+class Turn(BaseModel):
+    """One earlier exchange of a conversation, as the user saw it."""
+
+    question: str
+    answer: str
+
+
+class Condensed(BaseModel):
+    """A follow-up rewritten to stand on its own, and what the rewriting cost."""
+
+    #: What retrieval and reranking were given instead of the question as asked.
+    question: str
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    #: USD, as the provider reported it; `None` when it did not, 0 with no call.
+    cost: float | None = 0.0
+
+
 class QueryResult(BaseModel):
     """The answer, the sources it may cite, and what the call cost."""
 
@@ -152,6 +190,9 @@ class QueryResult(BaseModel):
     #: Whether reranking actually applied. False after a transient provider failure,
     #: so a silently un-reranked run cannot pass for a reranked one.
     reranked: bool = False
+    #: The standalone question retrieval used for a follow-up; `None` otherwise.
+    #: Kept apart from `usage`, whose fields are the CLI's `--json` output.
+    condensed: Condensed | None = None
 
 
 _CITATION_MARKER = re.compile(r"\[(\d+(?:\s*,\s*\d+)*)\]")
@@ -168,6 +209,54 @@ def cited_numbers(answer: str) -> set[int]:
     for match in _CITATION_MARKER.finditer(answer):
         numbers.update(int(part) for part in match.group(1).split(","))
     return numbers
+
+
+def strip_citations(text: str) -> str:
+    """The text without its `[n]` markers, for sending an earlier answer back.
+
+    Those numbers pointed at passages of an earlier turn; left in, they would read
+    as references to the new turn's passages.
+    """
+    stripped = re.sub(r"[ \t]*" + _CITATION_MARKER.pattern, "", text)
+    return re.sub(r"[ \t]+([.,;:!?])", r"\1", stripped).strip()
+
+
+def _transcript(history: Sequence[Turn]) -> str:
+    lines: list[str] = []
+    for turn in history:
+        lines.append(f"User: {turn.question.strip()}")
+        lines.append(f"Assistant: {strip_citations(turn.answer)}")
+    return "\n".join(lines)
+
+
+def condense_question(question: str, history: Sequence[Turn], chat: Answerer) -> Condensed:
+    """Rewrite a follow-up so that retrieval can find what it refers to.
+
+    With no history the question is returned as it is, and the model is not
+    called, so the first question of a conversation costs nothing extra. An empty
+    reply falls back to the question as asked.
+    """
+    if not history:
+        return Condensed(question=question)
+    messages: list[BaseMessage] = [
+        SystemMessage(content=CONDENSE_PROMPT),
+        HumanMessage(
+            content=f"Conversation:\n{_transcript(history)}\n\nLatest question: {question}"
+        ),
+    ]
+    try:
+        message = chat(messages)
+    except Exception as exc:  # noqa: BLE001 - the client raises assorted API errors
+        raise LLMError(f"The language model call failed: {exc}") from exc
+    prompt_tokens, completion_tokens = usage_from_message(message)
+    rewritten = message_text(message).strip().strip('"').strip()
+    logger.info("condensed %r to %r", question, rewritten)
+    return Condensed(
+        question=rewritten or question,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cost=cost_from_message(message),
+    )
 
 
 def _text(metadata: dict[str, object], key: str, default: str = "") -> str:
@@ -295,11 +384,21 @@ def build_context(chunks: list[StoredChunk], numbers: list[int], sources: list[S
     return "\n\n".join(blocks)
 
 
-def build_messages(question: str, context: str) -> list[BaseMessage]:
-    return [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=f"Context passages:\n{context}\n\nQuestion: {question}"),
-    ]
+def build_messages(question: str, context: str, history: Sequence[Turn] = ()) -> list[BaseMessage]:
+    """The prompt: rules, any earlier turns, then the passages and the question.
+
+    Earlier turns go in as plain user and assistant messages without their
+    citation markers. The passages are only ever this turn's, so every `[n]` in
+    the answer refers to a source of this answer.
+    """
+    latest = HumanMessage(content=f"Context passages:\n{context}\n\nQuestion: {question}")
+    if not history:
+        return [SystemMessage(content=SYSTEM_PROMPT), latest]
+    earlier: list[BaseMessage] = []
+    for turn in history:
+        earlier.append(HumanMessage(content=turn.question.strip()))
+        earlier.append(AIMessage(content=strip_citations(turn.answer)))
+    return [SystemMessage(content=SYSTEM_PROMPT + HISTORY_RULE), *earlier, latest]
 
 
 @dataclass
@@ -316,6 +415,7 @@ class _Prepared:
     usage: Usage
     #: `None` when nothing was retrieved, so there is nothing to ask the model.
     messages: list[BaseMessage] | None
+    condensed: Condensed | None
 
 
 def _prepare(
@@ -329,30 +429,53 @@ def _prepare(
     rerank: RerankFn | None,
     rerank_fanout: int,
     filters: Filters | None,
+    history: Sequence[Turn],
+    condensed: Condensed | None,
 ) -> _Prepared:
-    """Retrieve wide → rerank → window → number the sources → build the prompt."""
-    start = time.perf_counter()
+    """Retrieve wide → rerank → window → number the sources → build the prompt.
 
-    embedding = embed_query(question)
+    Retrieval and reranking search for the condensed question when there is one;
+    the model is still asked the question as the user put it.
+    """
+    start = time.perf_counter()
+    searched = condensed.question if condensed is not None else question
+
+    embedding = embed_query(searched)
     depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
-    candidates = retrieve(store, embedding, question, depth, mode, keyword_index, filters)
-    hits, reranked, rerank_cost = apply_rerank(candidates, question, top_k, rerank)
+    candidates = retrieve(store, embedding, searched, depth, mode, keyword_index, filters)
+    hits, reranked, rerank_cost = apply_rerank(candidates, searched, top_k, rerank)
     chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
-    usage = Usage(embedding_tokens=count_tokens([question]), rerank_cost=rerank_cost)
+    usage = Usage(embedding_tokens=count_tokens([searched]), rerank_cost=rerank_cost)
 
     messages = None
     if hits:
-        messages = build_messages(question, build_context(chunks, numbers, sources))
+        messages = build_messages(question, build_context(chunks, numbers, sources), history)
     else:
-        logger.info("no chunks retrieved for %r", question)
-    return _Prepared(question, start, candidates, hits, reranked, chunks, sources, usage, messages)
+        logger.info("no chunks retrieved for %r", searched)
+    return _Prepared(
+        question,
+        start,
+        candidates,
+        hits,
+        reranked,
+        chunks,
+        sources,
+        usage,
+        messages,
+        condensed,
+    )
 
 
 def _no_context(prepared: _Prepared) -> QueryResult:
     prepared.usage.elapsed_s = time.perf_counter() - prepared.start
     prepared.usage.answer_cost = prepared.usage.answer_list_cost = 0.0  # no model call
-    return QueryResult(question=prepared.question, answer=NO_CONTEXT_ANSWER, usage=prepared.usage)
+    return QueryResult(
+        question=prepared.question,
+        answer=NO_CONTEXT_ANSWER,
+        usage=prepared.usage,
+        condensed=prepared.condensed,
+    )
 
 
 def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
@@ -383,6 +506,7 @@ def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
         chunks_in_context=len(prepared.chunks),
         candidates_considered=len(prepared.candidates),
         reranked=prepared.reranked,
+        condensed=prepared.condensed,
     )
 
 
@@ -398,6 +522,8 @@ def answer_question(
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
     filters: Filters | None = None,
+    history: Sequence[Turn] = (),
+    condensed: Condensed | None = None,
 ) -> QueryResult:
     """Retrieve `top_k` chunks for the question and have the LLM answer from them.
 
@@ -421,6 +547,11 @@ def answer_question(
     tag), so the reranker chooses among them and windowing then stays inside their
     attachments (PRD-CursesUI §4.3.1). `None`, the default, searches the whole store.
 
+    A follow-up in a conversation passes the earlier turns as `history`, and the
+    result of `condense_question` as `condensed`: retrieval searches for the
+    standalone question, and the model answers the question as asked with the
+    conversation in view. With neither, the prompt is exactly a one-off question's.
+
     With nothing retrieved, no LLM call is made: an empty context can only
     produce "I don't know", and saying so costs nothing.
     """
@@ -435,6 +566,8 @@ def answer_question(
         rerank=rerank,
         rerank_fanout=rerank_fanout,
         filters=filters,
+        history=history,
+        condensed=condensed,
     )
     if prepared.messages is None:
         return _no_context(prepared)
@@ -473,6 +606,8 @@ def stream_answer_question(
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
     filters: Filters | None = None,
+    history: Sequence[Turn] = (),
+    condensed: Condensed | None = None,
 ) -> QueryResult:
     """`answer_question`, with the answer's text sent to `on_token` as it arrives.
 
@@ -502,6 +637,8 @@ def stream_answer_question(
         rerank=rerank,
         rerank_fanout=rerank_fanout,
         filters=filters,
+        history=history,
+        condensed=condensed,
     )
     if prepared.messages is None:
         on_token(NO_CONTEXT_ANSWER)
