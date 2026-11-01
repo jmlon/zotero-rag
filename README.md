@@ -636,8 +636,8 @@ unreranked. An unknown model or a rejected key stops the run instead.
 A note on cost, since "cheaper" is easy to over-read: reranking halves the *text sent
 to the LLM*, but adds one rerank request per question, billed separately (Cohere per
 search, the others per million tokens; see the `rerankers` list). Whether your
-total bill goes down depends on the two providers' prices, which the tool does not yet
-track. What is measured is that you get better answers from less context.
+total bill goes down depends on the two providers' prices — `eval` now reports the
+cost per query, reranking included, so the second study below could answer it.
 
 **Upgrading an existing index folder?** Your `config.yaml` was written when you ran
 `init`, and its values win over the built-in defaults, so an older folder keeps
@@ -653,8 +653,61 @@ zotero-rag eval --top-k 5 --reranker cohere/rerank-4-fast  # better and cheaper
 zotero-rag query "..." --top-k 10
 ```
 
-Note that grading costs tokens too — roughly 40% of a run's bill — so `eval`
-reports the judge's usage as its own figure rather than folding it in.
+Note that grading costs tokens too — about three quarters of a run's bill since
+the judge reads the retrieved passages — so `eval` reports it as its own figure
+rather than folding it into the cost per query.
+
+### A second study: answering model and reranker
+
+A later round of measurements used a different library — 12 papers on knowledge
+graphs and LLMs — and the fairer evaluation this README now describes: 36
+generated questions (set `kg-v3`) whose expected points cover only what each
+question asks and whose answering passage is checked verbatim, graded by
+`google/gemini-3.5-flash-lite` with the retrieved passages in view, and priced at
+list price. All rows use 1000/200 chunks, `top_k: 7` and hybrid retrieval:
+
+| Answering model | Reranker | Score | Passage hit | Coverage | Cited | $/query (list) | s/question |
+|---|---|---|---|---|---|---|---|
+| openai/gpt-4o-mini | — | 3.81 | 27/33 | 72% | 89% | $0.00029 | 3.0 |
+| openai/gpt-6-luna | — | 4.00 | 27/33 | 79% | 97% | $0.00021 | 3.5 |
+| openai/gpt-4o-mini | voyageai/rerank-3-lite | 4.53 | 33/33 | 91% | 94% | $0.00041 | 3.5 |
+| **openai/gpt-6-luna** | **voyageai/rerank-3-lite** | **4.83** | **33/33** | **97%** | **100%** | **$0.00033** | 3.7 |
+
+The best configuration found, at about **$0.33 per thousand queries**:
+
+```yaml
+global:
+    defaults:
+        llm_model: openai/gpt-6-luna
+index:
+    chunk_size: 1000
+    chunk_overlap: 200
+    top_k: 7
+    retrieval: hybrid
+    reranker: voyageai/rerank-3-lite
+```
+
+- **Reranking is the largest single gain.** Retrieving 28 candidates and keeping
+  the best 7 put the answering passage in front of the model for every question
+  that has one, against 27 of 33 without it, and raised the score by 0.7–0.8 for
+  both models.
+- **The stronger model is better and cheaper.** gpt-6-luna leads on score,
+  coverage and citation in both configurations, and costs 20–25% less per query
+  at list price; it is about half a second slower per question. Its lead without
+  the reranker (+0.19) is within the 0.25 that identical runs were seen to differ
+  by; with it (+0.31) it is not.
+- **Chunking and `top_k` came first.** On the same library, 1000/200 chunks beat
+  500/100 and 1500/300 at every amount of text sent, and without a reranker
+  `top_k` 7, 10 and 20 scored the same within noise — so 7, the cheapest.
+- **How you grade decides the winner.** Graded against the reference answer
+  alone, gpt-4o-mini came out ahead: its longer answers repeated more of the
+  reference, while gpt-6-luna's concise ones were marked down for leaving out
+  background the question never asked for, and for true statements the reference
+  happened to omit. Showing the judge the passages and scoping the expected
+  points reversed the ranking.
+
+These are single runs on one library of 12 papers; read them as a starting point
+and confirm them on yours with `eval`, which logs every run for comparison.
 
 ## Configuring an index
 
