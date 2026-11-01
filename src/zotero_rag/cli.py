@@ -449,6 +449,18 @@ def _print_notice(notice: Notice) -> None:
     err_console.print(f"[yellow]{notice.level.capitalize()}:[/yellow] {escape(notice.text)}")
 
 
+def _citation_username(zot: Any, config: Config) -> str:
+    """The username citation URLs are built from, or "" to use the API's own links.
+
+    A user library is cited inside the item's collection, which needs its owner's
+    username, one API call. In a group library the username behind the API key is
+    not the library's, so the planner falls back to each item's `links.alternate`.
+    """
+    if config.global_.zotero_library_type != "user":
+        return ""
+    return fetch_username(zot)
+
+
 def _fetch_plan(
     config: Config,
     collection: str | None,
@@ -465,8 +477,7 @@ def _fetch_plan(
     roots = build_collection_tree(fetch_collections(zot))
     scope, target, node = _resolve_target(config, roots, collection, collection_key, assume_yes)
 
-    # The citation URL needs the library owner's username; a dry run skips it.
-    username = fetch_username(zot) if with_username else ""
+    username = _citation_username(zot, config) if with_username else ""
 
     fetched: list[tuple[CollectionNode, list[dict[str, object]]]] = []
     with err_console.status("[dim]Fetching items from Zotero...[/dim]") as status:
@@ -1188,7 +1199,7 @@ def convert(
         scope, target, _node = _resolve_target(
             config, roots, collection, collection_key, assume_yes, verb="convert"
         )
-        username = "" if dry_run else fetch_username(zot)
+        username = "" if dry_run else _citation_username(zot, config)
         fetched: list[tuple[str, list[dict[str, object]]]] = []
         with console.status("[dim]Fetching items from Zotero...[/dim]") as status:
             for collection_node in scope:

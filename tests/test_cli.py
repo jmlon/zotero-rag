@@ -1509,3 +1509,21 @@ def test_cached_tokens_are_read_from_the_usage_metadata() -> None:
     )
     assert cached_tokens_from_message(message) == 2217
     assert cached_tokens_from_message(AIMessage(content="x")) == 0
+
+
+@pytest.mark.parametrize(("library_type", "expected"), [("user", "someone"), ("group", "")])
+def test_citations_use_the_username_only_in_a_user_library(
+    library_type: str, expected: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The username behind a key does not own a group, so a group cites the API's links."""
+    calls: list[object] = []
+
+    def fetch_username(zot: object) -> str:
+        calls.append(zot)
+        return "someone"
+
+    monkeypatch.setattr(cli, "fetch_username", fetch_username)
+    config = Config()
+    config.global_.zotero_library_type = library_type  # type: ignore[assignment]
+    assert cli._citation_username(object(), config) == expected
+    assert len(calls) == (1 if library_type == "user" else 0)

@@ -23,10 +23,10 @@ from zotero_rag_core import html_text, provenance
 from zotero_rag_core.documents import DocumentFormat, LocatorKind, format_for
 from zotero_rag_core.metadata import (
     authors_str,
+    citation_url,
     item_tags,
     parse_year,
     year_number,
-    zotero_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -77,6 +77,8 @@ class PlannedAttachment(BaseModel):
 
     attachment_key: str
     item_key: str
+    #: Zotero's item type of the parent: `journalArticle`, `book`, `thesis`, ...
+    item_type: str = ""
     title: str
     authors: str
     year: str
@@ -125,6 +127,7 @@ class PlannedAttachment(BaseModel):
         """
         metadata: dict[str, str | int | list[str]] = {
             "item_key": self.item_key,
+            "item_type": self.item_type,
             "attachment_key": self.attachment_key,
             "title": self.title,
             "authors": self.authors,
@@ -275,6 +278,23 @@ def item_membership(
     return {item_key: sorted(keys) for item_key, keys in membership.items()}
 
 
+def library_membership(items: Iterable[dict[str, Any]]) -> dict[str, list[str]]:
+    """Map each parent item key to the collections it is filed in, library-wide.
+
+    When the whole library is indexed every collection is in scope, so an item's
+    own `collections` field is exact, and fetching each collection separately
+    (`item_membership`) would cost one request per collection for the same answer.
+    Unfiled items map to an empty list.
+    """
+    membership: dict[str, list[str]] = {}
+    for entry in items:
+        data = entry.get("data") or {}
+        key = data.get("key") or entry.get("key")
+        if key and data.get("itemType") not in ("attachment", "note"):
+            membership[str(key)] = sorted({str(k) for k in data.get("collections") or []})
+    return membership
+
+
 def build_plan(
     collections: list[tuple[str, list[dict[str, Any]]]],
     username: str = "",
@@ -291,8 +311,10 @@ def build_plan(
     reference implementation processed one collection at a time and reported
     spurious cache misses because of it.
 
-    `username` is only needed to build citation URLs; an empty one yields empty
-    `zotero_url` values, which keeps `--dry-run` free of an extra API call.
+    `username` builds citation URLs inside the item's first collection
+    (`metadata.zotero_url`), which suits a user library. Without one, the URL is
+    the item's own web link from the API payload (`links.alternate`), which is
+    also right for a group library. A payload without links yields an empty URL.
 
     `membership`, from `item_membership`, gives each planned attachment the
     `collection_keys` of its parent item.
@@ -302,6 +324,7 @@ def build_plan(
     membership = membership or {}
 
     parents: dict[str, tuple[dict[str, Any], str]] = {}
+    urls: dict[str, str] = {}
     attachments: list[tuple[dict[str, Any], str]] = []
     notes: list[tuple[dict[str, Any], str]] = []
 
@@ -320,15 +343,17 @@ def build_plan(
                 notes.append((data, collection_name))
             else:
                 plan.items_seen += 1
-                parents.setdefault(key, (data, collection_name))
+                if key not in parents:
+                    parents[key] = (data, collection_name)
+                    urls[key] = citation_url(username, entry)
 
     collected = collect_candidates(attachments, parents, _index_format)
     plan.skipped.extend(collected.skipped)
     unavailable = collected.unavailable
     _plan_candidates(
-        plan, collected.by_parent, parents, order, username, index_all_attachments, membership
+        plan, collected.by_parent, parents, order, urls, index_all_attachments, membership
     )
-    _plan_notes(plan, notes, parents, username, index_notes, membership)
+    _plan_notes(plan, notes, parents, urls, index_notes, membership)
 
     planned_parents = {attachment.item_key for attachment in plan.attachments}
     for parent_key, (parent_data, collection_name) in parents.items():
@@ -460,7 +485,7 @@ def _plan_candidates(
     candidates: dict[str, list[Candidate]],
     parents: dict[str, tuple[dict[str, Any], str]],
     order: tuple[DocumentFormat, ...],
-    username: str,
+    urls: Mapping[str, str],
     index_all_attachments: bool,
     membership: Mapping[str, list[str]],
 ) -> None:
@@ -492,7 +517,7 @@ def _plan_candidates(
                 )
                 indexed, other = (transcript, source) if prefer_transcript else pair
             plan.attachments.append(
-                _planned(indexed, parent_key, parent_data, username, membership)
+                _planned(indexed, parent_key, parent_data, urls[parent_key], membership)
             )
             if other is not None:
                 plan.skipped.append(_skipped(other, SkipReason.SAME_DOCUMENT, indexed))
@@ -583,12 +608,13 @@ def _planned(
     candidate: Candidate,
     parent_key: str,
     parent_data: dict[str, Any],
-    username: str,
+    url: str,
     membership: Mapping[str, list[str]],
 ) -> PlannedAttachment:
     return PlannedAttachment(
         attachment_key=candidate.data["key"],
         item_key=parent_key,
+        item_type=str(parent_data.get("itemType") or ""),
         title=parent_data.get("title") or "(untitled)",
         authors=authors_str(parent_data),
         year=parse_year(parent_data.get("date")),
@@ -596,7 +622,7 @@ def _planned(
         collection_name=candidate.collection_name,
         collection_keys=list(membership.get(parent_key, [])),
         tags=item_tags(parent_data),
-        zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
+        zotero_url=url,
         version=_version(candidate.data),
         content_type=candidate.content_type,
         # The file's own format, not its standing: a transcript whose source is
@@ -609,7 +635,7 @@ def _plan_notes(
     plan: IndexPlan,
     notes: list[tuple[dict[str, Any], str]],
     parents: dict[str, tuple[dict[str, Any], str]],
-    username: str,
+    urls: Mapping[str, str],
     index_notes: bool,
     membership: Mapping[str, list[str]],
 ) -> None:
@@ -648,6 +674,7 @@ def _plan_notes(
             PlannedAttachment(
                 attachment_key=key,
                 item_key=str(parent_key),
+                item_type=str(parent_data.get("itemType") or ""),
                 title=parent_data.get("title") or "(untitled)",
                 authors=authors_str(parent_data),
                 year=parse_year(parent_data.get("date")),
@@ -655,7 +682,7 @@ def _plan_notes(
                 collection_name=collection_name,
                 collection_keys=list(membership.get(str(parent_key), [])),
                 tags=item_tags(parent_data),
-                zotero_url=zotero_url(username, str(parent_key), parent_data.get("collections")),
+                zotero_url=urls[str(parent_key)],
                 version=_version(data),
                 content_type="note",
                 document_format=DocumentFormat.NOTE,

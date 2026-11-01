@@ -108,3 +108,32 @@ def item_tags(data: dict[str, Any]) -> list[str]:
         if isinstance(entry, dict) and str(entry.get("tag") or "").strip()
     }
     return sorted(names)
+
+
+def web_url(entry: dict[str, Any]) -> str:
+    """The item's page in the zotero.org web library, as the API links it.
+
+    Every item payload carries `links.alternate`, which points into the right
+    library whoever owns it: `/<username>/items/<key>` for a user library and
+    `/groups/<id or name>/items/<key>` for a group. Empty when the payload has no
+    links, as hand-built test payloads usually do not.
+    """
+    links = entry.get("links")
+    alternate = links.get("alternate") if isinstance(links, dict) else None
+    href = alternate.get("href") if isinstance(alternate, dict) else None
+    return str(href) if href else ""
+
+
+def citation_url(username: str, entry: dict[str, Any]) -> str:
+    """The URL a citation links to.
+
+    With a `username`, the item inside its first collection (`zotero_url`), as the
+    CLI has always cited a user library. Without one, the API's own link
+    (`web_url`), which is the only correct choice for a group library: the
+    username behind an API key is not the library's owner.
+    """
+    data = entry.get("data") or {}
+    key = str(data.get("key") or entry.get("key") or "")
+    if username and key:
+        return zotero_url(username, key, data.get("collections"))
+    return web_url(entry)

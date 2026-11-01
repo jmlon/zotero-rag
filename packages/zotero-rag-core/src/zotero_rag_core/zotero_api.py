@@ -7,7 +7,7 @@ import io
 import logging
 import time
 import zipfile
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -154,6 +154,75 @@ def fetch_collection_items(zot: zotero.Zotero, collection_key: str) -> list[dict
         raise ZoteroApiError(
             f"Could not fetch items for collection {collection_key}: {exc}"
         ) from exc
+
+
+#: Item keys per request when fetching by key; the Zotero API's maximum.
+ITEM_KEYS_PER_REQUEST = 50
+
+
+def library_version(zot: zotero.Zotero) -> int:
+    """The library's current version: Zotero bumps it on every change anywhere in it.
+
+    Read it *before* fetching what changed since the last sync, and store it once
+    the sync succeeds. A change made while fetching is then fetched again next
+    time, rather than skipped.
+    """
+    try:
+        return int(zot.last_modified_version())
+    except NETWORK_ERRORS as exc:
+        raise ZoteroApiError(f"Could not read the library version from Zotero: {exc}") from exc
+
+
+def fetch_library_items(zot: zotero.Zotero, since: int | None = None) -> list[dict[str, Any]]:
+    """Every item in the library, with attachments and notes, filed or not.
+
+    With `since`, only the items changed after that library version. Items in the
+    trash are left out, as the API leaves them out of `/items`; see
+    `fetch_removed_item_keys`.
+    """
+    query = {"since": since} if since is not None else {}
+    try:
+        return list(zot.everything(zot.items(**query)))
+    except NETWORK_ERRORS as exc:
+        raise ZoteroApiError(f"Could not fetch the library's items from Zotero: {exc}") from exc
+
+
+def fetch_items_by_key(zot: zotero.Zotero, keys: Iterable[str]) -> list[dict[str, Any]]:
+    """The items with these keys, `ITEM_KEYS_PER_REQUEST` per request.
+
+    An incremental sync sees a changed attachment without its unchanged parent,
+    whose title and authors the citation needs; this fetches such parents.
+    """
+    wanted = sorted(set(keys))
+    found: list[dict[str, Any]] = []
+    for start in range(0, len(wanted), ITEM_KEYS_PER_REQUEST):
+        batch = wanted[start : start + ITEM_KEYS_PER_REQUEST]
+        try:
+            found.extend(zot.everything(zot.items(itemKey=",".join(batch))))
+        except NETWORK_ERRORS as exc:
+            raise ZoteroApiError(f"Could not fetch items by key from Zotero: {exc}") from exc
+    return found
+
+
+def fetch_removed_item_keys(zot: zotero.Zotero, since: int) -> set[str]:
+    """Keys of the items deleted, or moved to the trash, after library version `since`.
+
+    The two are separate in the API: `/deleted` lists only items deleted for good,
+    and an item in the trash simply stops appearing in `/items`. Both should leave
+    the index, so both are asked.
+    """
+    try:
+        deleted = zot.deleted(since=since)
+        trashed = zot.everything(zot.trash(since=since))
+    except NETWORK_ERRORS as exc:
+        raise ZoteroApiError(f"Could not fetch deleted items from Zotero: {exc}") from exc
+    keys = {str(key) for key in (deleted or {}).get("items", [])}
+    for entry in trashed:
+        data = entry.get("data") or {}
+        key = data.get("key") or entry.get("key")
+        if key:
+            keys.add(str(key))
+    return keys
 
 
 def split_collection_path(path: str) -> list[str]:
