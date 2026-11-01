@@ -34,8 +34,8 @@ from zotero_rag.conversion import (
     SourceAttachment,
     Transcript,
 )
-from zotero_rag.planning import LINKED_URL_MODE
 from zotero_rag.quality import QualityVerdict
+from zotero_rag_core.planning import LINKED_URL_MODE
 
 _SIZE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmgt]?)(i?b)?\s*$", re.IGNORECASE)
 _UNITS = {"": 0, "k": 1, "m": 2, "g": 3, "t": 4}

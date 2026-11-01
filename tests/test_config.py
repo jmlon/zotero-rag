@@ -15,7 +15,7 @@ from zotero_rag.config import (
     load_config,
     packaged_defaults,
 )
-from zotero_rag.errors import ConfigError, MissingCredentialError
+from zotero_rag_core.errors import ConfigError, MissingCredentialError
 
 ZOTERO_VARS = ("ZOTERO_LIBRARY_ID", "ZOTERO_API_KEY")
 OPENROUTER_VARS = ("OPENROUTER_ENDPOINT", "OPENROUTER_API_KEY")

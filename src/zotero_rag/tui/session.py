@@ -16,21 +16,21 @@ from typing import Literal, cast
 
 from langchain_core.messages import AIMessageChunk, BaseMessage
 
-from zotero_rag.embedding import build_embeddings
-from zotero_rag.errors import ZoteroRagError
 from zotero_rag.index_folder import Notice, build_keyword_index, open_index, resolve_reranker
-from zotero_rag.llm import build_chat
-from zotero_rag.querying import (
+from zotero_rag.snapshot import CollectionSnapshot, read_snapshot
+from zotero_rag_core.embedding import build_embeddings
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.llm import build_chat
+from zotero_rag_core.querying import (
     QueryResult,
     QuestionEmbedder,
     StreamingAnswerer,
     TokenSink,
     stream_answer_question,
 )
-from zotero_rag.reranking import RerankFn
-from zotero_rag.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag.snapshot import CollectionSnapshot, read_snapshot
-from zotero_rag.vectorstore import Scope, VectorStore
+from zotero_rag_core.reranking import RerankFn
+from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.vectorstore import Scope, VectorStore
 
 logger = logging.getLogger(__name__)
 

@@ -14,16 +14,16 @@ from pathlib import Path
 from typing import Literal
 
 from zotero_rag.config import CONFIG_FILENAME, Config, is_reranker_name, load_config
-from zotero_rag.errors import (
+from zotero_rag_core.errors import (
     ConfigError,
     FingerprintMismatchError,
     NotAnIndexFolderError,
     NotIndexedError,
 )
-from zotero_rag.fingerprint import StoreFingerprint, advisory, blocking
-from zotero_rag.reranking import RerankFn, build_reranker
-from zotero_rag.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.fingerprint import StoreFingerprint, advisory, blocking
+from zotero_rag_core.reranking import RerankFn, build_reranker
+from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
 
 REINDEX_REMEDY = (
     "Run `zotero-rag index --repair` to re-embed the affected chunks with the "

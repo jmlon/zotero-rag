@@ -35,10 +35,10 @@ from zotero_rag.converter_run import (
     run_conversion,
     transcript_filename,
 )
-from zotero_rag.errors import ZoteroApiError
-from zotero_rag.provenance import MARKDOWN_TAG, Provenance, parse
 from zotero_rag.quality import QualityVerdict
-from zotero_rag.zotero_api import file_md5
+from zotero_rag_core.errors import ZoteroApiError
+from zotero_rag_core.provenance import MARKDOWN_TAG, Provenance, parse
+from zotero_rag_core.zotero_api import file_md5
 
 TODAY = date(2026, 10, 29)
 # 343 distinct six-letter pseudo-words, three to a line so each fits the 200pt

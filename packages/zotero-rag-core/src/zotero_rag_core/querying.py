@@ -22,18 +22,18 @@ from langchain_core.messages import (
 )
 from pydantic import BaseModel, Field
 
-from zotero_rag.documents import LocatorKind
-from zotero_rag.embedding import count_tokens
-from zotero_rag.llm import (
+from zotero_rag_core.documents import LocatorKind
+from zotero_rag_core.embedding import count_tokens
+from zotero_rag_core.llm import (
     LLMError,
     cached_tokens_from_message,
     cost_from_message,
     message_text,
     usage_from_message,
 )
-from zotero_rag.reranking import RerankFn, apply_rerank, candidate_count
-from zotero_rag.retrieval import KeywordIndex, RetrievalMode, retrieve
-from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore
+from zotero_rag_core.reranking import RerankFn, apply_rerank, candidate_count
+from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode, retrieve
+from zotero_rag_core.vectorstore import Scope, StoredChunk, VectorStore
 
 logger = logging.getLogger(__name__)
 

@@ -17,12 +17,12 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
-from zotero_rag.chunking import Chunk, chunk_segments
-from zotero_rag.embedding import count_tokens
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.extraction import extract_note, extract_segments
-from zotero_rag.planning import IndexPlan, PlannedAttachment, SkipReason
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.chunking import Chunk, chunk_segments
+from zotero_rag_core.embedding import count_tokens
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.extraction import extract_note, extract_segments
+from zotero_rag_core.planning import IndexPlan, PlannedAttachment, SkipReason
+from zotero_rag_core.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
 

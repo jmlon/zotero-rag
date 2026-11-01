@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 
-from zotero_rag.metadata import authors_str, parse_year, zotero_url
+from zotero_rag_core.metadata import authors_str, parse_year, zotero_url
 
 
 def test_first_last_names_are_formatted_last_first() -> None:

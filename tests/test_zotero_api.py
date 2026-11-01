@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from zotero_rag.zotero_api import CollectionNode, build_collection_tree, count_collections
+from zotero_rag_core.zotero_api import CollectionNode, build_collection_tree, count_collections
 
 
 def collection(

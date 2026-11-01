@@ -21,7 +21,7 @@ from typing import Literal
 
 from rank_bm25 import BM25Okapi
 
-from zotero_rag.vectorstore import Scope, StoredChunk, VectorStore, in_scope
+from zotero_rag_core.vectorstore import Scope, StoredChunk, VectorStore, in_scope
 
 logger = logging.getLogger(__name__)
 

@@ -19,10 +19,10 @@ from pydantic import BaseModel
 from pypdf import PdfReader
 from pypdf.errors import PyPdfError
 
-from zotero_rag import html_text, office, pdf_text
-from zotero_rag.documents import DocumentFormat, LocatorKind, locator_kind_for
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.markdown import body
+from zotero_rag_core import html_text, office, pdf_text
+from zotero_rag_core.documents import DocumentFormat, LocatorKind, locator_kind_for
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.markdown import body
 
 logger = logging.getLogger(__name__)
 

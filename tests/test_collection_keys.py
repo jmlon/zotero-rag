@@ -12,9 +12,9 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.indexer import index_plan, refresh_collection_keys
-from zotero_rag.planning import IndexPlan, PlannedAttachment
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.indexer import index_plan, refresh_collection_keys
+from zotero_rag_core.planning import IndexPlan, PlannedAttachment
+from zotero_rag_core.vectorstore import VectorStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 

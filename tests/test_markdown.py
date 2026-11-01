@@ -21,7 +21,6 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject, Num
 from tests.conftest import make_docx_bytes, make_epub_bytes, make_odt_bytes, make_pdf_bytes
 from zotero_rag import markdown
 from zotero_rag.config import load_config
-from zotero_rag.documents import DocumentFormat, conversion_format_for
 from zotero_rag.markdown import (
     ConversionError,
     Converted,
@@ -32,7 +31,8 @@ from zotero_rag.markdown import (
     normalise,
     transcript,
 )
-from zotero_rag.planning import PlannedAttachment
+from zotero_rag_core.documents import DocumentFormat, conversion_format_for
+from zotero_rag_core.planning import PlannedAttachment
 
 FileFactory = Callable[[str, bytes | str], Path]
 
@@ -380,7 +380,7 @@ def test_conversion_format_for(content_type: str | None, expected: str | None) -
 
 
 def test_conversion_only_formats_are_still_skipped_by_index() -> None:
-    from zotero_rag.documents import format_for
+    from zotero_rag_core.documents import format_for
 
     assert format_for("application/vnd.ms-powerpoint") is None
 
@@ -483,7 +483,7 @@ def test_text_layer_pages_are_named_in_the_front_matter() -> None:
 
 
 def test_cleaning_drops_embedded_latex_and_base64_but_keeps_glued_text() -> None:
-    from zotero_rag.pdf_text import clean
+    from zotero_rag_core.pdf_text import clean
 
     blob = "AAAB+XicbVBNS8NAEN34WetX1KOXxSJ4KkkV9Fj04rGC/YA2hs120y7dbMLupLSE/BMvHhTx6j"
     text = (

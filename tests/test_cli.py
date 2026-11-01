@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
 
@@ -16,17 +17,17 @@ from langchain_core.messages import AIMessage
 from rich.console import Console
 from typer.testing import CliRunner
 
-from zotero_rag import __version__, cli, index_folder
+from zotero_rag import PACKAGE_LOGGERS, __version__, cli, index_folder
 from zotero_rag.config import Config
-from zotero_rag.evaluation import JudgeVerdict, RawVerdict, load_questions
-from zotero_rag.fingerprint import StoreFingerprint
-from zotero_rag.generation import DocumentText, GeneratedQuestion, RawGeneration
-from zotero_rag.indexer import IndexStats
-from zotero_rag.planning import IndexPlan, PlannedAttachment, SkippedEntry, SkipReason
-from zotero_rag.querying import QueryResult, Source, Usage
 from zotero_rag.snapshot import read_snapshot
-from zotero_rag.vectorstore import VectorStore
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.evaluation import JudgeVerdict, RawVerdict, load_questions
+from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.generation import DocumentText, GeneratedQuestion, RawGeneration
+from zotero_rag_core.indexer import IndexStats
+from zotero_rag_core.planning import IndexPlan, PlannedAttachment, SkippedEntry, SkipReason
+from zotero_rag_core.querying import QueryResult, Source, Usage
+from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.zotero_api import CollectionNode
 
 runner = CliRunner()
 
@@ -136,6 +137,35 @@ def test_verbose_brings_back_pypdf_warnings(
     monkeypatch.chdir(tmp_path)
     runner.invoke(cli.app, arguments)
     assert pypdf_logger.isEnabledFor(logging.WARNING)
+
+
+@pytest.fixture
+def package_loggers() -> Iterator[list[logging.Logger]]:
+    """This CLI's logger and the core's, reset to quiet and restored afterwards."""
+    loggers = [logging.getLogger(name) for name in PACKAGE_LOGGERS]
+    levels = [logger.level for logger in loggers]
+    for logger in loggers:
+        logger.setLevel(logging.WARNING)
+    yield loggers
+    for logger, level in zip(loggers, levels, strict=True):
+        logger.setLevel(level)
+
+
+@pytest.mark.parametrize("arguments", [["-v", "index", "--dry-run"], ["index", "-v", "--dry-run"]])
+def test_verbose_reaches_the_core_pipeline(
+    arguments: list[str],
+    package_loggers: list[logging.Logger],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The indexer and query pipeline log under `zotero_rag_core`, not `zotero_rag`.
+
+    Raising only the CLI's own logger would leave `-v` silent about everything the
+    pipeline does, since that code moved into the core package.
+    """
+    monkeypatch.chdir(tmp_path)
+    runner.invoke(cli.app, arguments)
+    assert [logger.isEnabledFor(logging.INFO) for logger in package_loggers] == [True, True]
 
 
 def test_query_requires_a_question() -> None:
@@ -1419,7 +1449,7 @@ def test_eval_without_a_version_id_logs_by_fingerprint_and_says_so(
 def test_cost_from_message_reads_the_providers_charge() -> None:
     from langchain_core.messages import AIMessage
 
-    from zotero_rag.llm import cost_from_message
+    from zotero_rag_core.llm import cost_from_message
 
     assert (
         cost_from_message(
@@ -1436,7 +1466,7 @@ def test_a_list_price_is_read_from_openrouters_model_list(
 ) -> None:
     import httpx
 
-    from zotero_rag import llm
+    from zotero_rag_core import llm
 
     listing = {
         "data": [
@@ -1466,7 +1496,7 @@ def test_a_list_price_is_read_from_openrouters_model_list(
 def test_cached_tokens_are_read_from_the_usage_metadata() -> None:
     from langchain_core.messages import AIMessage
 
-    from zotero_rag.llm import cached_tokens_from_message
+    from zotero_rag_core.llm import cached_tokens_from_message
 
     message = AIMessage(
         content="x",

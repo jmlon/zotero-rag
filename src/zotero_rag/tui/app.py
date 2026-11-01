@@ -15,8 +15,6 @@ from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Static, Tree
 
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.querying import QueryResult
 from zotero_rag.tui.clipboard import copy_with_system_tool
 from zotero_rag.tui.export import (
     Exchange,
@@ -37,6 +35,8 @@ from zotero_rag.tui.widgets import (
     SessionNote,
     Transcript,
 )
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.querying import QueryResult
 
 logger = logging.getLogger(__name__)
 

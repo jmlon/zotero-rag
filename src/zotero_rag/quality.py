@@ -23,7 +23,7 @@ from enum import StrEnum
 from pydantic import BaseModel, Field
 
 from zotero_rag.config import QualityThresholds
-from zotero_rag.extraction import Segment
+from zotero_rag_core.extraction import Segment
 
 # Words long enough to be distinctive; short ones match anywhere by accident.
 _WORD = re.compile(r"[^\W\d_]{4,}")

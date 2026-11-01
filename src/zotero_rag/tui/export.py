@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from zotero_rag.querying import QueryResult
+from zotero_rag_core.querying import QueryResult
 
 TRANSCRIPTS_DIRNAME = "transcripts"
 

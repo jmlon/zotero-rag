@@ -11,9 +11,9 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.indexer import chunk_id, index_plan
-from zotero_rag.planning import IndexPlan, PlannedAttachment
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.indexer import chunk_id, index_plan
+from zotero_rag_core.planning import IndexPlan, PlannedAttachment
+from zotero_rag_core.vectorstore import VectorStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 
@@ -245,7 +245,7 @@ def test_empty_plan_is_a_no_op(store: VectorStore) -> None:
 def test_a_rejected_key_is_reported_without_the_unexpected_prefix(
     store: VectorStore, pdf_factory: PdfFactory
 ) -> None:
-    from zotero_rag.errors import RejectedCredentialError
+    from zotero_rag_core.errors import RejectedCredentialError
 
     pdf = pdf_factory("doc.pdf", ["Some content"])
 

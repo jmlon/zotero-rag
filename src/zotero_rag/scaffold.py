@@ -18,7 +18,7 @@ from zotero_rag.config import (
     GlobalConfig,
     packaged_defaults_text,
 )
-from zotero_rag.errors import ZoteroRagError
+from zotero_rag_core.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
 

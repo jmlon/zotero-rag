@@ -10,8 +10,8 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.querying import answer_question
-from zotero_rag.retrieval import (
+from zotero_rag_core.querying import answer_question
+from zotero_rag_core.retrieval import (
     CANDIDATE_MULTIPLIER,
     MIN_CANDIDATES,
     RRF_K,
@@ -21,7 +21,7 @@ from zotero_rag.retrieval import (
     retrieve,
     tokenize,
 )
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore
 
 
 def chunk(identifier: str, text: str = "some text", distance: float | None = None) -> StoredChunk:

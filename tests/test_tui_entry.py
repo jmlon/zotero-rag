@@ -16,18 +16,18 @@ import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from typer.testing import CliRunner
 
-from zotero_rag import cli
+from zotero_rag import PACKAGE_LOGGERS, cli
 from zotero_rag.config import Config
-from zotero_rag.fingerprint import StoreFingerprint
-from zotero_rag.querying import answer_question
-from zotero_rag.retrieval import KeywordIndex, RetrievalMode
 from zotero_rag.snapshot import write_snapshot
 from zotero_rag.tui import UI_DIRNAME, main, session
 from zotero_rag.tui.app import ZoteroRagApp
 from zotero_rag.tui.history import HISTORY_FILENAME
 from zotero_rag.tui.session import Phase, QuerySession, QuerySettings, open_session
-from zotero_rag.vectorstore import VectorStore
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.querying import answer_question
+from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.zotero_api import CollectionNode
 
 runner = CliRunner()
 
@@ -44,7 +44,7 @@ def _isolate(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("COLUMNS", "200")
     root = logging.getLogger()
     handlers, level = list(root.handlers), root.level
-    package_level = logging.getLogger("zotero_rag").level
+    package_levels = {name: logging.getLogger(name).level for name in PACKAGE_LOGGERS}
     yield
     for handler in list(root.handlers):
         root.removeHandler(handler)
@@ -53,7 +53,8 @@ def _isolate(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for handler in handlers:
         root.addHandler(handler)
     root.setLevel(level)
-    logging.getLogger("zotero_rag").setLevel(package_level)
+    for name, package_level in package_levels.items():
+        logging.getLogger(name).setLevel(package_level)
 
 
 class Embeddings:

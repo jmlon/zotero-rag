@@ -12,9 +12,9 @@ import logging
 from pathlib import Path
 from typing import Protocol
 
-from zotero_rag.documents import DocumentFormat, cache_suffix
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.zotero_api import NETWORK_ERRORS
+from zotero_rag_core.documents import DocumentFormat, cache_suffix
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.zotero_api import NETWORK_ERRORS
 
 logger = logging.getLogger(__name__)
 

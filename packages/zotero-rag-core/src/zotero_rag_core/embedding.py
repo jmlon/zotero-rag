@@ -14,8 +14,8 @@ import tiktoken
 from langchain_openai import OpenAIEmbeddings
 from pydantic import SecretStr
 
-from zotero_rag.config import Config
-from zotero_rag.errors import RejectedCredentialError
+from zotero_rag_core.config import Config
+from zotero_rag_core.errors import RejectedCredentialError
 
 logger = logging.getLogger(__name__)
 

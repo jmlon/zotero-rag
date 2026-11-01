@@ -8,7 +8,7 @@ from pathlib import Path
 from zotero_rag.snapshot import CollectionSnapshot
 from zotero_rag.tui.history import PromptHistory
 from zotero_rag.tui.scopes import LIBRARY_LABEL, ScopeNode, build_scope_tree
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.zotero_api import CollectionNode
 
 # --- history: stepping ------------------------------------------------------
 

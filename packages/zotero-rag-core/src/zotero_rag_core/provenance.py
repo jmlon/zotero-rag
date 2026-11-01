@@ -27,7 +27,7 @@ from datetime import date
 
 from pydantic import BaseModel
 
-from zotero_rag import html_text
+from zotero_rag_core import html_text
 
 HEADER = "zotero-rag:markdown v1"
 #: Tagged as well, so the user can find every transcript in Zotero's tag selector.

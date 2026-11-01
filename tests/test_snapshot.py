@@ -12,7 +12,7 @@ from zotero_rag.snapshot import (
     read_snapshot,
     write_snapshot,
 )
-from zotero_rag.zotero_api import CollectionNode, scope_tree
+from zotero_rag_core.zotero_api import CollectionNode, scope_tree
 
 
 def tree() -> CollectionNode:

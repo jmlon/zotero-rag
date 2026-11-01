@@ -13,16 +13,16 @@ from typing import Any
 
 import pytest
 
-from zotero_rag.documents import DocumentFormat, LocatorKind
-from zotero_rag.indexer import index_plan
-from zotero_rag.planning import (
+from zotero_rag_core.documents import DocumentFormat, LocatorKind
+from zotero_rag_core.indexer import index_plan
+from zotero_rag_core.planning import (
     DEFAULT_PREFERENCE,
     SkipReason,
     build_plan,
     resolve_preference,
 )
-from zotero_rag.querying import Source, collect_sources
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.querying import Source, collect_sources
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore
 
 FileFactory = Callable[[str, bytes | str], Path]
 

@@ -145,7 +145,7 @@ def file_factory(tmp_path: Path):  # type: ignore[no-untyped-def]
 @pytest.fixture(autouse=True)
 def _no_price_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     """`eval` and `compare-embeddings` fetch a list price from OpenRouter; tests stay offline."""
-    from zotero_rag.llm import ModelPrice
+    from zotero_rag_core.llm import ModelPrice
 
     monkeypatch.setattr(
         "zotero_rag.cli.fetch_price",

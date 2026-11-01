@@ -10,7 +10,6 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.querying import QueryResult, Source
 from zotero_rag.tui import clipboard
 from zotero_rag.tui.export import (
     Exchange,
@@ -20,6 +19,7 @@ from zotero_rag.tui.export import (
     transcript_markdown,
     write_transcript,
 )
+from zotero_rag_core.querying import QueryResult, Source
 
 WHEN = datetime(2026, 10, 28, 14, 5, 9)
 #: Resolved before any test narrows PATH to the fake tools.

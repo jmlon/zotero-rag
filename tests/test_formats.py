@@ -13,15 +13,15 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import make_docx_bytes, make_epub_bytes, make_odt_bytes
-from zotero_rag import html_text
-from zotero_rag.documents import (
+from zotero_rag_core import html_text
+from zotero_rag_core.documents import (
     DocumentFormat,
     LocatorKind,
     cache_suffix,
     format_for,
     locator_kind_for,
 )
-from zotero_rag.extraction import (
+from zotero_rag_core.extraction import (
     ExtractionError,
     extract_note,
     extract_segments,

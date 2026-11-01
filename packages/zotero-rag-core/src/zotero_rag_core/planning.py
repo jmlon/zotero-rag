@@ -19,9 +19,9 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from zotero_rag import html_text, provenance
-from zotero_rag.documents import DocumentFormat, LocatorKind, format_for
-from zotero_rag.metadata import authors_str, parse_year, zotero_url
+from zotero_rag_core import html_text, provenance
+from zotero_rag_core.documents import DocumentFormat, LocatorKind, format_for
+from zotero_rag_core.metadata import authors_str, parse_year, zotero_url
 
 logger = logging.getLogger(__name__)
 

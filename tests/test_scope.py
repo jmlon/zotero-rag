@@ -13,12 +13,12 @@ from typing import Any, cast
 import pytest
 from langchain_core.messages import AIMessage, BaseMessage
 
-from zotero_rag.errors import CollectionNotFoundError
-from zotero_rag.querying import NO_CONTEXT_ANSWER, answer_question
-from zotero_rag.retrieval import KeywordIndex, retrieve
 from zotero_rag.snapshot import CollectionSnapshot
-from zotero_rag.vectorstore import StoredChunk, VectorStore, in_scope, scope_where
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.errors import CollectionNotFoundError
+from zotero_rag_core.querying import NO_CONTEXT_ANSWER, answer_question
+from zotero_rag_core.retrieval import KeywordIndex, retrieve
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore, in_scope, scope_where
+from zotero_rag_core.zotero_api import CollectionNode
 
 #: attachment → (collection keys, text, embedding). D predates `collection_keys`.
 LIBRARY: dict[str, tuple[list[str] | None, str, list[float]]] = {

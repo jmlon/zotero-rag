@@ -33,7 +33,7 @@ from rich.progress import (
 from rich.table import Table
 from rich.tree import Tree
 
-from zotero_rag import __version__
+from zotero_rag import PACKAGE_LOGGERS, __version__
 from zotero_rag.config import (
     CONFIG_FILENAME,
     ENV_FILENAME,
@@ -59,9 +59,6 @@ from zotero_rag.converter_run import (
     report_rows,
     run_conversion,
 )
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.download import CACHE_DIRNAME, ensure_cached
-from zotero_rag.embedding import build_embeddings
 from zotero_rag.embedding_comparison import (
     ComparisonReport,
     ComparisonSettings,
@@ -73,13 +70,47 @@ from zotero_rag.embedding_comparison import (
     stored_tokens,
     variant_config,
 )
-from zotero_rag.errors import (
+from zotero_rag.experiments import (
+    ExperimentLogError,
+    ExperimentRun,
+    log_path,
+    make_run,
+    new_batch_id,
+    question_set_info,
+    record_runs,
+)
+from zotero_rag.index_folder import (
+    REINDEX_REMEDY,
+    Notice,
+    build_keyword_index,
+    check_fingerprint,
+    open_index,
+    resolve_reranker,
+)
+from zotero_rag.quality import QualityVerdict
+from zotero_rag.scaffold import init_index_folder
+from zotero_rag.shrink import (
+    KeepReason,
+    ShrinkEntry,
+    Verdict,
+    format_size,
+    parse_size,
+    shrink_candidates,
+)
+from zotero_rag.shrink_run import BACKUP_DIRNAME, LinkProber, check_candidates, trash_files
+from zotero_rag.shrink_run import REPORT_FIELDS as SHRINK_REPORT_FIELDS
+from zotero_rag.shrink_run import report_rows as shrink_report_rows
+from zotero_rag.snapshot import write_snapshot
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.download import CACHE_DIRNAME, ensure_cached
+from zotero_rag_core.embedding import build_embeddings
+from zotero_rag_core.errors import (
     CollectionMismatchError,
     NotAnIndexFolderError,
     NotIndexedError,
     ZoteroRagError,
 )
-from zotero_rag.evaluation import (
+from zotero_rag_core.evaluation import (
     JUDGE_PROTOCOL,
     MAX_SCORE,
     CostSpread,
@@ -99,17 +130,8 @@ from zotero_rag.evaluation import (
     resolve_questions_path,
     run_settings,
 )
-from zotero_rag.experiments import (
-    ExperimentLogError,
-    ExperimentRun,
-    log_path,
-    make_run,
-    new_batch_id,
-    question_set_info,
-    record_runs,
-)
-from zotero_rag.fingerprint import StoreFingerprint
-from zotero_rag.generation import (
+from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.generation import (
     MATCH_DOCUMENT,
     DocumentText,
     GenerationStats,
@@ -120,15 +142,7 @@ from zotero_rag.generation import (
     generate_questions,
     write_questions,
 )
-from zotero_rag.index_folder import (
-    REINDEX_REMEDY,
-    Notice,
-    build_keyword_index,
-    check_fingerprint,
-    open_index,
-    resolve_reranker,
-)
-from zotero_rag.indexer import (
+from zotero_rag_core.indexer import (
     DIMENSION_PROBE,
     IndexStats,
     drop_replaced_copies,
@@ -138,8 +152,8 @@ from zotero_rag.indexer import (
     refresh_collection_keys,
     repair_embeddings,
 )
-from zotero_rag.llm import ModelPrice, build_chat, fetch_price
-from zotero_rag.planning import (
+from zotero_rag_core.llm import ModelPrice, build_chat, fetch_price
+from zotero_rag_core.planning import (
     IndexPlan,
     PlannedAttachment,
     SkipReason,
@@ -147,24 +161,10 @@ from zotero_rag.planning import (
     build_plan,
     item_membership,
 )
-from zotero_rag.quality import QualityVerdict
-from zotero_rag.querying import QueryResult, answer_question
-from zotero_rag.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag.scaffold import init_index_folder
-from zotero_rag.shrink import (
-    KeepReason,
-    ShrinkEntry,
-    Verdict,
-    format_size,
-    parse_size,
-    shrink_candidates,
-)
-from zotero_rag.shrink_run import BACKUP_DIRNAME, LinkProber, check_candidates, trash_files
-from zotero_rag.shrink_run import REPORT_FIELDS as SHRINK_REPORT_FIELDS
-from zotero_rag.shrink_run import report_rows as shrink_report_rows
-from zotero_rag.snapshot import write_snapshot
-from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
-from zotero_rag.zotero_api import (
+from zotero_rag_core.querying import QueryResult, answer_question
+from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.zotero_api import (
     CollectionNode,
     FileDownloader,
     build_client,
@@ -215,7 +215,8 @@ def _setup_logging(verbose: bool) -> None:
         format="%(message)s",
         handlers=[RichHandler(console=err_console, show_time=False, show_path=False)],
     )
-    logging.getLogger("zotero_rag").setLevel(logging.INFO if verbose else logging.WARNING)
+    for name in PACKAGE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO if verbose else logging.WARNING)
     _set_noisy_logger_level(verbose)
 
 
@@ -236,7 +237,8 @@ VerboseOption = Annotated[
 def _enable_verbose(verbose: bool) -> None:
     """Raise this package to INFO when a subcommand was given its own `-v`."""
     if verbose:
-        logging.getLogger("zotero_rag").setLevel(logging.INFO)
+        for name in PACKAGE_LOGGERS:
+            logging.getLogger(name).setLevel(logging.INFO)
         _set_noisy_logger_level(True)
 
 

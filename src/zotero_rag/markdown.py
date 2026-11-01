@@ -32,9 +32,10 @@ from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PyPdfError
 from pypdf.generic import DictionaryObject
 
-from zotero_rag import __version__, html_text, pdf_text
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.errors import ZoteroRagError
+from zotero_rag import __version__
+from zotero_rag_core import html_text, pdf_text
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
 
@@ -167,18 +168,6 @@ def transcript(
         fields["text_layer_pages"] = converted.text_layer_pages
     header = yaml.safe_dump(fields, sort_keys=False, allow_unicode=True, width=1000)
     return f"---\n{header}---\n\n{converted.markdown}"
-
-
-def body(text: str) -> str:
-    """A transcript without its YAML front matter; other Markdown is unchanged.
-
-    Applied before judging a transcript, so the title and authors in its own
-    header cannot count as text it recovered from the source.
-    """
-    if not text.startswith("---\n"):
-        return text
-    end = text.find("\n---\n", 4)
-    return text if end < 0 else text[end + len("\n---\n") :].lstrip("\n")
 
 
 def normalise(markdown: str) -> str:

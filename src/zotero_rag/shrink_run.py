@@ -25,11 +25,6 @@ import httpx
 
 from zotero_rag import __version__
 from zotero_rag.config import QualityThresholds
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.download import AttachmentFetcher, ensure_cached
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.extraction import ExtractionError, extract_segments
-from zotero_rag.markdown import body
 from zotero_rag.quality import QualityVerdict, assess
 from zotero_rag.shrink import (
     KeepReason,
@@ -41,7 +36,12 @@ from zotero_rag.shrink import (
     judge_probe,
     listing_reason,
 )
-from zotero_rag.zotero_api import file_md5, trash_item, update_attachment_note
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.download import AttachmentFetcher, ensure_cached
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.extraction import ExtractionError, extract_segments
+from zotero_rag_core.markdown import body
+from zotero_rag_core.zotero_api import file_md5, trash_item, update_attachment_note
 
 logger = logging.getLogger(__name__)
 

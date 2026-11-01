@@ -10,13 +10,13 @@ import typer
 from rich.console import Console
 from rich.logging import RichHandler
 
-from zotero_rag import __version__
+from zotero_rag import PACKAGE_LOGGERS, __version__
 from zotero_rag.config import load_env
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.retrieval import RetrievalMode
 from zotero_rag.tui import UI_DIRNAME
 from zotero_rag.tui.history import HISTORY_FILENAME, PromptHistory
 from zotero_rag.tui.session import open_session
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.retrieval import RetrievalMode
 
 LOG_FILENAME = "ui.log"
 # The CLI's list (`cli.NOISY_LOGGERS`) plus the HTTP clients, whose request lines
@@ -61,7 +61,8 @@ def _log_while_drawing(index_dir: Path | None, verbose: bool) -> None:
     handler = logging.FileHandler(log_dir / LOG_FILENAME, encoding="utf-8")
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     root.addHandler(handler)
-    logging.getLogger("zotero_rag").setLevel(logging.INFO)
+    for name in PACKAGE_LOGGERS:
+        logging.getLogger(name).setLevel(logging.INFO)
     for name in NOISY_LOGGERS:
         logging.getLogger(name).setLevel(logging.WARNING)
 

@@ -9,7 +9,7 @@ differently from new ones, which is worth a warning and nothing more.
 from __future__ import annotations
 
 from zotero_rag.config import Config
-from zotero_rag.fingerprint import (
+from zotero_rag_core.fingerprint import (
     METADATA_PREFIX,
     Severity,
     StoreFingerprint,

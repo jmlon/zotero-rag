@@ -7,14 +7,6 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.evaluation import (
-    EvalAggregate,
-    EvalQuestion,
-    QuestionSet,
-    QuestionSetError,
-    RunSettings,
-    load_question_set,
-)
 from zotero_rag.experiments import (
     ExperimentLogError,
     load_log,
@@ -22,6 +14,14 @@ from zotero_rag.experiments import (
     make_run,
     question_set_info,
     record_runs,
+)
+from zotero_rag_core.evaluation import (
+    EvalAggregate,
+    EvalQuestion,
+    QuestionSet,
+    QuestionSetError,
+    RunSettings,
+    load_question_set,
 )
 
 QUESTIONS = """\

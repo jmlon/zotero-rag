@@ -11,8 +11,8 @@ from pathlib import Path
 import pytest
 
 from zotero_rag.config import Config, load_config, packaged_defaults, pin_collection
-from zotero_rag.errors import ConfigError
 from zotero_rag.scaffold import init_index_folder
+from zotero_rag_core.errors import ConfigError
 
 
 @pytest.fixture

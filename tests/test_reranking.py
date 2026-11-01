@@ -13,19 +13,19 @@ from pathlib import Path
 import httpx
 import pytest
 
-from zotero_rag import reranking
 from zotero_rag.config import Config
-from zotero_rag.embedding import MAX_RETRIES
-from zotero_rag.errors import MissingCredentialError
-from zotero_rag.querying import answer_question
-from zotero_rag.reranking import (
+from zotero_rag_core import reranking
+from zotero_rag_core.embedding import MAX_RETRIES
+from zotero_rag_core.errors import MissingCredentialError
+from zotero_rag_core.querying import answer_question
+from zotero_rag_core.reranking import (
     COHERE_RERANK_URL,
     RerankError,
     apply_rerank,
     build_reranker,
     candidate_count,
 )
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore
 
 
 def chunk(identifier: str, text: str) -> StoredChunk:

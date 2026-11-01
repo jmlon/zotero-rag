@@ -18,13 +18,13 @@ from zotero_rag.config import (
     packaged_defaults,
     packaged_defaults_text,
 )
-from zotero_rag.errors import ZoteroRagError
 from zotero_rag.scaffold import (
     ENV_FILENAME,
     GITIGNORE_FILENAME,
     init_index_folder,
     render_env_template,
 )
+from zotero_rag_core.errors import ZoteroRagError
 
 
 @pytest.fixture

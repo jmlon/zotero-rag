@@ -14,8 +14,8 @@ import pytest
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 
 from zotero_rag.config import Config, packaged_defaults
-from zotero_rag.llm import LLMError, build_chat, message_text, usage_from_message
-from zotero_rag.querying import (
+from zotero_rag_core.llm import LLMError, build_chat, message_text, usage_from_message
+from zotero_rag_core.querying import (
     NO_CONTEXT_ANSWER,
     SYSTEM_PROMPT,
     QueryResult,
@@ -26,7 +26,7 @@ from zotero_rag.querying import (
     expand_window,
     stream_answer_question,
 )
-from zotero_rag.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 

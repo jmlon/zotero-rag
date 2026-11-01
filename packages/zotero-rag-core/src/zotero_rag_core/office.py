@@ -16,7 +16,7 @@ import zipfile
 from pathlib import Path
 from xml.etree import ElementTree
 
-from zotero_rag.html_text import Section, normalise, parse_sections
+from zotero_rag_core.html_text import Section, normalise, parse_sections
 
 logger = logging.getLogger(__name__)
 

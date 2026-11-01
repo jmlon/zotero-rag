@@ -5,8 +5,8 @@ from __future__ import annotations
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel
 
-from zotero_rag.documents import LocatorKind
-from zotero_rag.extraction import Segment
+from zotero_rag_core.documents import LocatorKind
+from zotero_rag_core.extraction import Segment
 
 
 class Chunk(BaseModel):

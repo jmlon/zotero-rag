@@ -24,7 +24,6 @@ from zotero_rag import cli
 from zotero_rag.config import QualityThresholds
 from zotero_rag.conversion import build_conversion_plan
 from zotero_rag.markdown import converter_name
-from zotero_rag.provenance import Provenance, parse
 from zotero_rag.shrink import (
     KeepReason,
     LinkCheck,
@@ -42,6 +41,7 @@ from zotero_rag.shrink_run import (
     report_rows,
     trash_files,
 )
+from zotero_rag_core.provenance import Provenance, parse
 
 TODAY = date(2026, 11, 2)
 URL = "https://example.org/paper.pdf"

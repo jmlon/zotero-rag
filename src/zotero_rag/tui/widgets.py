@@ -18,10 +18,10 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Label, Markdown, Static, TextArea, Tree
 from textual.widgets.tree import TreeNode
 
-from zotero_rag.querying import QueryResult
 from zotero_rag.tui.export import Exchange
 from zotero_rag.tui.history import PromptHistory
 from zotero_rag.tui.scopes import ScopeChoice, ScopeNode
+from zotero_rag_core.querying import QueryResult
 
 # --- folder tree -------------------------------------------------------------
 

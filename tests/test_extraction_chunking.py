@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from zotero_rag.chunking import chunk_segments
-from zotero_rag.extraction import ExtractionError, Segment, extract_pdf
+from zotero_rag_core.chunking import chunk_segments
+from zotero_rag_core.extraction import ExtractionError, Segment, extract_pdf
 
 PdfFactory = Callable[[str, list[str]], Path]
 

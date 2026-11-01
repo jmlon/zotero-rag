@@ -6,8 +6,8 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from zotero_rag.embedding import OpenRouterEmbeddings
-from zotero_rag.errors import RejectedCredentialError
+from zotero_rag_core.embedding import OpenRouterEmbeddings
+from zotero_rag_core.errors import RejectedCredentialError
 
 
 @pytest.fixture

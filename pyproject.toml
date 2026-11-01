@@ -6,24 +6,20 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "chromadb>=1.5.9",
+    # The indexing and query pipeline, with the Chroma store kept in index folders.
+    "zotero-rag-core[chroma]",
     # Markdown transcripts. Capped below the next minor: the API is pre-1.0.
     "firecrawl-anydoc>=0.2.4,<0.3",
     # Imported directly to catch transport errors pyzotero lets through.
     "httpx>=0.28",
     "langchain-core>=1.5.1",
-    "langchain-openai>=1.4.1",
-    "langchain-text-splitters>=1.1.2",
     "pinecone>=9.1.0",
     "pydantic>=2.13.4",
     "pypdf>=6.14.2",
     "python-dotenv>=1.2.2",
     "pyyaml>=6.0.3",
-    "pyzotero>=1.13.2",
-    "rank-bm25>=0.2.2",
     "rich>=15.0.0",
     "textual>=8.2.8",
-    "tiktoken>=0.13.0",
     "typer>=0.27.0",
 ]
 
@@ -55,6 +51,12 @@ packages = ["src/zotero_rag"]
 # Ensures uv uses src layout
 package = true
 
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+zotero-rag-core = { workspace = true }
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
@@ -65,9 +67,12 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["zotero_rag", "zotero_rag_core"]
+
 [tool.mypy]
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "packages/zotero-rag-core/src", "tests"]
 plugins = ["pydantic.mypy"]
 
 # rank_bm25 ships no py.typed marker and there are no stubs for it. Scoped to the

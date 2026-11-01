@@ -14,8 +14,8 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ValidationError
 
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.zotero_api import CollectionNode, find_collection_by_key
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.zotero_api import CollectionNode, find_collection_by_key
 
 logger = logging.getLogger(__name__)
 

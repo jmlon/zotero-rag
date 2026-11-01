@@ -21,11 +21,11 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from zotero_rag import provenance
-from zotero_rag.documents import DocumentFormat, conversion_format_for, format_for
 from zotero_rag.markdown import converter_name
-from zotero_rag.metadata import authors_str, parse_year, zotero_url
-from zotero_rag.planning import (
+from zotero_rag_core import provenance
+from zotero_rag_core.documents import DocumentFormat, conversion_format_for, format_for
+from zotero_rag_core.metadata import authors_str, parse_year, zotero_url
+from zotero_rag_core.planning import (
     LINKED_URL_MODE,
     Candidate,
     SkippedEntry,
@@ -35,7 +35,7 @@ from zotero_rag.planning import (
     collect_candidates,
     resolve_preference,
 )
-from zotero_rag.provenance import Provenance
+from zotero_rag_core.provenance import Provenance
 
 MARKDOWN_TYPES = frozenset({"text/markdown", "text/x-markdown"})
 MARKDOWN_SUFFIXES = (".md", ".markdown")

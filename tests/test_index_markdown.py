@@ -12,12 +12,12 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-from zotero_rag.documents import DocumentFormat, LocatorKind
-from zotero_rag.extraction import extract_segments
-from zotero_rag.indexer import drop_replaced_copies, find_orphans
-from zotero_rag.planning import SkipReason, build_plan
-from zotero_rag.provenance import Provenance, parse
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.documents import DocumentFormat, LocatorKind
+from zotero_rag_core.extraction import extract_segments
+from zotero_rag_core.indexer import drop_replaced_copies, find_orphans
+from zotero_rag_core.planning import SkipReason, build_plan
+from zotero_rag_core.provenance import Provenance, parse
+from zotero_rag_core.vectorstore import VectorStore
 
 FileFactory = Callable[[str, bytes | str], Path]
 MARKDOWN_FIRST = ["markdown", "pdf", "docx", "odt", "epub", "html", "txt"]

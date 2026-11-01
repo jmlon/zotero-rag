@@ -32,14 +32,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from zotero_rag.config import QualityThresholds
 from zotero_rag.conversion import ConversionAction, ConversionEntry, SourceAttachment
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.download import AttachmentFetcher, cache_path, ensure_cached
-from zotero_rag.errors import ZoteroConflictError, ZoteroRagError
-from zotero_rag.extraction import ExtractionError, extract_segments
 from zotero_rag.markdown import Converted, NeedsOcr, OcrMode, convert, transcript
-from zotero_rag.provenance import MARKDOWN_TAG, Provenance
 from zotero_rag.quality import QualityReport, QualityVerdict, assess
-from zotero_rag.zotero_api import (
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.download import AttachmentFetcher, cache_path, ensure_cached
+from zotero_rag_core.errors import ZoteroConflictError, ZoteroRagError
+from zotero_rag_core.extraction import ExtractionError, extract_segments
+from zotero_rag_core.provenance import MARKDOWN_TAG, Provenance
+from zotero_rag_core.zotero_api import (
     create_markdown_attachment,
     file_md5,
     replace_attachment_file,

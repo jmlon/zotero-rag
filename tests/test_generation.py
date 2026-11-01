@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from zotero_rag.config import Config
-from zotero_rag.evaluation import EvalQuestion, load_questions
-from zotero_rag.generation import (
+from zotero_rag_core.evaluation import EvalQuestion, load_questions
+from zotero_rag_core.generation import (
     ELLIPSIS,
     MATCH_DOCUMENT,
     SPARE_QUESTIONS,
@@ -33,7 +33,7 @@ from zotero_rag.generation import (
     to_questions,
     write_questions,
 )
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.vectorstore import VectorStore
 
 
 def store_with(tmp_path: Path, chunks: list[dict[str, object]]) -> VectorStore:

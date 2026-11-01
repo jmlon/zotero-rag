@@ -15,8 +15,8 @@ from zotero_rag.conversion import (
     ConversionState,
     build_conversion_plan,
 )
-from zotero_rag.planning import SkipReason
-from zotero_rag.provenance import Provenance
+from zotero_rag_core.planning import SkipReason
+from zotero_rag_core.provenance import Provenance
 
 PDF_MD5 = "a" * 32
 NEW_PDF_MD5 = "b" * 32

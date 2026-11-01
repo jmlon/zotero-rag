@@ -17,9 +17,7 @@ from langchain_core.messages import AIMessageChunk, BaseMessage
 from textual.pilot import Pilot
 from textual.widgets import Input, Markdown, Static
 
-from zotero_rag.errors import ZoteroRagError
 from zotero_rag.index_folder import Notice
-from zotero_rag.querying import NO_CONTEXT_ANSWER
 from zotero_rag.snapshot import CollectionSnapshot
 from zotero_rag.tui import app as app_module
 from zotero_rag.tui.app import UNAVAILABLE_NOTICE, ZoteroRagApp
@@ -33,8 +31,10 @@ from zotero_rag.tui.widgets import (
     ScopeTree,
     Transcript,
 )
-from zotero_rag.vectorstore import VectorStore
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.querying import NO_CONTEXT_ANSWER
+from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.zotero_api import CollectionNode
 
 SIZE = (120, 40)
 

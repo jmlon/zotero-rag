@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.planning import SkipReason, build_plan, item_membership
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.planning import SkipReason, build_plan, item_membership
 
 
 def item(

@@ -16,8 +16,8 @@ import chromadb
 from chromadb.config import Settings
 from pydantic import BaseModel, Field
 
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.fingerprint import StoreFingerprint
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.fingerprint import StoreFingerprint
 
 logger = logging.getLogger(__name__)
 

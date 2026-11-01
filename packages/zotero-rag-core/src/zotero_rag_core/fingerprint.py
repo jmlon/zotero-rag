@@ -19,7 +19,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel
 
-from zotero_rag.config import Config
+from zotero_rag_core.config import Config
 
 logger = logging.getLogger(__name__)
 

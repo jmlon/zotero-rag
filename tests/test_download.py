@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import make_pdf_bytes
-from zotero_rag.download import (
+from zotero_rag_core.download import (
     AttachmentDownloadError,
     cache_path,
     ensure_cached,
@@ -119,7 +119,7 @@ def test_envelope_is_stripped_to_a_valid_pdf() -> None:
 
 def test_stripped_pdf_still_extracts(tmp_path: Path) -> None:
     """The repaired bytes must be readable by the extraction stage."""
-    from zotero_rag.extraction import extract_pdf
+    from zotero_rag_core.extraction import extract_pdf
 
     path = tmp_path / "repaired.pdf"
     path.write_bytes(strip_multipart_envelope(wrap_in_multipart(make_pdf_bytes(["Real text"]))))

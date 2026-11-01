@@ -810,6 +810,18 @@ The test suite makes no network calls and mocks no Zotero API: the download and
 embedding seams are injected, and tests run against a real on-disk Chroma store
 with hand-built PDFs.
 
+The repository is a [uv workspace](https://docs.astral.sh/uv/concepts/projects/workspaces/)
+with two packages:
+
+| package | path | what it holds |
+|---|---|---|
+| `zotero-rag` | `src/zotero_rag/` | the CLI, the terminal UI, index folders, `convert` and `shrink-storage` |
+| `zotero-rag-core` | `packages/zotero-rag-core/` | the pipeline: Zotero access, planning, extraction, chunking, embedding, retrieval, reranking, querying, indexing and evaluation |
+
+The core has no command line and no terminal UI, so other applications (such as
+the planned `zotero-rag-web`) can depend on it alone. `uv sync` installs both,
+and the CLI uses the core from the checkout.
+
 ## Reference
 
 - [pyzotero](https://pyzotero.readthedocs.io/en/latest/)

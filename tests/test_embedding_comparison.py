@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from typer.testing import CliRunner
 
-from zotero_rag import cli, evaluation
+from zotero_rag import cli
 from zotero_rag.config import (
     Config,
     EmbeddingModelSpec,
@@ -25,7 +25,6 @@ from zotero_rag.config import (
     RerankerSpec,
     load_config,
 )
-from zotero_rag.embedding import DEFAULT_BATCH_SIZE, MAX_RETRIES, build_embeddings
 from zotero_rag.embedding_comparison import (
     chunkings,
     context_warning,
@@ -34,11 +33,13 @@ from zotero_rag.embedding_comparison import (
     scaled_overlap,
     variant_config,
 )
-from zotero_rag.evaluation import JudgeVerdict, RawVerdict, build_verdict_fn
-from zotero_rag.fingerprint import StoreFingerprint
-from zotero_rag.indexer import DIMENSION_PROBE
-from zotero_rag.llm import build_chat
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core import evaluation
+from zotero_rag_core.embedding import DEFAULT_BATCH_SIZE, MAX_RETRIES, build_embeddings
+from zotero_rag_core.evaluation import JudgeVerdict, RawVerdict, build_verdict_fn
+from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.indexer import DIMENSION_PROBE
+from zotero_rag_core.llm import build_chat
+from zotero_rag_core.vectorstore import VectorStore
 
 runner = CliRunner()
 

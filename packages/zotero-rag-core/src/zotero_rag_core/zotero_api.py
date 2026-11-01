@@ -20,8 +20,8 @@ from pyzotero.zotero_errors import (
     RequestEntityTooLargeError,
 )
 
-from zotero_rag.config import Config
-from zotero_rag.errors import (
+from zotero_rag_core.config import Config
+from zotero_rag_core.errors import (
     AmbiguousCollectionError,
     CollectionNotFoundError,
     RejectedCredentialError,

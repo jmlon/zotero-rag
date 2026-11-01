@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from zotero_rag.snapshot import CollectionSnapshot
-from zotero_rag.zotero_api import CollectionNode
+from zotero_rag_core.zotero_api import CollectionNode
 
 #: The root label when a whole-library index has several top-level collections, or
 #: when there is no snapshot and no pinned collection name to show instead.

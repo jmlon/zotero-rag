@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pytest
 
-from zotero_rag.errors import AmbiguousCollectionError, CollectionNotFoundError
-from zotero_rag.zotero_api import (
+from zotero_rag_core.errors import AmbiguousCollectionError, CollectionNotFoundError
+from zotero_rag_core.zotero_api import (
     CollectionNode,
     build_collection_tree,
     collection_scope,

@@ -23,9 +23,9 @@ from pathlib import Path
 from pydantic import BaseModel, Field, computed_field
 
 from zotero_rag.config import Config
-from zotero_rag.embedding import count_tokens
-from zotero_rag.evaluation import EvalAggregate, QuestionOutcome
-from zotero_rag.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.embedding import count_tokens
+from zotero_rag_core.evaluation import EvalAggregate, QuestionOutcome
+from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
 
 EMBEDDINGS_DIRNAME = "embeddings"
 

@@ -13,10 +13,10 @@ from pathlib import Path
 import pytest
 
 from zotero_rag.config import Config, QualityThresholds, load_config
-from zotero_rag.documents import LocatorKind
-from zotero_rag.extraction import Segment
-from zotero_rag.markdown import body
 from zotero_rag.quality import QualityVerdict, assess
+from zotero_rag_core.documents import LocatorKind
+from zotero_rag_core.extraction import Segment
+from zotero_rag_core.markdown import body
 
 THRESHOLDS = QualityThresholds()
 

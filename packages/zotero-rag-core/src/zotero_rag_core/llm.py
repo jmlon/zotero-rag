@@ -14,9 +14,9 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, SecretStr
 
-from zotero_rag.config import Config
-from zotero_rag.embedding import MAX_RETRIES
-from zotero_rag.errors import ZoteroRagError
+from zotero_rag_core.config import Config
+from zotero_rag_core.embedding import MAX_RETRIES
+from zotero_rag_core.errors import ZoteroRagError
 
 logger = logging.getLogger(__name__)
 

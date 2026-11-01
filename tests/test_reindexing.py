@@ -14,16 +14,16 @@ from pathlib import Path
 import pytest
 
 from zotero_rag.config import Config
-from zotero_rag.fingerprint import StoreFingerprint
-from zotero_rag.indexer import (
+from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.indexer import (
     find_orphans,
     index_plan,
     needs_reindex,
     prune_orphans,
     repair_embeddings,
 )
-from zotero_rag.planning import IndexPlan, PlannedAttachment
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.planning import IndexPlan, PlannedAttachment
+from zotero_rag_core.vectorstore import VectorStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 

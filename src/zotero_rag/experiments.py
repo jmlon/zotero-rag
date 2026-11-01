@@ -32,8 +32,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, ValidationError
 
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.evaluation import EvalAggregate, QuestionOutcome, QuestionSet, RunSettings
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.evaluation import EvalAggregate, QuestionOutcome, QuestionSet, RunSettings
 
 logger = logging.getLogger(__name__)
 

@@ -6,7 +6,7 @@ from datetime import date
 
 import pytest
 
-from zotero_rag.provenance import HEADER, Provenance, parse
+from zotero_rag_core.provenance import HEADER, Provenance, parse
 
 MD5_A = "9e107d9d372bb6826bd81d3542a419d6"
 MD5_B = "e4d909c290d0fb1ca068ffaddf22cbd0"

@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from zotero_rag.config import Config
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.evaluation import (
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.evaluation import (
     EVIDENCE_COVERAGE,
     SCORES,
     Coverage,
@@ -39,8 +39,8 @@ from zotero_rag.evaluation import (
     retrieval_hit,
     run_settings,
 )
-from zotero_rag.querying import QueryResult, Source, Usage
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.querying import QueryResult, Source, Usage
+from zotero_rag_core.vectorstore import VectorStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -761,7 +761,7 @@ def test_the_judge_sees_every_passage_the_answer_was_written_from() -> None:
 
 def test_runs_record_that_the_judge_saw_the_passages(tmp_path: Path) -> None:
     from zotero_rag.config import Config
-    from zotero_rag.evaluation import JUDGE_PROTOCOL, run_settings
+    from zotero_rag_core.evaluation import JUDGE_PROTOCOL, run_settings
 
     settings = run_settings(Config(), VectorStore(tmp_path / "chroma"), 7, tmp_path / "q.yaml")
     assert settings.judge_protocol == JUDGE_PROTOCOL == "reference+passages"

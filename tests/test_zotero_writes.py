@@ -20,10 +20,10 @@ import pytest
 from pyzotero.zotero_errors import PreConditionFailedError, RequestEntityTooLargeError
 
 from zotero_rag.config import Config
-from zotero_rag.documents import DocumentFormat
-from zotero_rag.download import AttachmentDownloadError, ensure_cached
-from zotero_rag.errors import ZoteroApiError, ZoteroConflictError, ZoteroWriteAccessError
-from zotero_rag.zotero_api import (
+from zotero_rag_core.documents import DocumentFormat
+from zotero_rag_core.download import AttachmentDownloadError, ensure_cached
+from zotero_rag_core.errors import ZoteroApiError, ZoteroConflictError, ZoteroWriteAccessError
+from zotero_rag_core.zotero_api import (
     FileDownloader,
     create_markdown_attachment,
     fetch_annotated_attachments,
@@ -448,7 +448,7 @@ def test_the_cache_works_with_the_new_downloader(tmp_path: Path) -> None:
 
 
 def test_credentials_are_required_at_the_first_download_not_before() -> None:
-    from zotero_rag.errors import MissingCredentialError
+    from zotero_rag_core.errors import MissingCredentialError
 
     files = FileDownloader.from_config(Config())  # fine: maybe nothing needs fetching
 
@@ -458,7 +458,7 @@ def test_credentials_are_required_at_the_first_download_not_before() -> None:
 
 @pytest.mark.parametrize("status", [401, 403])
 def test_a_rejected_key_names_zotero_and_the_variable(status: int) -> None:
-    from zotero_rag.errors import RejectedCredentialError
+    from zotero_rag_core.errors import RejectedCredentialError
 
     files = FileDownloader(
         "user",

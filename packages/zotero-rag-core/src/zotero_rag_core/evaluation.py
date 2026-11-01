@@ -40,12 +40,12 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr, computed_field
 
-from zotero_rag.config import Config
-from zotero_rag.embedding import MAX_RETRIES
-from zotero_rag.errors import ZoteroRagError
-from zotero_rag.llm import cost_from_message, usage_from_message
-from zotero_rag.querying import QueryResult, Source
-from zotero_rag.vectorstore import VectorStore
+from zotero_rag_core.config import Config
+from zotero_rag_core.embedding import MAX_RETRIES
+from zotero_rag_core.errors import ZoteroRagError
+from zotero_rag_core.llm import cost_from_message, usage_from_message
+from zotero_rag_core.querying import QueryResult, Source
+from zotero_rag_core.vectorstore import VectorStore
 
 logger = logging.getLogger(__name__)
 

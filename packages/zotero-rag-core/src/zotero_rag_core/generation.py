@@ -43,11 +43,16 @@ from langchain_core.messages import AIMessage
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, SecretStr
 
-from zotero_rag.config import Config
-from zotero_rag.embedding import count_tokens
-from zotero_rag.evaluation import EvalQuestion, QuestionSetError, evidence_found, load_questions
-from zotero_rag.llm import usage_from_message
-from zotero_rag.vectorstore import StoredChunk, VectorStore, reading_order_key
+from zotero_rag_core.config import Config
+from zotero_rag_core.embedding import count_tokens
+from zotero_rag_core.evaluation import (
+    EvalQuestion,
+    QuestionSetError,
+    evidence_found,
+    load_questions,
+)
+from zotero_rag_core.llm import usage_from_message
+from zotero_rag_core.vectorstore import StoredChunk, VectorStore, reading_order_key
 
 logger = logging.getLogger(__name__)
 
