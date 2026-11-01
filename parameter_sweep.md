@@ -41,8 +41,29 @@ zotero-rag compare-embeddings --model openai/text-embedding-3-small \
 
 
 
+## Sweep the different embedding models
 
+```sh
+# Without reranker
+zotero-rag compare-embeddings --dry-run
+zotero-rag compare-embeddings --yes
 
+# With reranker
+zotero-rag compare-embeddings --reranker voyageai/rerank-3-lite --dry-run
+zotero-rag compare-embeddings --reranker voyageai/rerank-3-lite --yes
+```
+
+Reconstruct the baseline:
+Change model
+        embedding_model: qwen/qwen3-embedding-8b
+Reindex
+```sh
+zotero-rag index --force        
+```
+Re-run evaluation with new embedding and reranker
+```sh
+zotero-rag eval --reranker voyageai/rerank-3-lite
+```
 
 
 
