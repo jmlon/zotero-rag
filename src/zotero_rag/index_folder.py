@@ -8,6 +8,7 @@ stray write to the terminal would corrupt the screen.
 
 from __future__ import annotations
 
+import atexit
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,8 +23,13 @@ from zotero_rag_core.errors import (
 )
 from zotero_rag_core.fingerprint import StoreFingerprint, advisory, blocking
 from zotero_rag_core.reranking import RerankFn, build_reranker
-from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
+from zotero_rag_core.retrieval import BM25Searcher, KeywordSearcher, RetrievalMode
+from zotero_rag_core.store import ChunkStore, VectorStoreError
 from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
+
+#: Where `--store` may also be given, so a session can be pointed at one database.
+STORE_ENV = "ZOTERO_RAG_STORE"
+_POSTGRES_SCHEMES = ("postgres://", "postgresql://")
 
 REINDEX_REMEDY = (
     "Run `zotero-rag index --repair` to re-embed the affected chunks with the "
@@ -43,7 +49,7 @@ class Notice:
 NoticeFn = Callable[[Notice], None]
 
 
-def check_fingerprint(store: ChromaStore, config: Config, remedy: str, on_notice: NoticeFn) -> None:
+def check_fingerprint(store: ChunkStore, config: Config, remedy: str, on_notice: NoticeFn) -> None:
     """Compare what the store was built with against what the config now asks for.
 
     A store with no fingerprint predates M4: it is *adopted* rather than rejected,
@@ -74,25 +80,64 @@ def check_fingerprint(store: ChromaStore, config: Config, remedy: str, on_notice
         on_notice(Notice("warning", f"{mismatch}."))
 
 
-def open_index(on_notice: NoticeFn) -> tuple[Config, ChromaStore]:
-    """Load the index config and open its store, or explain what is missing."""
+def open_store(index_dir: Path, store_url: str | None, *, create: bool) -> ChunkStore:
+    """The folder's own Chroma store, or the PostgreSQL store at `store_url`.
+
+    With `create`, a database gets the tables the store needs (an idempotent DDL
+    script); only `index` asks for that, so a query never alters a database.
+    """
+    if not store_url:
+        return ChromaStore(index_dir / CHROMA_DIRNAME)
+    if not store_url.startswith(_POSTGRES_SCHEMES):
+        raise ConfigError(
+            "--store takes a PostgreSQL URL (postgresql://user:password@host/database); "
+            "leave it out to use this folder's own store."
+        )
+    # Imported here: psycopg is only loaded by the runs that use a database.
+    from zotero_rag_core.stores.pg import PgStore
+
+    store = PgStore.from_url(store_url, create=create)
+    # A command ends with the process; an open pool would complain at shutdown.
+    atexit.register(store.close)
+    return store
+
+
+def open_index(on_notice: NoticeFn, store_url: str | None = None) -> tuple[Config, ChunkStore]:
+    """Load the index config and open its store, or explain what is missing.
+
+    The folder is needed either way, for its `config.yaml`; `store_url` only
+    changes where the chunks are.
+    """
     config = load_config()
     if config.source_dir is None:
         raise NotAnIndexFolderError(
             f"No {CONFIG_FILENAME} in {Path.cwd()}. Run `zotero-rag init` here first, "
             "or change to an index folder."
         )
-    chroma_dir = config.source_dir / CHROMA_DIRNAME
-    if not ChromaStore.exists(chroma_dir):
-        raise NotIndexedError(
-            f"This index folder has no vector store yet ({chroma_dir} is empty). "
-            'Run `zotero-rag index --collection "NAME"` (or `--collection-key KEY`) first.'
-        )
-    store = ChromaStore(chroma_dir)
-    if store.count() == 0:
-        raise NotIndexedError(
-            "The vector store holds no chunks. Run `zotero-rag index` to populate it."
-        )
+    if store_url:
+        store = open_store(config.source_dir, store_url, create=False)
+        try:
+            count = store.count()
+        except VectorStoreError as exc:
+            raise NotIndexedError(
+                f"The database has no index yet ({exc}). Run `zotero-rag index --store URL` first."
+            ) from exc
+        if count == 0:
+            raise NotIndexedError(
+                "The database holds no chunks. Run `zotero-rag index --store URL` to populate it."
+            )
+    else:
+        chroma_dir = config.source_dir / CHROMA_DIRNAME
+        if not ChromaStore.exists(chroma_dir):
+            raise NotIndexedError(
+                f"This index folder has no vector store yet ({chroma_dir} is empty). "
+                'Run `zotero-rag index --collection "NAME"` (or `--collection-key KEY`) first.'
+            )
+        store = open_store(config.source_dir, None, create=False)
+        if store.count() == 0:
+            raise NotIndexedError(
+                "The vector store holds no chunks. Run `zotero-rag index` to populate it."
+            )
     # A question embedded by a different model than the store was built with cannot
     # retrieve meaningfully, so refuse rather than answer from nonsense neighbours.
     check_fingerprint(store, config, REINDEX_REMEDY, on_notice)
@@ -116,12 +161,18 @@ def resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | N
     return build_reranker(config, name), name
 
 
-def build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> BM25Searcher | None:
-    """The BM25 index, built once, or `None` for plain vector retrieval.
+def build_keyword_index(store: ChunkStore, mode: RetrievalMode) -> KeywordSearcher | None:
+    """The keyword half of hybrid retrieval, or `None` for plain vector retrieval.
 
-    Built by the caller rather than inside the query so a run over many questions
-    pays for it once; it is a tokenize pass over every chunk in the store.
+    A database searches its own full-text index. Otherwise BM25 is built here, once,
+    by the caller rather than inside the query, so a run over many questions pays
+    for it once; it is a tokenize pass over every chunk in the store.
     """
     if mode != "hybrid":
         return None
+    if not isinstance(store, ChromaStore):
+        from zotero_rag_core.stores.pg import PgFullTextSearcher, PgStore
+
+        if isinstance(store, PgStore):
+            return PgFullTextSearcher(store)
     return BM25Searcher.from_store(store)

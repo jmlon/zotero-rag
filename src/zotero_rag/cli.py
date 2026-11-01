@@ -81,10 +81,12 @@ from zotero_rag.experiments import (
 )
 from zotero_rag.index_folder import (
     REINDEX_REMEDY,
+    STORE_ENV,
     Notice,
     build_keyword_index,
     check_fingerprint,
     open_index,
+    open_store,
     resolve_reranker,
 )
 from zotero_rag.quality import QualityVerdict
@@ -162,8 +164,9 @@ from zotero_rag_core.planning import (
     item_membership,
 )
 from zotero_rag_core.querying import QueryResult, answer_question
-from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
-from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
+from zotero_rag_core.retrieval import KeywordSearcher, RetrievalMode
+from zotero_rag_core.store import ChunkStore
+from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import (
     CollectionNode,
     FileDownloader,
@@ -501,7 +504,7 @@ def _fetch_plan(
 def _run_index(
     plan: IndexPlan,
     config: Config,
-    store: ChromaStore,
+    store: ChunkStore,
     embeddings: Any,
     cache_dir: Path,
     jobs: int = 1,
@@ -542,7 +545,7 @@ def _run_index(
 
 
 def _print_index_summary(
-    plan: IndexPlan, stats: IndexStats, store: ChromaStore, verbose: bool
+    plan: IndexPlan, stats: IndexStats, store: ChunkStore, verbose: bool
 ) -> None:
     """Report what the run did, including everything it chose not to do."""
     console.print(
@@ -719,6 +722,7 @@ def index(
             min=1,
         ),
     ] = INDEX_JOBS,
+    store_url: StoreOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Index the PDF attachments of the pinned Zotero collection.
@@ -770,7 +774,7 @@ def index(
             )
             console.print(f"Pinned collection [bold]{escape(node.name)}[/bold] ({node.key})")
 
-        store = ChromaStore(index_dir / CHROMA_DIRNAME)
+        store = open_store(index_dir, store_url, create=True)
         embeddings = build_embeddings(config)
         cache_dir = index_dir / CACHE_DIRNAME
 
@@ -823,7 +827,7 @@ def index(
         )
 
 
-def _run_repair(store: ChromaStore, config: Config, embeddings: Any) -> None:
+def _run_repair(store: ChunkStore, config: Config, embeddings: Any) -> None:
     """Re-embed chunks written by a superseded model, from their stored text."""
     with err_console.status("[dim]Re-embedding chunks from a previous model...[/dim]"):
         stats = repair_embeddings(store, embeddings.embed_documents, config.embedding_model)
@@ -870,6 +874,20 @@ RetrievalOption = Annotated[
 ]
 
 
+StoreOption = Annotated[
+    str | None,
+    typer.Option(
+        "--store",
+        envvar=STORE_ENV,
+        # The URL carries a password: never echo a value taken from the environment.
+        show_default=False,
+        show_envvar=True,
+        help="Keep the chunks in the PostgreSQL database at this URL "
+        "(postgresql://user:password@host/database) instead of this folder's own store.",
+    ),
+]
+
+
 RerankerOption = Annotated[
     str | None,
     typer.Option(
@@ -880,7 +898,7 @@ RerankerOption = Annotated[
 ]
 
 
-def _build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> BM25Searcher | None:
+def _build_keyword_index(store: ChunkStore, mode: RetrievalMode) -> KeywordSearcher | None:
     """`build_keyword_index` behind a spinner, since it can take a moment."""
     if mode != "hybrid":
         return None
@@ -1589,6 +1607,7 @@ def query(
     as_json: Annotated[
         bool, typer.Option("--json", help="Emit a JSON object instead of formatted output.")
     ] = False,
+    store_url: StoreOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Answer a question from the index, with citations back to Zotero items.
@@ -1598,7 +1617,7 @@ def query(
     _enable_verbose(verbose)
 
     try:
-        config, store = open_index(_print_notice)
+        config, store = open_index(_print_notice, store_url)
         mode = retrieval if retrieval is not None else config.index.retrieval
         rerank, _ = resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
@@ -1926,6 +1945,7 @@ def eval_command(
         bool, typer.Option("--json", help="Emit the full report as JSON instead of a table.")
     ] = False,
     no_record: NoRecordOption = False,
+    store_url: StoreOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Score the index against a golden set of questions.
@@ -1937,7 +1957,7 @@ def eval_command(
     _enable_verbose(verbose)
 
     try:
-        config, store = open_index(_print_notice)
+        config, store = open_index(_print_notice, store_url)
         questions_path = resolve_questions_path(config, questions_file)
         question_set = load_question_set(questions_path)
         questions = _select_questions(question_set.questions, only or [])
@@ -2284,10 +2304,10 @@ def _build_variants(
 def _evaluate_variant(
     variant: Variant,
     config: Config,
-    store: ChromaStore | None,
+    store: ChunkStore | None,
     stats: IndexStats | None,
     build_error: str,
-    evaluate_with: Callable[[ChromaStore, Config], list[QuestionOutcome]],
+    evaluate_with: Callable[[ChunkStore, Config], list[QuestionOutcome]],
 ) -> VariantResult:
     """Score one variant. Any failure is recorded on its row, never raised.
 
@@ -2667,7 +2687,7 @@ def compare_embeddings_command(
                 variant, task = variants[position], tasks[position]
                 progress.start_task(task)
 
-                def evaluate_with(store: ChromaStore, settings: Config) -> list[QuestionOutcome]:
+                def evaluate_with(store: ChunkStore, settings: Config) -> list[QuestionOutcome]:
                     embeddings = build_embeddings(settings)
                     keyword_index = build_keyword_index(store, mode)
 
@@ -2934,6 +2954,7 @@ def generate_questions_command(
     assume_yes: Annotated[
         bool, typer.Option("--yes", "-y", help="Skip the confirmation on a large collection.")
     ] = False,
+    store_url: StoreOption = None,
     verbose: VerboseOption = False,
 ) -> None:
     """Write a starting questions.yaml from the documents already indexed.
@@ -2945,7 +2966,7 @@ def generate_questions_command(
     _enable_verbose(verbose)
 
     try:
-        config, store = open_index(_print_notice)
+        config, store = open_index(_print_notice, store_url)
         count = per_document if per_document is not None else config.eval.questions_per_document
         documents = _select_documents(
             collect_documents(store, config.eval.document_char_budget),

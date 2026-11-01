@@ -750,6 +750,24 @@ changed.
 
 Settings resolve as **CLI flag → the folder's `config.yaml` → packaged defaults**.
 
+### Keeping the chunks in PostgreSQL
+
+`index`, `query`, `eval` and `generate-questions` accept `--store` with a
+PostgreSQL URL, to keep the chunks in a database with the
+[pgvector](https://github.com/pgvector/pgvector) extension instead of the folder's
+`chroma/`:
+
+```bash
+export ZOTERO_RAG_STORE=postgresql://user:password@host/database   # or pass --store
+zotero-rag index        # creates the tables on first use
+zotero-rag eval         # grades the database's retrieval with this folder's questions
+```
+
+The folder still supplies `config.yaml` and the question sets. This is how a shared
+deployment such as `zotero-rag-web` is measured with the same `eval` as an index
+folder. Keyword search then runs in the database (full-text search over the same
+tokens BM25 uses) instead of being rebuilt in memory at start-up.
+
 ## What lives in an index folder
 
 ```

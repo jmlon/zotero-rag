@@ -29,9 +29,8 @@ from zotero_rag_core.querying import (
     stream_answer_question,
 )
 from zotero_rag_core.reranking import RerankFn
-from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
-from zotero_rag_core.store import Filters
-from zotero_rag_core.stores.chroma import ChromaStore
+from zotero_rag_core.retrieval import KeywordSearcher, RetrievalMode
+from zotero_rag_core.store import ChunkStore, Filters
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +71,7 @@ class QuerySession:
     def __init__(
         self,
         *,
-        store: ChromaStore,
+        store: ChunkStore,
         settings: QuerySettings,
         embed_query: QuestionEmbedder,
         stream: StreamingAnswerer,
@@ -91,7 +90,7 @@ class QuerySession:
         self._embed_query = embed_query
         self._stream = stream
         self._rerank = rerank
-        self._keyword_index: BM25Searcher | None = None
+        self._keyword_index: KeywordSearcher | None = None
         self._keyword_error: Exception | None = None
         self._keyword_ready = threading.Event()
         if not self.needs_keyword_index:

@@ -26,6 +26,7 @@ from zotero_rag_core.generation import DocumentText, GeneratedQuestion, RawGener
 from zotero_rag_core.indexer import IndexStats
 from zotero_rag_core.planning import IndexPlan, PlannedAttachment, SkippedEntry, SkipReason
 from zotero_rag_core.querying import QueryResult, Source, Usage
+from zotero_rag_core.retrieval import BM25Searcher
 from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import CollectionNode
 
@@ -1095,13 +1096,13 @@ def test_hybrid_builds_the_keyword_index_once_per_eval_run(
     _stub_seams(monkeypatch)
     builds: list[int] = []
 
-    real = cli.BM25Searcher.from_store
+    real = BM25Searcher.from_store
 
     def counted(store: object) -> object:
         builds.append(1)
         return real(store)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(cli.BM25Searcher, "from_store", staticmethod(counted))
+    monkeypatch.setattr(BM25Searcher, "from_store", staticmethod(counted))
 
     result = runner.invoke(cli.app, ["eval", "--retrieval", "hybrid", "--json"])
 
@@ -1120,7 +1121,7 @@ def test_vector_mode_builds_no_keyword_index(
     def must_not_build(store: object) -> object:
         raise AssertionError("vector retrieval built a keyword index")
 
-    monkeypatch.setattr(cli.BM25Searcher, "from_store", staticmethod(must_not_build))
+    monkeypatch.setattr(BM25Searcher, "from_store", staticmethod(must_not_build))
 
     assert runner.invoke(cli.app, ["eval", "--retrieval", "vector"]).exit_code == 0
 
