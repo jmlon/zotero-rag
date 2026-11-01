@@ -30,7 +30,8 @@ from zotero_rag_core.querying import (
 )
 from zotero_rag_core.reranking import RerankFn
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag_core.vectorstore import Scope, VectorStore
+from zotero_rag_core.store import Scope
+from zotero_rag_core.stores.chroma import ChromaStore
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +72,7 @@ class QuerySession:
     def __init__(
         self,
         *,
-        store: VectorStore,
+        store: ChromaStore,
         settings: QuerySettings,
         embed_query: QuestionEmbedder,
         stream: StreamingAnswerer,

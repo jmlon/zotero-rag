@@ -22,7 +22,8 @@ from zotero_rag_core.planning import (
     resolve_preference,
 )
 from zotero_rag_core.querying import Source, collect_sources
-from zotero_rag_core.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.store import StoredChunk
+from zotero_rag_core.stores.chroma import ChromaStore
 
 FileFactory = Callable[[str, bytes | str], Path]
 
@@ -217,7 +218,7 @@ def test_a_snapshot_is_indexed_with_section_locators(
         "<h2>Architecture</h2><p>Nodes at the edge.</p></body></html>",
     )
     plan = build_plan([("C", [item(), attachment("SNAP", DocumentFormat.HTML)])])
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
 
     stats = index_plan(
         plan,
@@ -251,7 +252,7 @@ def test_a_note_is_indexed_without_any_download(tmp_path: Path) -> None:
         },
     }
     plan = build_plan([("C", [item(), note])])
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
 
     def refuse_download(key: str) -> Path:
         raise AssertionError(f"a note must not be downloaded (asked for {key})")

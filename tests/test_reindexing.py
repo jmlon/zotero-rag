@@ -23,7 +23,7 @@ from zotero_rag_core.indexer import (
     repair_embeddings,
 )
 from zotero_rag_core.planning import IndexPlan, PlannedAttachment
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 
@@ -55,12 +55,12 @@ def embed_4d(texts: list[str]) -> list[list[float]]:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> VectorStore:
-    return VectorStore(tmp_path / "chroma")
+def store(tmp_path: Path) -> ChromaStore:
+    return ChromaStore(tmp_path / "chroma")
 
 
 def run_index(
-    store: VectorStore,
+    store: ChromaStore,
     attachments: list[PlannedAttachment],
     pdf: Path,
     model: str = MODEL_A,
@@ -81,7 +81,7 @@ def run_index(
 
 
 def test_chunks_record_the_model_and_the_attachment_version(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """These two fields are what make repair and version-aware reindexing possible."""
     run_index(store, [planned(version=7)], pdf_factory("doc.pdf", ["Only page"]))
@@ -90,7 +90,7 @@ def test_chunks_record_the_model_and_the_attachment_version(
     assert metadata["attachment_version"] == 7
 
 
-def test_the_store_records_and_returns_its_fingerprint(store: VectorStore) -> None:
+def test_the_store_records_and_returns_its_fingerprint(store: ChromaStore) -> None:
     store.write_fingerprint(StoreFingerprint.intended(Config(), embedding_dim=3))
     recorded = store.read_fingerprint()
     assert recorded is not None
@@ -101,13 +101,13 @@ def test_the_store_records_and_returns_its_fingerprint(store: VectorStore) -> No
 def test_fingerprint_survives_reopening_the_store(tmp_path: Path) -> None:
     """It has to outlive the process, or it guards nothing."""
     directory = tmp_path / "chroma"
-    VectorStore(directory).write_fingerprint(StoreFingerprint(embedding_model="x/y"))
-    reopened = VectorStore(directory).read_fingerprint()
+    ChromaStore(directory).write_fingerprint(StoreFingerprint(embedding_model="x/y"))
+    reopened = ChromaStore(directory).read_fingerprint()
     assert reopened is not None and reopened.embedding_model == "x/y"
 
 
 def test_dimension_is_derived_from_the_data_not_the_record(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """The one fact that cannot be forged by editing a file."""
     assert store.derived_dimension() is None
@@ -119,7 +119,7 @@ def test_dimension_is_derived_from_the_data_not_the_record(
 
 
 def test_unchanged_attachments_are_still_skipped(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["Some text"])
     run_index(store, [planned(version=5)], pdf)
@@ -129,7 +129,7 @@ def test_unchanged_attachments_are_still_skipped(
 
 
 def test_a_newer_zotero_version_triggers_reindexing(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """Acceptance for §11.1: a PDF replaced in Zotero is picked up."""
     run_index(store, [planned(version=5)], pdf_factory("old.pdf", ["Original text"]))
@@ -146,7 +146,7 @@ def test_a_newer_zotero_version_triggers_reindexing(
 
 
 def test_reindexing_drops_the_pages_the_replacement_no_longer_has(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """Without deleting first, a shorter replacement leaves orphaned tail pages."""
     run_index(store, [planned(version=1)], pdf_factory("long.pdf", ["One", "Two", "Three"]))
@@ -159,7 +159,7 @@ def test_reindexing_drops_the_pages_the_replacement_no_longer_has(
 
 
 def test_an_older_version_never_downgrades_the_store(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     run_index(store, [planned(version=9)], pdf_factory("doc.pdf", ["Newer"]))
     stats = run_index(store, [planned(version=4)], pdf_factory("other.pdf", ["Older"]))
@@ -168,7 +168,7 @@ def test_an_older_version_never_downgrades_the_store(
 
 
 def test_chunks_predating_version_tracking_are_left_alone(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """Upgrading must not silently re-embed every existing store."""
     run_index(store, [planned(version=0)], pdf_factory("doc.pdf", ["Text"]))
@@ -178,7 +178,7 @@ def test_chunks_predating_version_tracking_are_left_alone(
     assert needs_reindex(store, planned(version=3))
 
 
-def test_needs_reindex_is_false_for_an_attachment_never_stored(store: VectorStore) -> None:
+def test_needs_reindex_is_false_for_an_attachment_never_stored(store: ChromaStore) -> None:
     assert not needs_reindex(store, planned(version=99))
 
 
@@ -186,7 +186,7 @@ def test_needs_reindex_is_false_for_an_attachment_never_stored(store: VectorStor
 
 
 def test_orphans_are_the_attachments_the_collection_no_longer_has(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["Text"])
     run_index(store, [planned("KEEP"), planned("GONE")], pdf)
@@ -197,7 +197,7 @@ def test_orphans_are_the_attachments_the_collection_no_longer_has(
 
 
 def test_pruning_removes_only_the_orphaned_chunks(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["One", "Two"])
     run_index(store, [planned("KEEP"), planned("GONE")], pdf)
@@ -210,7 +210,7 @@ def test_pruning_removes_only_the_orphaned_chunks(
     assert store.attachment_keys() == {"KEEP"}
 
 
-def test_nothing_to_prune_is_a_no_op(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_nothing_to_prune_is_a_no_op(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     run_index(store, [planned("KEEP")], pdf_factory("doc.pdf", ["Text"]))
     assert prune_orphans(store, IndexPlan(attachments=[planned("KEEP")])) == (0, 0)
     assert store.count() == 1
@@ -220,7 +220,7 @@ def test_nothing_to_prune_is_a_no_op(store: VectorStore, pdf_factory: PdfFactory
 
 
 def test_repair_re_embeds_only_the_stale_chunks(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """The remedy for an edited `embedding_model`: no download, no re-chunking."""
     pdf = pdf_factory("doc.pdf", ["Page one", "Page two"])
@@ -243,7 +243,7 @@ def test_repair_re_embeds_only_the_stale_chunks(
     assert [len(batch) for batch in embedded] == [1, 2]
 
 
-def test_repair_preserves_ids_and_text(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_repair_preserves_ids_and_text(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     """Chunk boundaries must survive: repair is not a re-chunk."""
     run_index(store, [planned()], pdf_factory("doc.pdf", ["Page one", "Page two"]), model=MODEL_A)
     before = {chunk.id: chunk.text for chunk in store.get_by_attachment("ATT1")}
@@ -256,7 +256,7 @@ def test_repair_preserves_ids_and_text(store: VectorStore, pdf_factory: PdfFacto
 
 
 def test_repair_rebuilds_the_store_when_the_width_changes(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """A collection's dimension is fixed once written, so in-place upsert cannot work."""
     run_index(store, [planned()], pdf_factory("doc.pdf", ["Page one", "Page two"]), model=MODEL_A)
@@ -273,7 +273,7 @@ def test_repair_rebuilds_the_store_when_the_width_changes(
 
 
 def test_repair_treats_untagged_chunks_as_stale(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """Pre-M4 chunks carry no model, and an unknown model cannot be assumed current.
 
@@ -288,7 +288,7 @@ def test_repair_treats_untagged_chunks_as_stale(
 
 
 def test_repair_is_a_no_op_when_everything_matches(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     run_index(store, [planned()], pdf_factory("doc.pdf", ["Text"]), model=MODEL_A)
     calls: list[list[str]] = []
@@ -299,7 +299,7 @@ def test_repair_is_a_no_op_when_everything_matches(
     assert calls == []  # not even the dimension probe
 
 
-def test_repair_on_an_empty_store_does_nothing(store: VectorStore) -> None:
+def test_repair_on_an_empty_store_does_nothing(store: ChromaStore) -> None:
     assert repair_embeddings(store, embed_3d, MODEL_A).repaired == 0
 
 
@@ -307,7 +307,7 @@ def test_repair_on_an_empty_store_does_nothing(store: VectorStore) -> None:
 
 
 def test_reset_empties_the_store_but_keeps_it_usable(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["Text"])
     run_index(store, [planned()], pdf)
@@ -321,7 +321,7 @@ def test_reset_empties_the_store_but_keeps_it_usable(
     assert store.count() == 1
 
 
-def test_reset_allows_a_different_vector_width(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_reset_allows_a_different_vector_width(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     """This is why `--force` exists as well as `--repair`."""
     pdf = pdf_factory("doc.pdf", ["Text"])
     run_index(store, [planned()], pdf, model=MODEL_A, embed=embed_3d)

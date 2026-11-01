@@ -22,7 +22,7 @@ from zotero_rag_core.embedding import count_tokens
 from zotero_rag_core.errors import ZoteroRagError
 from zotero_rag_core.extraction import extract_note, extract_segments
 from zotero_rag_core.planning import IndexPlan, PlannedAttachment, SkipReason
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.store import ChunkStore
 
 logger = logging.getLogger(__name__)
 
@@ -83,7 +83,7 @@ def chunk_id(attachment_key: str, locator: int, chunk_index: int) -> str:
     return f"{attachment_key}:{locator}:{chunk_index}"
 
 
-def needs_reindex(store: VectorStore, attachment: PlannedAttachment) -> bool:
+def needs_reindex(store: ChunkStore, attachment: PlannedAttachment) -> bool:
     """True when an already-stored attachment has changed in Zotero since indexing.
 
     Zotero bumps an attachment's `version` when its file or metadata changes, so a
@@ -100,7 +100,7 @@ def needs_reindex(store: VectorStore, attachment: PlannedAttachment) -> bool:
 
 def index_plan(
     plan: IndexPlan,
-    store: VectorStore,
+    store: ChunkStore,
     download: Downloader,
     embed: Embedder,
     chunk_size: int,
@@ -235,7 +235,7 @@ def _prepare_attachment(
 def _store_attachment(
     attachment: PlannedAttachment,
     prepared: _Prepared,
-    store: VectorStore,
+    store: ChunkStore,
     embedding_model: str,
     stats: IndexStats,
 ) -> None:
@@ -260,7 +260,7 @@ def _store_attachment(
     stats.embedding_tokens += prepared.tokens
 
 
-def find_orphans(store: VectorStore, plan: IndexPlan) -> set[str]:
+def find_orphans(store: ChunkStore, plan: IndexPlan) -> set[str]:
     """Attachment keys in the store that the collection no longer contains.
 
     One mechanism covers three cases the PRD listed separately: an item deleted in
@@ -272,7 +272,7 @@ def find_orphans(store: VectorStore, plan: IndexPlan) -> set[str]:
     return store.attachment_keys() - planned
 
 
-def prune_orphans(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
+def prune_orphans(store: ChunkStore, plan: IndexPlan) -> tuple[int, int]:
     """Delete chunks of attachments no longer in the collection.
 
     Returns (attachments removed, chunks removed).
@@ -284,7 +284,7 @@ def prune_orphans(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
     return len(orphans), chunks
 
 
-def drop_replaced_copies(store: VectorStore, plan: IndexPlan) -> tuple[int, int]:
+def drop_replaced_copies(store: ChunkStore, plan: IndexPlan) -> tuple[int, int]:
     """Delete chunks of a document's copy that its other copy now replaces.
 
     When the preference switches a converted document from its PDF to its
@@ -307,7 +307,7 @@ def drop_replaced_copies(store: VectorStore, plan: IndexPlan) -> tuple[int, int]
     return len(replaced), chunks
 
 
-def refresh_collection_keys(store: VectorStore, plan: IndexPlan) -> int:
+def refresh_collection_keys(store: ChunkStore, plan: IndexPlan) -> int:
     """Bring each stored attachment's `collection_keys` in line with the plan.
 
     Moving an item between folders in Zotero does not bump its attachment's version,
@@ -331,7 +331,7 @@ def refresh_collection_keys(store: VectorStore, plan: IndexPlan) -> int:
 
 
 def repair_embeddings(
-    store: VectorStore,
+    store: ChunkStore,
     embed: Embedder,
     embedding_model: str,
 ) -> RepairStats:

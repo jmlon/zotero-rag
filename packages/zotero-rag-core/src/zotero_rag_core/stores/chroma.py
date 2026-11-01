@@ -1,4 +1,4 @@
-"""Persistent Chroma vector store.
+"""The persistent Chroma store an index folder keeps: a `ChunkStore`.
 
 chromadb is used directly rather than through a LangChain wrapper. Embeddings
 are always supplied by us, so the collection is created with no embedding
@@ -8,55 +8,20 @@ function at all — that keeps Chroma's bundled ONNX model from ever loading.
 from __future__ import annotations
 
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection
 from pathlib import Path
 from typing import Any, cast
 
 import chromadb
 from chromadb.config import Settings
-from pydantic import BaseModel, Field
 
-from zotero_rag_core.errors import ZoteroRagError
 from zotero_rag_core.fingerprint import StoreFingerprint
+from zotero_rag_core.store import Scope, StoredChunk, VectorStoreError, reading_order_key
 
 logger = logging.getLogger(__name__)
 
 CHROMA_DIRNAME = "chroma"
 COLLECTION_NAME = "zotero_rag"
-
-
-class StoredChunk(BaseModel):
-    """A chunk read back out of the store, with its citation metadata."""
-
-    id: str
-    text: str
-    metadata: dict[str, Any] = Field(default_factory=dict)
-    distance: float | None = None
-
-
-class VectorStoreError(ZoteroRagError):
-    """The vector store could not be opened or written."""
-
-
-def reading_order_key(chunk: StoredChunk) -> tuple[str, int, int]:
-    """Where a chunk sits in its document: attachment, locator ordinal, chunk index.
-
-    Chunk ids are `<attachment_key>:<locator>:<chunk_index>`, so sorting the *ids*
-    as strings puts page 10 before page 2 and hands the reader a scrambled document.
-    Reading order has to come from the numeric metadata instead.
-    """
-
-    def number(field: str) -> int:
-        try:
-            return int(str(chunk.metadata.get(field)))
-        except (TypeError, ValueError):
-            return 0
-
-    return str(chunk.metadata.get("attachment_key") or ""), number("page"), number("chunk_index")
-
-
-#: Collection keys a search is limited to; `None` searches the whole store.
-Scope = Collection[str] | None
 
 
 def scope_where(scope: Collection[str]) -> dict[str, Any]:
@@ -74,19 +39,7 @@ def scope_where(scope: Collection[str]) -> dict[str, Any]:
     return clauses[0] if len(clauses) == 1 else {"$or": clauses}
 
 
-def in_scope(metadata: Mapping[str, Any], scope: Scope) -> bool:
-    """Whether a chunk belongs to `scope`. The same rule as `scope_where`, in Python.
-
-    A chunk with no `collection_keys` (written before they existed) is outside every
-    scope, but inside an unscoped search.
-    """
-    if scope is None:
-        return True
-    keys = metadata.get("collection_keys")
-    return isinstance(keys, list) and not set(scope).isdisjoint(keys)
-
-
-class VectorStore:
+class ChromaStore:
     """Thin wrapper over one persistent Chroma collection."""
 
     def __init__(self, directory: Path) -> None:

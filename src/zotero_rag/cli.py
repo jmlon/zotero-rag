@@ -163,7 +163,7 @@ from zotero_rag_core.planning import (
 )
 from zotero_rag_core.querying import QueryResult, answer_question
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
 from zotero_rag_core.zotero_api import (
     CollectionNode,
     FileDownloader,
@@ -490,7 +490,7 @@ def _fetch_plan(
 def _run_index(
     plan: IndexPlan,
     config: Config,
-    store: VectorStore,
+    store: ChromaStore,
     embeddings: Any,
     cache_dir: Path,
     jobs: int = 1,
@@ -531,7 +531,7 @@ def _run_index(
 
 
 def _print_index_summary(
-    plan: IndexPlan, stats: IndexStats, store: VectorStore, verbose: bool
+    plan: IndexPlan, stats: IndexStats, store: ChromaStore, verbose: bool
 ) -> None:
     """Report what the run did, including everything it chose not to do."""
     console.print(
@@ -759,7 +759,7 @@ def index(
             )
             console.print(f"Pinned collection [bold]{escape(node.name)}[/bold] ({node.key})")
 
-        store = VectorStore(index_dir / CHROMA_DIRNAME)
+        store = ChromaStore(index_dir / CHROMA_DIRNAME)
         embeddings = build_embeddings(config)
         cache_dir = index_dir / CACHE_DIRNAME
 
@@ -812,7 +812,7 @@ def index(
         )
 
 
-def _run_repair(store: VectorStore, config: Config, embeddings: Any) -> None:
+def _run_repair(store: ChromaStore, config: Config, embeddings: Any) -> None:
     """Re-embed chunks written by a superseded model, from their stored text."""
     with err_console.status("[dim]Re-embedding chunks from a previous model...[/dim]"):
         stats = repair_embeddings(store, embeddings.embed_documents, config.embedding_model)
@@ -869,7 +869,7 @@ RerankerOption = Annotated[
 ]
 
 
-def _build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:
+def _build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> KeywordIndex | None:
     """`build_keyword_index` behind a spinner, since it can take a moment."""
     if mode != "hybrid":
         return None
@@ -2015,7 +2015,7 @@ def _money(value: float | None) -> str:
 
 def _stored_chunks(directory: Path) -> int:
     """Chunks in the store at `directory`, without creating one where there is none."""
-    return VectorStore(directory).count() if VectorStore.exists(directory) else 0
+    return ChromaStore(directory).count() if ChromaStore.exists(directory) else 0
 
 
 def _variant_remedy(variant: Variant) -> str:
@@ -2104,7 +2104,7 @@ def _build_variant(
     plan: IndexPlan,
     config: Config,
     variant: Variant,
-    store: VectorStore,
+    store: ChromaStore,
     download: Callable[[str], Path],
     on_start: Callable[[PlannedAttachment], None],
 ) -> IndexStats:
@@ -2185,11 +2185,11 @@ def _build_variants(
 
     built: dict[Path, IndexStats] = {}
     errors: dict[Path, str] = {}
-    stores: dict[Path, VectorStore] = {}
+    stores: dict[Path, ChromaStore] = {}
     by_model: dict[str, list[Variant]] = {}
     for variant in to_build:
         try:
-            store = VectorStore(variant.store_dir)
+            store = ChromaStore(variant.store_dir)
             check_fingerprint(
                 store, variant_config(config, variant), _variant_remedy(variant), _print_notice
             )
@@ -2273,10 +2273,10 @@ def _build_variants(
 def _evaluate_variant(
     variant: Variant,
     config: Config,
-    store: VectorStore | None,
+    store: ChromaStore | None,
     stats: IndexStats | None,
     build_error: str,
-    evaluate_with: Callable[[VectorStore, Config], list[QuestionOutcome]],
+    evaluate_with: Callable[[ChromaStore, Config], list[QuestionOutcome]],
 ) -> VariantResult:
     """Score one variant. Any failure is recorded on its row, never raised.
 
@@ -2631,7 +2631,7 @@ def compare_embeddings_command(
         stores = {
             variant.store_dir: baseline_store
             if variant.baseline
-            else VectorStore(variant.store_dir)
+            else ChromaStore(variant.store_dir)
             for variant in variants
             if variant.baseline or _stored_chunks(variant.store_dir)
         }
@@ -2656,7 +2656,7 @@ def compare_embeddings_command(
                 variant, task = variants[position], tasks[position]
                 progress.start_task(task)
 
-                def evaluate_with(store: VectorStore, settings: Config) -> list[QuestionOutcome]:
+                def evaluate_with(store: ChromaStore, settings: Config) -> list[QuestionOutcome]:
                     embeddings = build_embeddings(settings)
                     keyword_index = build_keyword_index(store, mode)
 

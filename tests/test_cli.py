@@ -26,7 +26,7 @@ from zotero_rag_core.generation import DocumentText, GeneratedQuestion, RawGener
 from zotero_rag_core.indexer import IndexStats
 from zotero_rag_core.planning import IndexPlan, PlannedAttachment, SkippedEntry, SkipReason
 from zotero_rag_core.querying import QueryResult, Source, Usage
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import CollectionNode
 
 runner = CliRunner()
@@ -102,7 +102,7 @@ def test_index_summary_reports_items_seen(tmp_path: Path) -> None:
     out = StringIO()
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(cli, "console", Console(file=out, width=200, no_color=True))
-        cli._print_index_summary(plan, stats, VectorStore(tmp_path / "chroma"), verbose=False)
+        cli._print_index_summary(plan, stats, ChromaStore(tmp_path / "chroma"), verbose=False)
     text = out.getvalue()
     assert "Indexed 4 documents" in text
     assert "146 chunks from 22 pages" in text  # all PDFs, so "pages" is right
@@ -195,9 +195,9 @@ def test_query_in_a_never_indexed_folder_points_at_index(
     assert "OPENROUTER" not in result.output
 
 
-def _populated_store(directory: Path, model: str, fingerprint: bool = True) -> VectorStore:
+def _populated_store(directory: Path, model: str, fingerprint: bool = True) -> ChromaStore:
     """A store holding one chunk, optionally fingerprinted with `model`."""
-    store = VectorStore(directory / "chroma")
+    store = ChromaStore(directory / "chroma")
     store.add(
         ids=["A:1:0"],
         embeddings=[[1.0, 0.0, 0.5]],
@@ -523,7 +523,7 @@ def test_depth_limit_hides_deeper_levels_and_says_how_many() -> None:
 
 def _eval_index_folder(tmp_path: Path, questions: str) -> None:
     """An index folder holding one indexed chunk and a golden set."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     config = Config()
     store.add(
         ids=["ATT1:1:0"],
@@ -719,7 +719,7 @@ def test_eval_assess_context_adds_the_retrieval_verdict(
 
 def _generation_index_folder(tmp_path: Path, documents: int = 1) -> None:
     """An index folder with `documents` indexed items and no question set yet."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     config = Config()
     for number in range(1, documents + 1):
         store.add(
@@ -1340,7 +1340,7 @@ def test_index_records_folder_membership_and_writes_the_snapshot(
     result = runner.invoke(cli.app, ["index"])
     assert result.exit_code == 0, result.output
 
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     assert store.collection_keys_by_attachment() == {
         "NP1": ["QUIC", "ROUTING"],  # one item, two folders
         "NP2": ["QUIC"],
@@ -1362,7 +1362,7 @@ def test_index_backfills_a_store_written_before_membership_existed(
     assert runner.invoke(cli.app, ["index"]).exit_code == 0
 
     # Make the store look like one indexed by 0.4.x: chunks, no keys, no snapshot.
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     old = store.all_chunks()
     store.delete_ids([chunk.id for chunk in old])
     store.add(
@@ -1379,7 +1379,7 @@ def test_index_backfills_a_store_written_before_membership_existed(
 
     assert result.exit_code == 0, result.output
     assert "Updated the folder membership of 1 attachment (no re-embedding)" in result.output
-    assert VectorStore(tmp_path / "chroma").collection_keys_by_attachment() == {"NP1": ["ROUTING"]}
+    assert ChromaStore(tmp_path / "chroma").collection_keys_by_attachment() == {"NP1": ["ROUTING"]}
     assert read_snapshot(tmp_path) is not None
 
 

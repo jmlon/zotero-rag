@@ -32,7 +32,7 @@ import httpx
 from zotero_rag_core.config import COHERE_RERANKER, Config
 from zotero_rag_core.embedding import MAX_RETRIES
 from zotero_rag_core.errors import ZoteroRagError
-from zotero_rag_core.vectorstore import StoredChunk
+from zotero_rag_core.store import StoredChunk
 
 logger = logging.getLogger(__name__)
 

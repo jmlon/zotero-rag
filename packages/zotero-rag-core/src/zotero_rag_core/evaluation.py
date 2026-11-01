@@ -45,7 +45,7 @@ from zotero_rag_core.embedding import MAX_RETRIES
 from zotero_rag_core.errors import ZoteroRagError
 from zotero_rag_core.llm import cost_from_message, usage_from_message
 from zotero_rag_core.querying import QueryResult, Source
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.store import ChunkStore
 
 logger = logging.getLogger(__name__)
 
@@ -1071,7 +1071,7 @@ class RunSettings(BaseModel):
 
 def run_settings(
     config: Config,
-    store: VectorStore,
+    store: ChunkStore,
     top_k: int,
     questions_path: Path,
     window: int = 0,

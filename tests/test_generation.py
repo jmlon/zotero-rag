@@ -33,12 +33,12 @@ from zotero_rag_core.generation import (
     to_questions,
     write_questions,
 )
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 
-def store_with(tmp_path: Path, chunks: list[dict[str, object]]) -> VectorStore:
+def store_with(tmp_path: Path, chunks: list[dict[str, object]]) -> ChromaStore:
     """A store holding the given chunks; `text` and metadata per entry."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=[str(chunk["id"]) for chunk in chunks],
         embeddings=[[1.0, 0.0, 0.5] for _ in chunks],

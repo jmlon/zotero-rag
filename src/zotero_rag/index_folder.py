@@ -23,7 +23,7 @@ from zotero_rag_core.errors import (
 from zotero_rag_core.fingerprint import StoreFingerprint, advisory, blocking
 from zotero_rag_core.reranking import RerankFn, build_reranker
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
 
 REINDEX_REMEDY = (
     "Run `zotero-rag index --repair` to re-embed the affected chunks with the "
@@ -43,7 +43,7 @@ class Notice:
 NoticeFn = Callable[[Notice], None]
 
 
-def check_fingerprint(store: VectorStore, config: Config, remedy: str, on_notice: NoticeFn) -> None:
+def check_fingerprint(store: ChromaStore, config: Config, remedy: str, on_notice: NoticeFn) -> None:
     """Compare what the store was built with against what the config now asks for.
 
     A store with no fingerprint predates M4: it is *adopted* rather than rejected,
@@ -74,7 +74,7 @@ def check_fingerprint(store: VectorStore, config: Config, remedy: str, on_notice
         on_notice(Notice("warning", f"{mismatch}."))
 
 
-def open_index(on_notice: NoticeFn) -> tuple[Config, VectorStore]:
+def open_index(on_notice: NoticeFn) -> tuple[Config, ChromaStore]:
     """Load the index config and open its store, or explain what is missing."""
     config = load_config()
     if config.source_dir is None:
@@ -83,12 +83,12 @@ def open_index(on_notice: NoticeFn) -> tuple[Config, VectorStore]:
             "or change to an index folder."
         )
     chroma_dir = config.source_dir / CHROMA_DIRNAME
-    if not VectorStore.exists(chroma_dir):
+    if not ChromaStore.exists(chroma_dir):
         raise NotIndexedError(
             f"This index folder has no vector store yet ({chroma_dir} is empty). "
             'Run `zotero-rag index --collection "NAME"` (or `--collection-key KEY`) first.'
         )
-    store = VectorStore(chroma_dir)
+    store = ChromaStore(chroma_dir)
     if store.count() == 0:
         raise NotIndexedError(
             "The vector store holds no chunks. Run `zotero-rag index` to populate it."
@@ -116,7 +116,7 @@ def resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | N
     return build_reranker(config, name), name
 
 
-def build_keyword_index(store: VectorStore, mode: RetrievalMode) -> KeywordIndex | None:
+def build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> KeywordIndex | None:
     """The BM25 index, built once, or `None` for plain vector retrieval.
 
     Built by the caller rather than inside the query so a run over many questions

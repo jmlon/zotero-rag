@@ -13,7 +13,7 @@ import pytest
 
 from zotero_rag_core.indexer import chunk_id, index_plan
 from zotero_rag_core.planning import IndexPlan, PlannedAttachment
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 
@@ -37,11 +37,11 @@ def fake_embed(texts: list[str]) -> list[list[float]]:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> VectorStore:
-    return VectorStore(tmp_path / "chroma")
+def store(tmp_path: Path) -> ChromaStore:
+    return ChromaStore(tmp_path / "chroma")
 
 
-def test_indexes_an_attachment_end_to_end(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_indexes_an_attachment_end_to_end(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     pdf = pdf_factory("doc.pdf", ["Page one text", "Page two text"])
     plan = IndexPlan(attachments=[planned()])
 
@@ -63,7 +63,7 @@ def test_indexes_an_attachment_end_to_end(store: VectorStore, pdf_factory: PdfFa
 
 
 def test_stored_metadata_matches_the_prd_schema(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["Only page"])
     index_plan(
@@ -92,7 +92,7 @@ def test_stored_metadata_matches_the_prd_schema(
 
 
 def test_second_run_skips_what_is_already_indexed(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     """Acceptance criterion 6, and the PoC's whole incremental rule."""
     pdf = pdf_factory("doc.pdf", ["Some text"])
@@ -114,7 +114,7 @@ def test_second_run_skips_what_is_already_indexed(
     assert store.count() == first.chunks  # nothing duplicated
 
 
-def test_skipping_avoids_re_embedding(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_skipping_avoids_re_embedding(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     """The skip must happen before the embedding call, not after."""
     pdf = pdf_factory("doc.pdf", ["Some text"])
     calls: list[int] = []
@@ -137,7 +137,7 @@ def test_skipping_avoids_re_embedding(store: VectorStore, pdf_factory: PdfFactor
 
 
 def test_a_failing_attachment_does_not_abort_the_run(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     good = pdf_factory("good.pdf", ["Fine content"])
 
@@ -162,7 +162,7 @@ def test_a_failing_attachment_does_not_abort_the_run(
     assert "network exploded" in stats.failures[0].error
 
 
-def test_unreadable_pdf_is_recorded_as_a_failure(store: VectorStore, tmp_path: Path) -> None:
+def test_unreadable_pdf_is_recorded_as_a_failure(store: ChromaStore, tmp_path: Path) -> None:
     broken = tmp_path / "broken.pdf"
     broken.write_bytes(b"not a pdf")
     stats = index_plan(
@@ -178,7 +178,7 @@ def test_unreadable_pdf_is_recorded_as_a_failure(store: VectorStore, tmp_path: P
 
 
 def test_pdf_without_text_is_counted_separately_from_failures(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     scan = pdf_factory("scan.pdf", ["", " "])
     stats = index_plan(
@@ -195,7 +195,7 @@ def test_pdf_without_text_is_counted_separately_from_failures(
     assert store.count() == 0
 
 
-def test_embedding_count_mismatch_is_caught(store: VectorStore, pdf_factory: PdfFactory) -> None:
+def test_embedding_count_mismatch_is_caught(store: ChromaStore, pdf_factory: PdfFactory) -> None:
     """A short vector list would silently misalign chunks and metadata."""
     pdf = pdf_factory("doc.pdf", ["a" * 400])
     stats = index_plan(
@@ -211,7 +211,7 @@ def test_embedding_count_mismatch_is_caught(store: VectorStore, pdf_factory: Pdf
 
 
 def test_progress_hook_fires_once_per_attachment(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     pdf = pdf_factory("doc.pdf", ["text"])
     seen: list[str] = []
@@ -228,7 +228,7 @@ def test_progress_hook_fires_once_per_attachment(
     assert seen == ["A", "B"]
 
 
-def test_empty_plan_is_a_no_op(store: VectorStore) -> None:
+def test_empty_plan_is_a_no_op(store: ChromaStore) -> None:
     stats = index_plan(
         IndexPlan(),
         store=store,
@@ -243,7 +243,7 @@ def test_empty_plan_is_a_no_op(store: VectorStore) -> None:
 
 
 def test_a_rejected_key_is_reported_without_the_unexpected_prefix(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     from zotero_rag_core.errors import RejectedCredentialError
 
@@ -274,7 +274,7 @@ def test_parallel_indexing_matches_a_serial_run(tmp_path: Path, pdf_factory: Pdf
     plan = IndexPlan(attachments=[planned(key, f"Paper {key}") for key in pdfs])
 
     def run(workers: int, name: str) -> tuple[object, set[str]]:
-        store = VectorStore(tmp_path / name)
+        store = ChromaStore(tmp_path / name)
         stats = index_plan(
             plan,
             store=store,
@@ -290,7 +290,7 @@ def test_parallel_indexing_matches_a_serial_run(tmp_path: Path, pdf_factory: Pdf
 
 
 def test_a_failing_attachment_does_not_stop_the_other_workers(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     good = pdf_factory("good.pdf", ["Fine content"])
 
@@ -315,7 +315,7 @@ def test_a_failing_attachment_does_not_stop_the_other_workers(
 
 
 def test_the_store_is_written_only_from_the_calling_thread(
-    store: VectorStore, pdf_factory: PdfFactory, monkeypatch: pytest.MonkeyPatch
+    store: ChromaStore, pdf_factory: PdfFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     import threading
 
@@ -342,7 +342,7 @@ def test_the_store_is_written_only_from_the_calling_thread(
 
 
 def test_an_exception_from_the_progress_hook_stops_the_run(
-    store: VectorStore, pdf_factory: PdfFactory
+    store: ChromaStore, pdf_factory: PdfFactory
 ) -> None:
     class Stop(Exception):
         pass

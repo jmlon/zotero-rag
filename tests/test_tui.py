@@ -33,7 +33,7 @@ from zotero_rag.tui.widgets import (
 )
 from zotero_rag_core.errors import ZoteroRagError
 from zotero_rag_core.querying import NO_CONTEXT_ANSWER
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import CollectionNode
 
 SIZE = (120, 40)
@@ -61,7 +61,7 @@ SNAPSHOT = CollectionSnapshot(
 )
 
 
-def populate(store: VectorStore) -> None:
+def populate(store: ChromaStore) -> None:
     store.add(
         ids=[f"{key}:1:0" for key in LIBRARY],
         embeddings=[[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.8, 0.2, 0.0]],
@@ -95,14 +95,14 @@ class Model:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> VectorStore:
-    store = VectorStore(tmp_path / "chroma")
+def store(tmp_path: Path) -> ChromaStore:
+    store = ChromaStore(tmp_path / "chroma")
     populate(store)
     return store
 
 
 def session(
-    store: VectorStore,
+    store: ChromaStore,
     model: Callable[[list[BaseMessage]], Iterator[AIMessageChunk]],
     snapshot: CollectionSnapshot | None = SNAPSHOT,
     **kwargs: Any,
@@ -171,7 +171,7 @@ def select(app: ZoteroRagApp, path: str) -> None:
 # --- launch ---------------------------------------------------------------
 
 
-def test_launch_selects_the_root_and_focuses_the_prompt(store: VectorStore) -> None:
+def test_launch_selects_the_root_and_focuses_the_prompt(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -184,7 +184,7 @@ def test_launch_selects_the_root_and_focuses_the_prompt(store: VectorStore) -> N
     run(app, steps)
 
 
-def test_tab_cycles_prompt_tree_results(store: VectorStore) -> None:
+def test_tab_cycles_prompt_tree_results(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -200,7 +200,7 @@ def test_tab_cycles_prompt_tree_results(store: VectorStore) -> None:
 # --- asking -----------------------------------------------------------------
 
 
-def test_an_answer_streams_in_with_its_cited_sources(store: VectorStore) -> None:
+def test_an_answer_streams_in_with_its_cited_sources(store: ChromaStore) -> None:
     model = Model()
     app = ZoteroRagApp(session(store, model), PromptHistory())
 
@@ -219,7 +219,7 @@ def test_an_answer_streams_in_with_its_cited_sources(store: VectorStore) -> None
     run(app, steps)
 
 
-def test_a_selected_folder_limits_the_search_to_its_subtree(store: VectorStore) -> None:
+def test_a_selected_folder_limits_the_search_to_its_subtree(store: ChromaStore) -> None:
     model = Model("From the evidence [1].")
     app = ZoteroRagApp(session(store, model), PromptHistory())
 
@@ -235,7 +235,7 @@ def test_a_selected_folder_limits_the_search_to_its_subtree(store: VectorStore) 
     run(app, steps)
 
 
-def test_moving_the_cursor_does_not_change_the_scope(store: VectorStore) -> None:
+def test_moving_the_cursor_does_not_change_the_scope(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -248,7 +248,7 @@ def test_moving_the_cursor_does_not_change_the_scope(store: VectorStore) -> None
     run(app, steps)
 
 
-def test_an_empty_prompt_is_not_sent(store: VectorStore) -> None:
+def test_an_empty_prompt_is_not_sent(store: ChromaStore) -> None:
     model = Model()
     app = ZoteroRagApp(session(store, model), PromptHistory())
 
@@ -260,7 +260,7 @@ def test_an_empty_prompt_is_not_sent(store: VectorStore) -> None:
     run(app, steps)
 
 
-def test_alt_enter_starts_a_new_line_and_question_mark_is_typed(store: VectorStore) -> None:
+def test_alt_enter_starts_a_new_line_and_question_mark_is_typed(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -271,7 +271,7 @@ def test_alt_enter_starts_a_new_line_and_question_mark_is_typed(store: VectorSto
     run(app, steps)
 
 
-def test_a_failing_model_shows_an_error_and_the_session_goes_on(store: VectorStore) -> None:
+def test_a_failing_model_shows_an_error_and_the_session_goes_on(store: ChromaStore) -> None:
     def failing(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
         yield AIMessageChunk(content="Partial")
         raise RuntimeError("402 insufficient credits")
@@ -289,7 +289,7 @@ def test_a_failing_model_shows_an_error_and_the_session_goes_on(store: VectorSto
 
 
 def test_a_folder_with_nothing_in_it_says_it_may_be_too_narrow(tmp_path: Path) -> None:
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     populate(store)
     empty = SNAPSHOT.model_copy(deep=True)
     empty.roots[0].children.append(CollectionNode(key="EMPTY", name="Empty"))
@@ -310,7 +310,7 @@ def test_a_folder_with_nothing_in_it_says_it_may_be_too_narrow(tmp_path: Path) -
 
 
 def test_up_recalls_the_previous_prompt_and_the_history_is_saved(
-    store: VectorStore, tmp_path: Path
+    store: ChromaStore, tmp_path: Path
 ) -> None:
     path = tmp_path / ".zotero-rag-ui" / "history"
     app = ZoteroRagApp(session(store, Model()), PromptHistory.load(path))
@@ -330,7 +330,7 @@ def test_up_recalls_the_previous_prompt_and_the_history_is_saved(
 
 
 def test_without_a_snapshot_the_tree_is_the_root_and_questions_still_work(
-    store: VectorStore,
+    store: ChromaStore,
 ) -> None:
     app = ZoteroRagApp(session(store, Model(), snapshot=None), PromptHistory())
 
@@ -345,7 +345,7 @@ def test_without_a_snapshot_the_tree_is_the_root_and_questions_still_work(
     run(app, steps)
 
 
-def test_open_index_notices_appear_in_the_transcript(store: VectorStore) -> None:
+def test_open_index_notices_appear_in_the_transcript(store: ChromaStore) -> None:
     notice = Notice("warning", "chunk_size changed since indexing.")
     app = ZoteroRagApp(session(store, Model(), notices=[notice]), PromptHistory())
 
@@ -359,7 +359,7 @@ def test_open_index_notices_appear_in_the_transcript(store: VectorStore) -> None
 # --- screen -----------------------------------------------------------------
 
 
-def test_help_opens_with_f1_and_closes_with_escape(store: VectorStore) -> None:
+def test_help_opens_with_f1_and_closes_with_escape(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -371,7 +371,7 @@ def test_help_opens_with_f1_and_closes_with_escape(store: VectorStore) -> None:
     run(app, steps)
 
 
-def test_a_small_terminal_shows_a_message_instead_of_the_layout(store: VectorStore) -> None:
+def test_a_small_terminal_shows_a_message_instead_of_the_layout(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -381,7 +381,7 @@ def test_a_small_terminal_shows_a_message_instead_of_the_layout(store: VectorSto
     run(app, steps, size=(70, 20))
 
 
-def test_a_keyword_index_failure_is_reported_on_the_question(store: VectorStore) -> None:
+def test_a_keyword_index_failure_is_reported_on_the_question(store: ChromaStore) -> None:
     hybrid = session(store, Model())
     hybrid.settings = QuerySettings(
         top_k=3, window=0, mode="hybrid", reranker=None, rerank_fanout=4, model="m"
@@ -398,7 +398,7 @@ def test_a_keyword_index_failure_is_reported_on_the_question(store: VectorStore)
     run(app, steps)
 
 
-def test_transcript_follows_new_output(store: VectorStore) -> None:
+def test_transcript_follows_new_output(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model("line\n\n" * 40 + "[1]")), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:
@@ -412,7 +412,7 @@ def test_transcript_follows_new_output(store: VectorStore) -> None:
 
 
 def test_the_answer_is_drawn_while_it_streams_and_completed_at_the_end(
-    store: VectorStore,
+    store: ChromaStore,
 ) -> None:
     """The model pauses mid-answer until the partial text is on screen."""
     release = threading.Event()
@@ -443,7 +443,7 @@ def test_the_answer_is_drawn_while_it_streams_and_completed_at_the_end(
 
 
 def test_history_survives_a_restart_and_a_recalled_prompt_can_be_edited(
-    store: VectorStore, tmp_path: Path
+    store: ChromaStore, tmp_path: Path
 ) -> None:
     """Criterion 5: recall with ↑, edit, resend; all of it still there next launch."""
     path = tmp_path / ".zotero-rag-ui" / "history"
@@ -465,7 +465,7 @@ def test_history_survives_a_restart_and_a_recalled_prompt_can_be_edited(
 
 
 def test_ctrl_l_copies_the_latest_answer_with_its_sources(
-    store: VectorStore, monkeypatch: pytest.MonkeyPatch
+    store: ChromaStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
     copied: list[str] = []
@@ -490,7 +490,7 @@ def test_ctrl_l_copies_the_latest_answer_with_its_sources(
 
 
 def test_ctrl_s_saves_the_transcript_where_the_user_says(
-    store: VectorStore, tmp_path: Path
+    store: ChromaStore, tmp_path: Path
 ) -> None:
     app = ZoteroRagApp(session(store, Model(), index_dir=tmp_path), PromptHistory())
 
@@ -512,7 +512,7 @@ def test_ctrl_s_saves_the_transcript_where_the_user_says(
 
 
 def test_an_existing_file_is_replaced_only_on_a_second_enter(
-    store: VectorStore, tmp_path: Path
+    store: ChromaStore, tmp_path: Path
 ) -> None:
     existing = tmp_path / "keep.md"
     existing.write_text("precious", encoding="utf-8")
@@ -535,7 +535,7 @@ def test_an_existing_file_is_replaced_only_on_a_second_enter(
     assert existing.read_text(encoding="utf-8").startswith("# zotero-rag transcript")
 
 
-def test_an_unwritable_path_is_reported_in_the_dialog(store: VectorStore, tmp_path: Path) -> None:
+def test_an_unwritable_path_is_reported_in_the_dialog(store: ChromaStore, tmp_path: Path) -> None:
     (tmp_path / "file").write_text("", encoding="utf-8")
     app = ZoteroRagApp(session(store, Model(), index_dir=tmp_path), PromptHistory())
 
@@ -553,7 +553,7 @@ def test_an_unwritable_path_is_reported_in_the_dialog(store: VectorStore, tmp_pa
     run(app, steps)
 
 
-def test_nothing_to_save_before_the_first_question(store: VectorStore) -> None:
+def test_nothing_to_save_before_the_first_question(store: ChromaStore) -> None:
     app = ZoteroRagApp(session(store, Model()), PromptHistory())
 
     async def steps(pilot: Pilot[None]) -> None:

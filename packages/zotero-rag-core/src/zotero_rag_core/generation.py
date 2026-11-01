@@ -52,7 +52,7 @@ from zotero_rag_core.evaluation import (
     load_questions,
 )
 from zotero_rag_core.llm import usage_from_message
-from zotero_rag_core.vectorstore import StoredChunk, VectorStore, reading_order_key
+from zotero_rag_core.store import ChunkStore, StoredChunk, reading_order_key
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +117,7 @@ def sample_text(text: str, budget: int) -> tuple[str, bool]:
     return ELLIPSIS.join(text[start : start + width] for start in starts), True
 
 
-def collect_documents(store: VectorStore, budget: int) -> list[DocumentText]:
+def collect_documents(store: ChunkStore, budget: int) -> list[DocumentText]:
     """Reassemble every indexed item's text, one `DocumentText` per Zotero item.
 
     Grouped by *item*, not by attachment: a paper and its supplement are one

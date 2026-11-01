@@ -21,7 +21,8 @@ from zotero_rag_core.retrieval import (
     retrieve,
     tokenize,
 )
-from zotero_rag_core.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.store import StoredChunk
+from zotero_rag_core.stores.chroma import ChromaStore
 
 
 def chunk(identifier: str, text: str = "some text", distance: float | None = None) -> StoredChunk:
@@ -115,7 +116,7 @@ def test_a_limit_of_zero_short_circuits() -> None:
 
 
 def test_the_keyword_index_reads_the_whole_store(tmp_path: Path) -> None:
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["A:1:0", "B:1:0"],
         embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]],
@@ -194,9 +195,9 @@ def test_candidates_run_deeper_than_the_final_cut() -> None:
 
 
 @pytest.fixture
-def hybrid_store(tmp_path: Path) -> VectorStore:
+def hybrid_store(tmp_path: Path) -> ChromaStore:
     """Three chunks whose embeddings and wording disagree about relevance."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["A:1:0", "B:1:0", "C:1:0"],
         embeddings=[[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.0, 0.0, 1.0]],
@@ -210,7 +211,7 @@ def hybrid_store(tmp_path: Path) -> VectorStore:
     return store
 
 
-def test_vector_mode_ignores_the_keyword_index(hybrid_store: VectorStore) -> None:
+def test_vector_mode_ignores_the_keyword_index(hybrid_store: ChromaStore) -> None:
     index = KeywordIndex.from_store(hybrid_store)
     hits = retrieve(
         hybrid_store, [1.0, 0.0, 0.0], "ECMP", top_k=2, mode="vector", keyword_index=index
@@ -218,7 +219,7 @@ def test_vector_mode_ignores_the_keyword_index(hybrid_store: VectorStore) -> Non
     assert [c.id for c in hits] == ["A:1:0", "B:1:0"]
 
 
-def test_hybrid_surfaces_a_chunk_the_vectors_ranked_last(hybrid_store: VectorStore) -> None:
+def test_hybrid_surfaces_a_chunk_the_vectors_ranked_last(hybrid_store: ChromaStore) -> None:
     """The case §11.4 predicted: the term is in C, but C is the furthest vector."""
     index = KeywordIndex.from_store(hybrid_store)
 
@@ -229,12 +230,12 @@ def test_hybrid_surfaces_a_chunk_the_vectors_ranked_last(hybrid_store: VectorSto
     assert "C:1:0" in [c.id for c in hits]
 
 
-def test_hybrid_without_an_index_falls_back_to_vectors(hybrid_store: VectorStore) -> None:
+def test_hybrid_without_an_index_falls_back_to_vectors(hybrid_store: ChromaStore) -> None:
     hits = retrieve(hybrid_store, [1.0, 0.0, 0.0], "ECMP", top_k=1, mode="hybrid")
     assert [c.id for c in hits] == ["A:1:0"]
 
 
-def test_hybrid_falls_back_when_bm25_matches_nothing(hybrid_store: VectorStore) -> None:
+def test_hybrid_falls_back_when_bm25_matches_nothing(hybrid_store: ChromaStore) -> None:
     """A question sharing no token with the corpus must not return an empty list."""
     index = KeywordIndex.from_store(hybrid_store)
 
@@ -250,7 +251,7 @@ def test_hybrid_falls_back_when_bm25_matches_nothing(hybrid_store: VectorStore) 
     assert [c.id for c in hits] == ["A:1:0", "B:1:0"]
 
 
-def test_hybrid_returns_at_most_top_k(hybrid_store: VectorStore) -> None:
+def test_hybrid_returns_at_most_top_k(hybrid_store: ChromaStore) -> None:
     index = KeywordIndex.from_store(hybrid_store)
     hits = retrieve(
         hybrid_store, [1.0, 0.0, 0.0], "balancing ECMP", top_k=2, mode="hybrid", keyword_index=index
@@ -263,7 +264,7 @@ def test_hybrid_returns_at_most_top_k(hybrid_store: VectorStore) -> None:
 
 def test_hybrid_composes_with_windowing(tmp_path: Path) -> None:
     """Fusion picks the hits; windowing then expands whatever survived."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["A:1:0", "A:1:1", "A:1:2"],
         embeddings=[[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],

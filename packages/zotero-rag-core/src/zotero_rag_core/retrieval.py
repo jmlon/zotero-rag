@@ -21,7 +21,7 @@ from typing import Literal
 
 from rank_bm25 import BM25Okapi
 
-from zotero_rag_core.vectorstore import Scope, StoredChunk, VectorStore, in_scope
+from zotero_rag_core.store import ChunkStore, Scope, StoredChunk, in_scope
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,7 @@ class KeywordIndex:
         logger.info("keyword index built over %d chunk(s)", len(self._chunks))
 
     @classmethod
-    def from_store(cls, store: VectorStore) -> KeywordIndex:
+    def from_store(cls, store: ChunkStore) -> KeywordIndex:
         return cls(store.all_chunks())
 
     def __len__(self) -> int:
@@ -163,7 +163,7 @@ def reciprocal_rank_fusion(
 
 
 def retrieve(
-    store: VectorStore,
+    store: ChunkStore,
     embedding: list[float],
     question: str,
     top_k: int,

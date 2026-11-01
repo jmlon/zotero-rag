@@ -26,7 +26,7 @@ from zotero_rag.tui.session import Phase, QuerySession, QuerySettings, open_sess
 from zotero_rag_core.fingerprint import StoreFingerprint
 from zotero_rag_core.querying import answer_question
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import CollectionNode
 
 runner = CliRunner()
@@ -79,10 +79,10 @@ def fake_clients(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(module, "build_chat", lambda config: Chat())
 
 
-def index_folder(directory: Path, fingerprint: bool = True) -> VectorStore:
+def index_folder(directory: Path, fingerprint: bool = True) -> ChromaStore:
     """A folder indexed from a pinned `Fog` collection with a `Edge` sub-folder."""
     config = Config()
-    store = VectorStore(directory / "chroma")
+    store = ChromaStore(directory / "chroma")
     store.add(
         ids=["A:1:0", "B:1:0"],
         embeddings=[[1.0, 0.0, 0.5], [0.9, 0.1, 0.5]],
@@ -271,7 +271,7 @@ def test_version_and_help() -> None:
 
 
 def make_session(
-    store: VectorStore, mode: RetrievalMode = "vector", window: int = 0
+    store: ChromaStore, mode: RetrievalMode = "vector", window: int = 0
 ) -> QuerySession:
     return QuerySession(
         store=store,

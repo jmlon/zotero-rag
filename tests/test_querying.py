@@ -26,7 +26,8 @@ from zotero_rag_core.querying import (
     expand_window,
     stream_answer_question,
 )
-from zotero_rag_core.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.store import StoredChunk
+from zotero_rag_core.stores.chroma import ChromaStore
 
 PdfFactory = Callable[[str, list[str]], Path]
 
@@ -58,11 +59,11 @@ def chunk(text: str, **kwargs: object) -> StoredChunk:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> VectorStore:
-    return VectorStore(tmp_path / "chroma")
+def store(tmp_path: Path) -> ChromaStore:
+    return ChromaStore(tmp_path / "chroma")
 
 
-def populate(store: VectorStore, texts: list[str]) -> None:
+def populate(store: ChromaStore, texts: list[str]) -> None:
     """Store one chunk per text, each on its own page, with 3-dim embeddings."""
     store.add(
         ids=[f"ATT1:{page}:0" for page in range(1, len(texts) + 1)],
@@ -133,7 +134,7 @@ def test_context_blocks_are_numbered_and_attributed() -> None:
 # --- the pipeline --------------------------------------------------------
 
 
-def test_answers_from_the_retrieved_chunks(store: VectorStore) -> None:
+def test_answers_from_the_retrieved_chunks(store: ChromaStore) -> None:
     populate(store, ["Writers should write every day.", "Keep previous versions of files."])
     seen: list[list[BaseMessage]] = []
 
@@ -159,7 +160,7 @@ def test_answers_from_the_retrieved_chunks(store: VectorStore) -> None:
     assert "write every day" in str(human.content)
 
 
-def test_top_k_bounds_the_retrieval(store: VectorStore) -> None:
+def test_top_k_bounds_the_retrieval(store: ChromaStore) -> None:
     populate(store, [f"passage {number}" for number in range(1, 6)])
     result = answer_question(
         "anything",
@@ -171,7 +172,7 @@ def test_top_k_bounds_the_retrieval(store: VectorStore) -> None:
     assert result.chunks_retrieved == 2
 
 
-def test_usage_is_reported_for_the_verbose_summary(store: VectorStore) -> None:
+def test_usage_is_reported_for_the_verbose_summary(store: ChromaStore) -> None:
     populate(store, ["some text"])
     result = answer_question(
         "why?",
@@ -188,7 +189,7 @@ def test_usage_is_reported_for_the_verbose_summary(store: VectorStore) -> None:
 
 
 def test_an_empty_store_says_it_does_not_know_without_calling_the_llm(
-    store: VectorStore,
+    store: ChromaStore,
 ) -> None:
     """Acceptance criterion 8's floor: no context can only mean "I don't know"."""
     calls: list[int] = []
@@ -206,7 +207,7 @@ def test_an_empty_store_says_it_does_not_know_without_calling_the_llm(
     assert result.sources == []
 
 
-def test_a_failing_llm_call_becomes_a_user_facing_error(store: VectorStore) -> None:
+def test_a_failing_llm_call_becomes_a_user_facing_error(store: ChromaStore) -> None:
     populate(store, ["some text"])
 
     def ask(messages: list[BaseMessage]) -> AIMessage:
@@ -234,7 +235,7 @@ def test_an_answer_with_no_markers_cites_nothing() -> None:
     assert cited_numbers("See section [A] of the text.") == set()
 
 
-def test_sources_record_whether_the_answer_cited_them(store: VectorStore) -> None:
+def test_sources_record_whether_the_answer_cited_them(store: ChromaStore) -> None:
     """Acceptance criterion 8: an "I don't know" must not look supported."""
     populate(store, ["passage one", "passage two"])
     result = answer_question(
@@ -248,7 +249,7 @@ def test_sources_record_whether_the_answer_cited_them(store: VectorStore) -> Non
     assert [source.cited for source in result.sources] == [False, False]
 
 
-def test_only_the_cited_sources_are_marked(store: VectorStore) -> None:
+def test_only_the_cited_sources_are_marked(store: ChromaStore) -> None:
     populate(store, ["passage one", "passage two"])
     result = answer_question(
         "why?",
@@ -279,7 +280,7 @@ def test_block_style_content_is_flattened_into_text() -> None:
 # --- windowed retrieval (M7, §11.4) --------------------------------------
 
 
-def populate_document(store: VectorStore, pages: dict[int, list[str]]) -> None:
+def populate_document(store: ChromaStore, pages: dict[int, list[str]]) -> None:
     """Store a multi-page attachment: {page: [chunk text, ...]}.
 
     The embedding encodes the page, so a query vector can select a known page.
@@ -294,13 +295,13 @@ def populate_document(store: VectorStore, pages: dict[int, list[str]]) -> None:
     store.add(ids=ids, embeddings=embeddings, documents=documents, metadatas=metadatas)
 
 
-def test_a_window_of_zero_is_the_pre_m7_path(store: VectorStore) -> None:
+def test_a_window_of_zero_is_the_pre_m7_path(store: ChromaStore) -> None:
     populate_document(store, {1: ["a", "b", "c"]})
     hits = [chunk("b", page=1, chunk_index=1)]
     assert expand_window(store, hits, window=0) == hits
 
 
-def test_a_window_adds_the_neighbours_either_side(store: VectorStore) -> None:
+def test_a_window_adds_the_neighbours_either_side(store: ChromaStore) -> None:
     populate_document(store, {1: ["first", "second", "third", "fourth"]})
     hits = store.query([1.0, 1.0, 0.5], top_k=1)
     assert [hit.text for hit in hits] == ["second"]
@@ -311,7 +312,7 @@ def test_a_window_adds_the_neighbours_either_side(store: VectorStore) -> None:
     assert [c.text for c in expanded] == ["first", "second", "third"]
 
 
-def test_a_window_crosses_a_page_boundary(store: VectorStore) -> None:
+def test_a_window_crosses_a_page_boundary(store: ChromaStore) -> None:
     """The one join with no `chunk_overlap` to stitch it: segments are chunked apart."""
     populate_document(store, {1: ["p1c0", "p1c1"], 2: ["p2c0", "p2c1"]})
     hits = [chunk("p2c0", page=2, chunk_index=0)]
@@ -321,13 +322,13 @@ def test_a_window_crosses_a_page_boundary(store: VectorStore) -> None:
     assert [c.text for c in expanded] == ["p1c1", "p2c0", "p2c1"]
 
 
-def test_a_window_stops_at_the_edges_of_the_document(store: VectorStore) -> None:
+def test_a_window_stops_at_the_edges_of_the_document(store: ChromaStore) -> None:
     populate_document(store, {1: ["only", "second"]})
     hits = [chunk("only", page=1, chunk_index=0)]
     assert [c.text for c in expand_window(store, hits, window=5)] == ["only", "second"]
 
 
-def test_overlapping_windows_emit_each_chunk_once(store: VectorStore) -> None:
+def test_overlapping_windows_emit_each_chunk_once(store: ChromaStore) -> None:
     """Two adjacent hits would otherwise repeat the same text in the prompt."""
     populate_document(store, {1: ["a", "b", "c", "d", "e"]})
     hits = [chunk("b", page=1, chunk_index=1), chunk("c", page=1, chunk_index=2)]
@@ -338,7 +339,7 @@ def test_overlapping_windows_emit_each_chunk_once(store: VectorStore) -> None:
     assert len({c.id for c in expanded}) == len(expanded)
 
 
-def test_a_window_does_not_reach_into_another_attachment(store: VectorStore) -> None:
+def test_a_window_does_not_reach_into_another_attachment(store: ChromaStore) -> None:
     """Neighbours are only neighbours within one document."""
     store.add(
         ids=["ATT1:1:0", "ATT2:1:0"],
@@ -350,7 +351,7 @@ def test_a_window_does_not_reach_into_another_attachment(store: VectorStore) -> 
     assert [c.text for c in expand_window(store, hits, window=3)] == ["from one"]
 
 
-def test_the_hit_keeps_its_similarity_distance(store: VectorStore) -> None:
+def test_the_hit_keeps_its_similarity_distance(store: ChromaStore) -> None:
     """Refetched neighbours have no distance; the hit's must survive the expansion."""
     populate_document(store, {1: ["a", "b", "c"]})
     hits = store.query([1.0, 1.0, 0.5], top_k=1)
@@ -363,13 +364,13 @@ def test_the_hit_keeps_its_similarity_distance(store: VectorStore) -> None:
     assert by_id[hit_id].distance is not None
 
 
-def test_an_unplaceable_hit_still_reaches_the_model(store: VectorStore) -> None:
+def test_an_unplaceable_hit_still_reaches_the_model(store: ChromaStore) -> None:
     """A chunk with no attachment key gets no neighbours, but is not dropped."""
     orphan = StoredChunk(id="X:1:0", text="orphaned", metadata={"page": 1})
     assert expand_window(store, [orphan], window=2) == [orphan]
 
 
-def test_windowing_reports_both_counts(store: VectorStore) -> None:
+def test_windowing_reports_both_counts(store: ChromaStore) -> None:
     populate_document(store, {1: ["alpha", "beta", "gamma"]})
 
     result = answer_question(
@@ -386,7 +387,7 @@ def test_windowing_reports_both_counts(store: VectorStore) -> None:
     assert result.chunks_in_context == 3
 
 
-def test_windowing_puts_the_neighbour_text_in_the_prompt(store: VectorStore) -> None:
+def test_windowing_puts_the_neighbour_text_in_the_prompt(store: ChromaStore) -> None:
     populate_document(store, {1: ["the preceding sentence", "the hit", "the following one"]})
     seen: list[str] = []
 
@@ -407,7 +408,7 @@ def test_windowing_puts_the_neighbour_text_in_the_prompt(store: VectorStore) -> 
     assert "the following one" in seen[0]
 
 
-def test_a_neighbour_on_another_page_becomes_its_own_source(store: VectorStore) -> None:
+def test_a_neighbour_on_another_page_becomes_its_own_source(store: ChromaStore) -> None:
     """Citing the page the text is really on beats attributing it to the next one."""
     populate_document(store, {1: ["page one tail"], 2: ["page two head"]})
     hits = [chunk("page two head", page=2, chunk_index=0)]
@@ -418,7 +419,7 @@ def test_a_neighbour_on_another_page_becomes_its_own_source(store: VectorStore) 
     assert [source.locator for source in sources] == ["p. 1", "p. 2"]
 
 
-def test_windowing_leaves_an_empty_retrieval_alone(store: VectorStore) -> None:
+def test_windowing_leaves_an_empty_retrieval_alone(store: ChromaStore) -> None:
     assert expand_window(store, [], window=2) == []
 
 
@@ -437,7 +438,7 @@ def chunks_of(text: str, usage: bool = True) -> list[AIMessageChunk]:
 
 
 def streamed(
-    store: VectorStore,
+    store: ChromaStore,
     stream: Callable[[list[BaseMessage]], Iterator[AIMessageChunk]],
     tokens: list[str],
     question: str = "why?",
@@ -462,7 +463,7 @@ def without_timing(result: QueryResult) -> dict[str, Any]:
 
 @pytest.mark.parametrize("window", [0, 1])
 def test_streaming_gives_the_same_result_as_the_blocking_call(
-    store: VectorStore, window: int
+    store: ChromaStore, window: int
 ) -> None:
     """The two variants share every step but the call, so they must agree exactly."""
     populate(store, ["Writers should write every day.", "Keep previous versions of files."])
@@ -488,7 +489,7 @@ def test_streaming_gives_the_same_result_as_the_blocking_call(
     assert "".join(tokens) == text
 
 
-def test_the_deltas_arrive_before_the_stream_ends(store: VectorStore) -> None:
+def test_the_deltas_arrive_before_the_stream_ends(store: ChromaStore) -> None:
     populate(store, ["some text"])
     tokens: list[str] = []
 
@@ -502,7 +503,7 @@ def test_the_deltas_arrive_before_the_stream_ends(store: VectorStore) -> None:
     assert seen_so_far[:3] == [1, 2, 3]  # each delta was delivered as it came
 
 
-def test_the_stream_is_given_the_same_prompt(store: VectorStore) -> None:
+def test_the_stream_is_given_the_same_prompt(store: ChromaStore) -> None:
     populate(store, ["Writers should write every day."])
     prompts: list[list[BaseMessage]] = []
 
@@ -516,20 +517,20 @@ def test_the_stream_is_given_the_same_prompt(store: VectorStore) -> None:
     assert "write every day" in str(human.content)
 
 
-def test_streamed_usage_comes_from_the_final_chunk(store: VectorStore) -> None:
+def test_streamed_usage_comes_from_the_final_chunk(store: ChromaStore) -> None:
     populate(store, ["some text"])
     result = streamed(store, lambda messages: iter(chunks_of("Because [1].")), [])
     assert (result.usage.prompt_tokens, result.usage.completion_tokens) == (120, 30)
 
 
-def test_a_stream_without_usage_reports_zeros(store: VectorStore) -> None:
+def test_a_stream_without_usage_reports_zeros(store: ChromaStore) -> None:
     populate(store, ["some text"])
     result = streamed(store, lambda messages: iter(chunks_of("Because [1].", usage=False)), [])
     assert result.usage.total_tokens == 0
     assert result.answer == "Because [1]."
 
 
-def test_an_empty_stream_is_an_empty_answer_not_a_crash(store: VectorStore) -> None:
+def test_an_empty_stream_is_an_empty_answer_not_a_crash(store: ChromaStore) -> None:
     populate(store, ["some text"])
     tokens: list[str] = []
     result = streamed(store, lambda messages: iter([]), tokens)
@@ -538,7 +539,7 @@ def test_an_empty_stream_is_an_empty_answer_not_a_crash(store: VectorStore) -> N
     assert not any(source.cited for source in result.sources)
 
 
-def test_streaming_with_nothing_retrieved_skips_the_model(store: VectorStore) -> None:
+def test_streaming_with_nothing_retrieved_skips_the_model(store: ChromaStore) -> None:
     calls: list[int] = []
 
     def stream(messages: list[BaseMessage]) -> Iterator[AIMessageChunk]:
@@ -552,7 +553,7 @@ def test_streaming_with_nothing_retrieved_skips_the_model(store: VectorStore) ->
     assert tokens == [NO_CONTEXT_ANSWER]  # a deltas-only renderer still shows it
 
 
-def test_a_stream_that_fails_midway_becomes_a_user_facing_error(store: VectorStore) -> None:
+def test_a_stream_that_fails_midway_becomes_a_user_facing_error(store: ChromaStore) -> None:
     populate(store, ["some text"])
     tokens: list[str] = []
 
@@ -565,7 +566,7 @@ def test_a_stream_that_fails_midway_becomes_a_user_facing_error(store: VectorSto
     assert tokens == ["Partial "]
 
 
-def test_a_failing_token_sink_is_not_blamed_on_the_model(store: VectorStore) -> None:
+def test_a_failing_token_sink_is_not_blamed_on_the_model(store: ChromaStore) -> None:
     populate(store, ["some text"])
 
     def sink(delta: str) -> None:
@@ -582,7 +583,7 @@ def test_a_failing_token_sink_is_not_blamed_on_the_model(store: VectorStore) -> 
         )
 
 
-def test_block_style_deltas_are_streamed_as_text(store: VectorStore) -> None:
+def test_block_style_deltas_are_streamed_as_text(store: ChromaStore) -> None:
     populate(store, ["some text"])
     tokens: list[str] = []
     pieces = [

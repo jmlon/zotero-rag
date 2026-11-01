@@ -40,7 +40,7 @@ from zotero_rag_core.evaluation import (
     run_settings,
 )
 from zotero_rag_core.querying import QueryResult, Source, Usage
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -596,7 +596,7 @@ def test_total_tokens_spans_answering_grading_and_embedding() -> None:
 
 def test_run_settings_record_everything_that_moves_the_numbers(tmp_path: Path) -> None:
     """A report without these is a set of figures with no "compared to what"."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["A:1:0"],
         embeddings=[[1.0, 0.0, 0.5]],
@@ -763,7 +763,7 @@ def test_runs_record_that_the_judge_saw_the_passages(tmp_path: Path) -> None:
     from zotero_rag.config import Config
     from zotero_rag_core.evaluation import JUDGE_PROTOCOL, run_settings
 
-    settings = run_settings(Config(), VectorStore(tmp_path / "chroma"), 7, tmp_path / "q.yaml")
+    settings = run_settings(Config(), ChromaStore(tmp_path / "chroma"), 7, tmp_path / "q.yaml")
     assert settings.judge_protocol == JUDGE_PROTOCOL == "reference+passages"
     # Runs logged earlier, without the field, read back as the old protocol.
     assert RunSettings().judge_protocol == "reference"

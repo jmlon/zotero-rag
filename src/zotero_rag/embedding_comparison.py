@@ -25,7 +25,7 @@ from pydantic import BaseModel, Field, computed_field
 from zotero_rag.config import Config
 from zotero_rag_core.embedding import count_tokens
 from zotero_rag_core.evaluation import EvalAggregate, QuestionOutcome
-from zotero_rag_core.vectorstore import CHROMA_DIRNAME, VectorStore
+from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
 
 EMBEDDINGS_DIRNAME = "embeddings"
 
@@ -148,7 +148,7 @@ def variant_config(config: Config, variant: Variant) -> Config:
     return copied
 
 
-def stored_tokens(store: VectorStore) -> int:
+def stored_tokens(store: ChromaStore) -> int:
     """Embedding tokens over every chunk in the store: what indexing it cost.
 
     Counted from the stored text rather than remembered from the build, so a store

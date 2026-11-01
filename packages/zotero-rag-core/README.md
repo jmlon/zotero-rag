@@ -11,4 +11,4 @@ environment variables.
 
 Extras:
 
-- `chroma` — the persistent Chroma vector store (`zotero_rag_core.vectorstore`).
+- `chroma` — the persistent Chroma store an index folder keeps (`zotero_rag_core.stores.chroma.ChromaStore`), one implementation of `zotero_rag_core.store.ChunkStore`.

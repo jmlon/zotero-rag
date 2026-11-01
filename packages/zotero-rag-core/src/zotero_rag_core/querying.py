@@ -33,7 +33,7 @@ from zotero_rag_core.llm import (
 )
 from zotero_rag_core.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode, retrieve
-from zotero_rag_core.vectorstore import Scope, StoredChunk, VectorStore
+from zotero_rag_core.store import ChunkStore, Scope, StoredChunk
 
 logger = logging.getLogger(__name__)
 
@@ -223,7 +223,7 @@ def collect_sources(chunks: list[StoredChunk]) -> tuple[list[Source], list[int]]
     return sources, numbers
 
 
-def expand_window(store: VectorStore, hits: list[StoredChunk], window: int) -> list[StoredChunk]:
+def expand_window(store: ChunkStore, hits: list[StoredChunk], window: int) -> list[StoredChunk]:
     """Add each hit's ±`window` neighbours in reading order (PRD §11.4).
 
     A 1,000-character chunk can easily cut a claim from the sentence that gives it
@@ -320,7 +320,7 @@ class _Prepared:
 
 def _prepare(
     question: str,
-    store: VectorStore,
+    store: ChunkStore,
     embed_query: QuestionEmbedder,
     top_k: int,
     window: int,
@@ -388,7 +388,7 @@ def _finish(prepared: _Prepared, message: AIMessage) -> QueryResult:
 
 def answer_question(
     question: str,
-    store: VectorStore,
+    store: ChunkStore,
     embed_query: QuestionEmbedder,
     answer: Answerer,
     top_k: int,
@@ -462,7 +462,7 @@ def _guarded(stream: StreamingAnswerer, messages: list[BaseMessage]) -> Iterator
 
 def stream_answer_question(
     question: str,
-    store: VectorStore,
+    store: ChunkStore,
     embed_query: QuestionEmbedder,
     stream: StreamingAnswerer,
     on_token: TokenSink,

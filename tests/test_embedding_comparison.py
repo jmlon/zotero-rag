@@ -39,7 +39,7 @@ from zotero_rag_core.evaluation import JudgeVerdict, RawVerdict, build_verdict_f
 from zotero_rag_core.fingerprint import StoreFingerprint
 from zotero_rag_core.indexer import DIMENSION_PROBE
 from zotero_rag_core.llm import build_chat
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 runner = CliRunner()
 
@@ -204,7 +204,7 @@ def _index_folder(tmp_path: Path) -> None:
     (tmp_path / "config.yaml").write_text(CATALOGUE, encoding="utf-8")
     (tmp_path / "questions.yaml").write_text(QUESTIONS, encoding="utf-8")
     config = Config()
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["ATT1:1:0"],
         embeddings=[[1.0, 0.0, 0.5]],
@@ -324,7 +324,7 @@ def test_compare_builds_each_variant_and_scores_all_of_them(
     assert baseline["index_cost"] is None
 
     # The variant's store records what built it, so a later run can trust it.
-    fingerprint = VectorStore(Path(cheap["store"])).read_fingerprint()
+    fingerprint = ChromaStore(Path(cheap["store"])).read_fingerprint()
     assert fingerprint is not None
     assert (fingerprint.embedding_model, fingerprint.chunk_size) == ("cheap/model", 1000)
 
@@ -415,7 +415,7 @@ def test_overlaps_are_compared_in_their_own_stores(
     variants = json.loads(result.stdout)["variants"]
     assert [(v["chunk_size"], v["chunk_overlap"]) for v in variants] == [(1000, 200), (300, 0)]
     assert (tmp_path / "embeddings" / "cheap_model" / "300-0").is_dir()
-    fingerprint = VectorStore(Path(variants[1]["store"])).read_fingerprint()
+    fingerprint = ChromaStore(Path(variants[1]["store"])).read_fingerprint()
     assert fingerprint is not None and fingerprint.chunk_overlap == 0
 
 
@@ -665,7 +665,7 @@ def test_stores_holding_different_documents_are_flagged(
     monkeypatch.chdir(tmp_path)
     _stub_network(monkeypatch)
     # A stale baseline: one more chunk than the collection now gives a fresh store.
-    VectorStore(tmp_path / "chroma").add(
+    ChromaStore(tmp_path / "chroma").add(
         ids=["OLD:1:0"],
         embeddings=[[1.0, 0.0, 0.5]],
         documents=["A paper since removed from the collection."],

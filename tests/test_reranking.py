@@ -25,7 +25,8 @@ from zotero_rag_core.reranking import (
     build_reranker,
     candidate_count,
 )
-from zotero_rag_core.vectorstore import StoredChunk, VectorStore
+from zotero_rag_core.store import StoredChunk
+from zotero_rag_core.stores.chroma import ChromaStore
 
 
 def chunk(identifier: str, text: str) -> StoredChunk:
@@ -369,9 +370,9 @@ def test_the_reranker_model_follows_the_reranker() -> None:
 
 
 @pytest.fixture
-def store(tmp_path: Path) -> VectorStore:
+def store(tmp_path: Path) -> ChromaStore:
     """Four chunks; the vector order deliberately disagrees with relevance."""
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     store.add(
         ids=["A:1:0", "A:1:1", "A:1:2", "A:1:3"],
         embeddings=[[1.0, 0.0, 0.0], [0.9, 0.1, 0.0], [0.8, 0.2, 0.0], [0.7, 0.3, 0.0]],
@@ -390,7 +391,7 @@ def reply():  # type: ignore[no-untyped-def]
     )
 
 
-def test_reranking_retrieves_wide_then_cuts(store: VectorStore) -> None:
+def test_reranking_retrieves_wide_then_cuts(store: ChromaStore) -> None:
     """`top_k` still bounds what reaches the model; the pool behind it grew."""
     result = answer_question(
         "which one answers it?",
@@ -409,7 +410,7 @@ def test_reranking_retrieves_wide_then_cuts(store: VectorStore) -> None:
     assert result.sources[0].excerpts == ["the actual answer"]
 
 
-def test_without_a_reranker_the_pool_is_just_top_k(store: VectorStore) -> None:
+def test_without_a_reranker_the_pool_is_just_top_k(store: ChromaStore) -> None:
     result = answer_question(
         "anything",
         store=store,
@@ -421,7 +422,7 @@ def test_without_a_reranker_the_pool_is_just_top_k(store: VectorStore) -> None:
     assert result.reranked is False
 
 
-def test_reranking_runs_before_windowing(store: VectorStore) -> None:
+def test_reranking_runs_before_windowing(store: ChromaStore) -> None:
     """Neighbours are context for the chosen hit, so they must not be reranked away."""
     result = answer_question(
         "which one?",

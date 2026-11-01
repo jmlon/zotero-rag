@@ -17,7 +17,7 @@ from zotero_rag_core.extraction import extract_segments
 from zotero_rag_core.indexer import drop_replaced_copies, find_orphans
 from zotero_rag_core.planning import SkipReason, build_plan
 from zotero_rag_core.provenance import Provenance, parse
-from zotero_rag_core.vectorstore import VectorStore
+from zotero_rag_core.stores.chroma import ChromaStore
 
 FileFactory = Callable[[str, bytes | str], Path]
 MARKDOWN_FIRST = ["markdown", "pdf", "docx", "odt", "epub", "html", "txt"]
@@ -231,7 +231,7 @@ def test_markdown_the_user_wrote_is_an_ordinary_document() -> None:
 # --- Swapping copies in the store ---------------------------------------------------
 
 
-def stored(store: VectorStore, *keys: str) -> None:
+def stored(store: ChromaStore, *keys: str) -> None:
     for number, key in enumerate(keys):
         store.add(
             ids=[f"{key}:1:0"],
@@ -242,7 +242,7 @@ def stored(store: VectorStore, *keys: str) -> None:
 
 
 def test_switching_to_the_transcript_drops_the_pdfs_chunks(tmp_path: Path) -> None:
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     stored(store, "PDFKEY01", "MDKEY001")
     plan = plan_of(
         paper(), attachment("PDFKEY01"), transcript_of("PDFKEY01"), preference=MARKDOWN_FIRST
@@ -256,7 +256,7 @@ def test_switching_to_the_transcript_drops_the_pdfs_chunks(tmp_path: Path) -> No
 def test_the_old_copy_stays_until_the_new_one_is_stored(tmp_path: Path) -> None:
     # The transcript failed to index this run: dropping the PDF would lose the
     # paper from the index entirely.
-    store = VectorStore(tmp_path / "chroma")
+    store = ChromaStore(tmp_path / "chroma")
     stored(store, "PDFKEY01")
     plan = plan_of(
         paper(), attachment("PDFKEY01"), transcript_of("PDFKEY01"), preference=MARKDOWN_FIRST
