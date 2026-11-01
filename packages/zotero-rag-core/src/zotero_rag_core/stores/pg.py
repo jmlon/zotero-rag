@@ -32,7 +32,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from zotero_rag_core.fingerprint import StoreFingerprint
-from zotero_rag_core.retrieval import tokenize
+from zotero_rag_core.retrieval import SCORE_DECIMALS, tokenize
 from zotero_rag_core.store import Filters, StoredChunk, VectorStoreError, reading_order_key
 
 logger = logging.getLogger(__name__)
@@ -41,6 +41,12 @@ SCHEMA_RESOURCE = "pg_schema.sql"
 VECTOR_INDEX = "chunks_embedding_hnsw"
 #: HNSW candidates examined per query; raised to `top_k` when that is larger.
 EF_SEARCH = 100
+#: pgvector's HNSW index takes at most this many dimensions for `vector`.
+MAX_INDEXED_DIMENSIONS = 2000
+#: rank_bm25.BM25Okapi's defaults, which `BM25Searcher` uses.
+BM25_K1, BM25_B, BM25_EPSILON = 1.5, 0.75, 0.25
+#: Marks the keyword statistics stale; run inside every transaction that writes chunks.
+_MARK_STALE = "UPDATE chunk_store SET keyword_stale = true WHERE id = 1"
 
 #: Chunk metadata keys stored on the item row; NULL when the metadata omits them.
 ITEM_FIELDS = (
@@ -237,12 +243,16 @@ class PgStore:
             attachments[attachment_key] = {"key": attachment_key, "item_key": item_key} | {
                 column: metadata.get(field) for field, column in ATTACHMENT_FIELDS.items()
             }
+            tokens = tokenize(text)
             chunks.append(
                 {"id": identifier, "attachment_key": attachment_key, "text": text}
                 | {field: metadata.get(field) for field in CHUNK_FIELDS}
                 | {
                     "embedding": [float(value) for value in embedding],
-                    "tsv": tsvector_text(text),
+                    "tsv": " ".join(tokens),
+                    # BM25's document length, and whether BM25Searcher would skip it.
+                    "n_tokens": len(tokens),
+                    "blank": not text.strip(),
                     "extra": Jsonb({k: v for k, v in metadata.items() if k not in _COLUMNS}),
                 }
             )
@@ -252,11 +262,19 @@ class PgStore:
         on_conflict = (
             "DO UPDATE SET attachment_key = EXCLUDED.attachment_key, text = EXCLUDED.text, "
             "embedding = EXCLUDED.embedding, tsv = EXCLUDED.tsv, extra = EXCLUDED.extra, "
+            "n_tokens = EXCLUDED.n_tokens, blank = EXCLUDED.blank, "
             + ", ".join(f"{field} = EXCLUDED.{field}" for field in CHUNK_FIELDS)
             if replace
             else "DO NOTHING"
         )
         dimension = len(chunks[0]["embedding"])
+        if dimension > MAX_INDEXED_DIMENSIONS:
+            raise VectorStoreError(
+                f"These vectors have {dimension} dimensions, and pgvector can index at most "
+                f"{MAX_INDEXED_DIMENSIONS}. Choose an embedding model with "
+                f"{MAX_INDEXED_DIMENSIONS} dimensions or fewer for a PostgreSQL store "
+                "(text-embedding-3-small has 1536)."
+            )
         with self._cursor("write to the store") as cur:
             cur.executemany(
                 cast(
@@ -281,12 +299,15 @@ class PgStore:
                 cast(
                     Any,
                     f"INSERT INTO chunks (id, attachment_key, text, {chunk_columns}, "
-                    "embedding, tsv, extra) VALUES (%(id)s, %(attachment_key)s, %(text)s, "
+                    "embedding, tsv, n_tokens, blank, extra) "
+                    "VALUES (%(id)s, %(attachment_key)s, %(text)s, "
                     f"{chunk_values}, %(embedding)s::float8[]::vector, "
-                    f"to_tsvector('simple', %(tsv)s), %(extra)s) ON CONFLICT (id) {on_conflict}",
+                    "to_tsvector('simple', %(tsv)s), %(n_tokens)s, %(blank)s, %(extra)s) "
+                    f"ON CONFLICT (id) {on_conflict}",
                 ),
                 chunks,
             )
+            cur.execute(_MARK_STALE)
             self._ensure_vector_index(cur, dimension)
 
     def _ensure_vector_index(self, cur: psycopg.Cursor[dict[str, Any]], dimension: int) -> None:
@@ -311,6 +332,7 @@ class PgStore:
             cur.execute("DELETE FROM chunks WHERE attachment_key = %s", (attachment_key,))
             removed = cur.rowcount
             cur.execute("DELETE FROM attachments WHERE key = %s", (attachment_key,))
+            cur.execute(_MARK_STALE)
         return max(removed, 0)
 
     def delete_ids(self, ids: list[str]) -> None:
@@ -318,6 +340,7 @@ class PgStore:
             return
         with self._cursor("delete from the store") as cur:
             cur.execute("DELETE FROM chunks WHERE id = ANY(%s::text[])", (list(ids),))
+            cur.execute(_MARK_STALE)
 
     def set_collection_keys(self, attachment_key: str, collection_keys: list[str]) -> int:
         """File the attachment's item in `collection_keys`; returns the attachment's chunks.
@@ -350,7 +373,55 @@ class PgStore:
             cur.execute("TRUNCATE chunks, attachments")
             cur.execute(cast(Any, f"DROP INDEX IF EXISTS {VECTOR_INDEX}"))
             cur.execute("UPDATE chunk_store SET fingerprint = '{}'::jsonb")
+            cur.execute(_MARK_STALE)
         self._indexed_dimension = None
+
+    # --- keyword statistics -------------------------------------------------
+
+    def keyword_stats_stale(self) -> bool:
+        return bool(self._scalar("SELECT keyword_stale FROM chunk_store WHERE id = 1"))
+
+    def refresh_keyword_stats(self) -> None:
+        """Rebuild what BM25 ranking needs: per-term document counts, and corpus totals.
+
+        Call it once after a batch of writes; a search refreshes stale statistics
+        itself, but then that search pays for it. It runs in one transaction, so
+        searches keep the previous statistics until it commits.
+
+        The corpus is BM25Searcher's: chunks that are not blank. The idf floor is
+        rank_bm25's: a negative idf becomes `BM25_EPSILON` × the vocabulary's mean idf.
+        """
+        with self._cursor("refresh the keyword statistics") as cur:
+            # Chunks written before these columns existed get them from their tsvector.
+            cur.execute(
+                "UPDATE chunks SET n_tokens = (SELECT coalesce(sum(cardinality(positions)), 0) "
+                "FROM unnest(tsv)), blank = (btrim(text, E' \\t\\n\\r') = '') "
+                "WHERE n_tokens IS NULL OR blank IS NULL"
+            )
+            cur.execute("DELETE FROM term_df")
+            cur.execute(
+                "INSERT INTO term_df (word, ndoc) "
+                "SELECT word, ndoc FROM ts_stat('SELECT tsv FROM chunks WHERE NOT blank')"
+            )
+            cur.execute(
+                "SELECT count(*) AS docs, coalesce(avg(n_tokens), 0) AS avgdl "
+                "FROM chunks WHERE NOT blank"
+            )
+            totals = cur.fetchone() or {"docs": 0, "avgdl": 0}
+            docs = int(totals["docs"])
+            cur.execute(
+                "SELECT coalesce(avg(ln((%s - ndoc + 0.5) / (ndoc + 0.5))), 0) AS mean_idf "
+                "FROM term_df",
+                (float(docs),),
+            )
+            row = cur.fetchone()
+            mean_idf = float(row["mean_idf"]) if row else 0.0
+            cur.execute(
+                "UPDATE chunk_store SET keyword_stale = false, keyword_docs = %s, "
+                "keyword_avgdl = %s, keyword_epsilon_idf = %s WHERE id = 1",
+                (docs, float(totals["avgdl"]), BM25_EPSILON * mean_idf),
+            )
+        logger.info("keyword statistics refreshed over %d chunk(s)", docs)
 
     # --- reading -----------------------------------------------------------
 
@@ -466,13 +537,65 @@ class PgStore:
         return None if dimension is None else int(dimension)
 
 
-class PgFullTextSearcher:
-    """Keyword search with Postgres full-text search: a `retrieval.KeywordSearcher`.
+#: BM25Okapi in SQL. `matched` is every chunk sharing a token with the question
+#: (within the filters); each matched (chunk, query term) pair scores
+#: idf × tf × (k1 + 1) / (tf + k1 × (1 − b + b × length / mean length)). Query terms
+#: count with their multiplicity, as rank_bm25 sums over the query's token list, and a
+#: term the corpus lacks scores nothing.
+_BM25_SQL = """
+WITH q(term) AS (SELECT unnest(%(tokens)s::text[])),
+idf AS (
+    SELECT q.term,
+           CASE WHEN raw.idf < 0 THEN s.keyword_epsilon_idf ELSE raw.idf END AS idf
+    FROM q
+    JOIN term_df d ON d.word = q.term
+    CROSS JOIN chunk_store s
+    CROSS JOIN LATERAL (
+        SELECT ln((s.keyword_docs - d.ndoc + 0.5) / (d.ndoc + 0.5)) AS idf
+    ) raw
+),
+matched AS (
+    SELECT c.id, c.tsv, c.n_tokens
+    FROM chunks c
+    JOIN attachments a ON a.key = c.attachment_key
+    JOIN items i ON i.key = a.item_key
+    WHERE NOT c.blank AND c.tsv @@ to_tsquery('simple', %(query)s) {filters}
+),
+tf AS (
+    SELECT m.id, m.n_tokens, u.lexeme, cardinality(u.positions) AS f
+    FROM matched m, unnest(m.tsv) u
+    WHERE u.lexeme = ANY(%(tokens)s::text[])
+),
+summed AS (
+    SELECT tf.id,
+           sum(idf.idf * tf.f * (%(k1)s + 1)
+               / (tf.f + %(k1)s * (1 - %(b)s + %(b)s * tf.n_tokens
+                  / nullif(s.keyword_avgdl, 0)))) AS score
+    FROM tf
+    JOIN idf ON idf.term = tf.lexeme
+    CROSS JOIN chunk_store s
+    GROUP BY tf.id
+),
+scored AS (
+    SELECT id, score FROM summed
+    ORDER BY round(score::numeric, %(decimals)s) DESC, id
+    LIMIT %(limit)s
+)
+"""
 
-    It matches what `BM25Searcher` matches, a chunk sharing any token with the
-    question, because both sides are tokenized by `retrieval.tokenize`. It ranks
-    with `ts_rank_cd` rather than BM25, so the order can differ; hybrid fusion only
-    uses the order.
+
+class PgFullTextSearcher:
+    """Keyword search in the database, ranked by BM25: a `retrieval.KeywordSearcher`.
+
+    It returns what `BM25Searcher` returns over the same chunks, in the same order:
+    the chunks sharing a token with the question (both sides tokenized by
+    `retrieval.tokenize`), ranked by rank_bm25's BM25Okapi. Postgres' own
+    `ts_rank_cd` was measured and rejected: without inverse document frequency,
+    common words decided the order, and hybrid retrieval did worse with it than
+    without any keyword search (zotero-rag-web, docs/spikes.md, S4).
+
+    Ranking reads `PgStore.refresh_keyword_stats`'s statistics, and refreshes them
+    first when a write has made them stale.
     """
 
     def __init__(self, store: PgStore) -> None:
@@ -483,18 +606,28 @@ class PgFullTextSearcher:
     ) -> list[StoredChunk]:
         if limit <= 0 or (filters is not None and filters.selects_nothing):
             return []
-        tokens = sorted(set(tokenize(question)))
+        tokens = tokenize(question)
         if not tokens:
             return []
+        if self._store.keyword_stats_stale():
+            self._store.refresh_keyword_stats()
         where, params = filters_sql(filters)
-        match = "c.tsv @@ to_tsquery('simple', %(query)s)"
-        where = f"{where} AND {match}" if where else f"WHERE {match}"
-        params |= {"query": " | ".join(tokens), "limit": limit}
-        # Normalisation 1 divides by 1 + log(length), as BM25 discounts long passages.
+        conditions = "AND " + where.removeprefix("WHERE ") if where else ""
+        params |= {
+            "tokens": tokens,
+            "query": " | ".join(sorted(set(tokens))),
+            "limit": limit,
+            "k1": BM25_K1,
+            "b": BM25_B,
+            "decimals": SCORE_DECIMALS,
+        }
+        select = _SELECT.replace("SELECT c.id,", "SELECT s.score, c.id,", 1).replace(
+            "FROM chunks c", "FROM scored s\nJOIN chunks c ON c.id = s.id", 1
+        )
         statement = (
-            f"{_SELECT} {where} "
-            "ORDER BY ts_rank_cd(c.tsv, to_tsquery('simple', %(query)s), 1) DESC, c.id "
-            "LIMIT %(limit)s"
+            _BM25_SQL.format(filters=conditions)
+            + select
+            + "ORDER BY round(s.score::numeric, %(decimals)s) DESC, c.id"
         )
         with self._store._cursor("search the store") as cur:
             cur.execute(cast(Any, statement), params)

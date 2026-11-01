@@ -39,6 +39,9 @@ MIN_CANDIDATES = 20
 #: dominate a list that is merely right at rank 3.
 RRF_K = 60
 
+#: Decimals a BM25 score is compared at before ties are broken by chunk id.
+SCORE_DECIMALS = 9
+
 _TOKEN = re.compile(r"[a-z0-9]+")
 
 
@@ -147,8 +150,12 @@ class BM25Searcher:
             return []
 
         scores = self._bm25.get_scores(tokens)
-        # Ties broken by id, so two runs of one question rank identically.
-        matched.sort(key=lambda index: (-scores[index], self._chunks[index].id))
+        # Ties broken by id, so two runs of one question rank identically. Scores are
+        # compared at SCORE_DECIMALS, or equal scores summed in another order (as a
+        # database does) would differ in the last bit and break the tie differently.
+        matched.sort(
+            key=lambda index: (-round(float(scores[index]), SCORE_DECIMALS), self._chunks[index].id)
+        )
         return [self._chunks[index] for index in matched[:limit]]
 
 

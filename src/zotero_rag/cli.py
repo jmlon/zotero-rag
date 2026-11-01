@@ -85,6 +85,7 @@ from zotero_rag.index_folder import (
     Notice,
     build_keyword_index,
     check_fingerprint,
+    finish_writes,
     open_index,
     open_store,
     resolve_reranker,
@@ -805,6 +806,7 @@ def index(
         # Folders can change without any attachment changing, so membership is
         # checked on every run, and the snapshot is written only once it is current.
         refreshed = refresh_collection_keys(store, plan)
+        finish_writes(store)
         write_snapshot(
             index_dir,
             [scope_tree(node, config.index.recursive)] if node is not None else roots,

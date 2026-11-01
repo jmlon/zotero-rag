@@ -63,3 +63,20 @@ CREATE TABLE IF NOT EXISTS chunks (
 );
 CREATE INDEX IF NOT EXISTS chunks_attachment_key_idx ON chunks (attachment_key);
 CREATE INDEX IF NOT EXISTS chunks_tsv_idx ON chunks USING gin (tsv);
+
+-- Keyword search ranks with BM25 (rank_bm25's BM25Okapi), computed in SQL. It needs
+-- each chunk's length in tokens and, per term, how many chunks contain it. Those
+-- statistics are rebuilt by PgStore.refresh_keyword_stats(); every write marks them
+-- stale, and a search refreshes stale statistics before ranking.
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS n_tokens integer;
+ALTER TABLE chunks ADD COLUMN IF NOT EXISTS blank boolean;
+
+CREATE TABLE IF NOT EXISTS term_df (
+    word text    PRIMARY KEY,
+    ndoc integer NOT NULL
+);
+
+ALTER TABLE chunk_store ADD COLUMN IF NOT EXISTS keyword_stale boolean NOT NULL DEFAULT true;
+ALTER TABLE chunk_store ADD COLUMN IF NOT EXISTS keyword_docs integer NOT NULL DEFAULT 0;
+ALTER TABLE chunk_store ADD COLUMN IF NOT EXISTS keyword_avgdl double precision NOT NULL DEFAULT 0;
+ALTER TABLE chunk_store ADD COLUMN IF NOT EXISTS keyword_epsilon_idf double precision NOT NULL DEFAULT 0;

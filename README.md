@@ -775,8 +775,10 @@ zotero-rag eval         # grades the database's retrieval with this folder's que
 
 The folder still supplies `config.yaml` and the question sets. This is how a shared
 deployment such as `zotero-rag-web` is measured with the same `eval` as an index
-folder. Keyword search then runs in the database (full-text search over the same
-tokens BM25 uses) instead of being rebuilt in memory at start-up.
+folder. Keyword search then runs in the database, ranked by the same BM25,
+instead of being rebuilt in memory at start-up. The embedding model must have at
+most 2,000 dimensions (pgvector's index limit): `qwen/qwen3-embedding-8b` (4,096) is
+refused, `openai/text-embedding-3-small` (1,536) works.
 
 ## What lives in an index folder
 

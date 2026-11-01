@@ -1,6 +1,6 @@
 [project]
 name = "zotero-rag-core"
-version = "0.5.0"
+version = "0.5.1"
 description = "Indexing and cited question answering over a Zotero library: the library behind zotero-rag"
 readme = "README.md"
 requires-python = ">=3.12"

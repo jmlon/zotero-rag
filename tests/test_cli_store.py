@@ -147,3 +147,14 @@ def test_index_writes_to_the_database_and_reruns_incrementally(
     assert second.exit_code == 0, second.output
     assert "Updated the folder membership of 1 attachment (no re-embedding)" in second.output
     assert pg_store.collection_keys_by_attachment() == {"NP1": ["QUIC"], "NP2": ["QUIC"]}
+
+
+def test_index_leaves_the_keyword_statistics_fresh(
+    tmp_path: Path, pg_store: PgStore, pg_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """So the first question after indexing does not wait for the refresh."""
+    (tmp_path / "config.yaml").write_text("index:\n  collection_key: NET\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    _fake_library(monkeypatch, {"ROUTING": _paper_with_note("P1")})
+    assert runner.invoke(cli.app, ["index", "--store", pg_url]).exit_code == 0
+    assert not pg_store.keyword_stats_stale()

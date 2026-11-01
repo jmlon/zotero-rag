@@ -13,9 +13,11 @@ Extras:
 
 - `chroma` — the persistent Chroma store an index folder keeps (`zotero_rag_core.stores.chroma.ChromaStore`), one implementation of `zotero_rag_core.store.ChunkStore`.
 - `pgvector` — a shared PostgreSQL store with the pgvector extension
-  (`zotero_rag_core.stores.pg.PgStore`), and Postgres full-text search as the
-  keyword half of hybrid retrieval (`PgFullTextSearcher`). The tables it expects
-  are in `stores/pg_schema.sql`; `PgStore.from_url(url, create=True)` creates them.
+  (`zotero_rag_core.stores.pg.PgStore`), and keyword search in the database
+  (`PgFullTextSearcher`), which ranks with BM25 computed in SQL and returns what
+  the in-memory `BM25Searcher` returns. The tables it expects are in
+  `stores/pg_schema.sql`; `PgStore.from_url(url, create=True)` creates them.
+  Embedding models must have at most 2,000 dimensions, pgvector's index limit.
 
 ## Tests
 

@@ -102,6 +102,18 @@ def open_store(index_dir: Path, store_url: str | None, *, create: bool) -> Chunk
     return store
 
 
+def finish_writes(store: ChunkStore) -> None:
+    """Bring a database's keyword statistics up to date after an `index` run.
+
+    A search would refresh stale statistics itself, but then the first question
+    after indexing would wait for it. A Chroma store keeps nothing of the kind.
+    """
+    from zotero_rag_core.stores.pg import PgStore
+
+    if isinstance(store, PgStore) and store.keyword_stats_stale():
+        store.refresh_keyword_stats()
+
+
 def open_index(on_notice: NoticeFn, store_url: str | None = None) -> tuple[Config, ChunkStore]:
     """Load the index config and open its store, or explain what is missing.
 

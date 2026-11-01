@@ -8,13 +8,14 @@ definition of a match.
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
 import pytest
 
 from tests.test_filters import LIBRARY, chunk_metadata, every_filter, expected, found
 from zotero_rag_core.retrieval import BM25Searcher, KeywordSearcher
-from zotero_rag_core.store import ChunkStore, Filters
+from zotero_rag_core.store import ChunkStore, Filters, VectorStoreError
 from zotero_rag_core.stores.pg import PgFullTextSearcher, PgStore, filters_sql, tsvector_text
 
 
@@ -97,7 +98,12 @@ def test_the_tsvector_is_built_from_bm25s_tokens() -> None:
     assert tsvector_text("GPT 3.5 utilización CFR-RL") == "gpt 3 5 utilizacion cfr rl"
 
 
-def test_a_better_match_ranks_first(pg_store: PgStore) -> None:
+def test_a_tiny_corpus_ranks_as_bm25_does(pg_store: PgStore) -> None:
+    """With two chunks, a word in both has a negative idf, so repeating it ranks *lower*.
+
+    Surprising, and exactly rank_bm25's behaviour, which is the point: the database
+    must not have its own opinion about relevance.
+    """
     texts = {"A": "ECMP once.", "B": "ECMP ECMP ECMP and ECMP hashing with ECMP."}
     pg_store.add(
         ids=["A:1:0", "B:1:0"],
@@ -105,8 +111,8 @@ def test_a_better_match_ranks_first(pg_store: PgStore) -> None:
         documents=list(texts.values()),
         metadatas=[{"attachment_key": key, "page": 1, "chunk_index": 0} for key in texts],
     )
-    hits = PgFullTextSearcher(pg_store).search("ECMP hashing", 2)
-    assert [hit.id for hit in hits] == ["B:1:0", "A:1:0"]
+    want = [c.id for c in BM25Searcher(pg_store.all_chunks()).search("ECMP hashing", 2)]
+    assert [c.id for c in PgFullTextSearcher(pg_store).search("ECMP hashing", 2)] == want
 
 
 def test_keyword_search_respects_the_limit_and_empty_filters(passages: PgStore) -> None:
@@ -197,3 +203,130 @@ def test_the_store_and_searcher_satisfy_the_protocols(pg_store: PgStore) -> None
     store: ChunkStore = pg_store
     searcher: KeywordSearcher = PgFullTextSearcher(pg_store)
     assert store.count() == 0 and searcher.search("anything", 5) == []
+
+
+# --- BM25 ranking in SQL ------------------------------------------------------------------
+
+#: Common words appear in most passages, as in real text without stop-word removal;
+#: they are what Postgres' ts_rank_cd let decide the order (zotero-rag-web S4).
+COMMON = ["the", "of", "and", "a", "to", "in", "is", "what", "how", "with"]
+RARE = [
+    "ecmp",
+    "hashing",
+    "graph",
+    "embedding",
+    "reranker",
+    "latency",
+    "quic",
+    "fog",
+    "transformer",
+    "ontology",
+    "triple",
+    "retrieval",
+    "loss",
+    "topic",
+    "gnn",
+    "bm25",
+]
+
+
+def corpus(seed: int = 7, size: int = 160) -> dict[str, str]:
+    """Passages of varied length mixing common and rare words, a few blank or symbolic."""
+    rng = random.Random(seed)
+    passages: dict[str, str] = {}
+    for n in range(size):
+        words = rng.choices(COMMON, k=rng.randint(4, 30)) + rng.choices(RARE, k=rng.randint(0, 6))
+        rng.shuffle(words)
+        passages[f"P{n:03d}"] = " ".join(words)
+    passages["BLANK"] = "   "
+    passages["SYMBOLS"] = "--- !!! ---"
+    return passages
+
+
+def load(store: PgStore, passages: dict[str, str], tag: str | None = None) -> None:
+    store.add(
+        ids=[f"{key}:1:0" for key in passages],
+        embeddings=[[1.0, 0.0, 0.0]] * len(passages),
+        documents=list(passages.values()),
+        metadatas=[
+            {"attachment_key": key, "page": 1, "chunk_index": 0}
+            | ({"tags": [tag]} if tag and int(key[1:] or 0) % 2 == 0 else {})
+            if key.startswith("P")
+            else {"attachment_key": key, "page": 1, "chunk_index": 0}
+            for key in passages
+        ],
+    )
+
+
+BM25_QUESTIONS = [
+    "What is ECMP hashing?",
+    "how is the graph embedding loss defined",
+    "the of and",  # only common words: idf at or below zero for all of them
+    "ECMP ECMP latency",  # a repeated term counts twice, as in rank_bm25
+    "reranker transformer retrieval with bm25 and quic",
+    "fog",
+    "nothing here matches zzzz",
+]
+
+
+@pytest.mark.parametrize("question", BM25_QUESTIONS)
+def test_sql_ranking_is_bm25s_ranking(pg_store: PgStore, question: str) -> None:
+    """Same chunks in the same order as the in-memory BM25 the CLI uses."""
+    passages = corpus()
+    load(pg_store, passages)
+    memory = BM25Searcher(pg_store.all_chunks())
+    sql = PgFullTextSearcher(pg_store)
+    for limit in (7, 28, 200):
+        want = [chunk.id for chunk in memory.search(question, limit)]
+        assert [chunk.id for chunk in sql.search(question, limit)] == want, limit
+
+
+def test_sql_ranking_with_a_filter_ranks_within_it(pg_store: PgStore) -> None:
+    """Filtered before the cut; statistics stay the whole library's, as in BM25Searcher."""
+    load(pg_store, corpus(), tag="EVEN")
+    filters = Filters(tags=frozenset({"EVEN"}))
+    memory = BM25Searcher(pg_store.all_chunks())
+    sql = PgFullTextSearcher(pg_store)
+    for question in BM25_QUESTIONS:
+        want = [chunk.id for chunk in memory.search(question, 20, filters)]
+        assert [chunk.id for chunk in sql.search(question, 20, filters)] == want, question
+
+
+def test_a_write_makes_the_statistics_stale_and_a_search_refreshes_them(
+    pg_store: PgStore,
+) -> None:
+    load(pg_store, corpus(size=20))
+    searcher = PgFullTextSearcher(pg_store)
+    pg_store.refresh_keyword_stats()
+    assert not pg_store.keyword_stats_stale()
+
+    pg_store.add(
+        ids=["NEW:1:0"],
+        embeddings=[[1.0, 0.0, 0.0]],
+        documents=["zeppelin airship"],
+        metadatas=[{"attachment_key": "NEW"}],
+    )
+    assert pg_store.keyword_stats_stale()
+    assert [chunk.id for chunk in searcher.search("zeppelin", 5)] == ["NEW:1:0"]
+    assert not pg_store.keyword_stats_stale()
+
+    pg_store.delete_ids(["NEW:1:0"])
+    assert pg_store.keyword_stats_stale()
+    assert searcher.search("zeppelin", 5) == []
+
+
+def test_blank_chunks_are_left_out_as_bm25_leaves_them_out(pg_store: PgStore) -> None:
+    load(pg_store, {"P001": "fog nodes", "BLANK": "   "})
+    pg_store.refresh_keyword_stats()
+    assert [chunk.id for chunk in PgFullTextSearcher(pg_store).search("fog", 5)] == ["P001:1:0"]
+
+
+def test_vectors_too_wide_to_index_are_refused_with_a_clear_message(pg_store: PgStore) -> None:
+    with pytest.raises(VectorStoreError, match="at most 2000"):
+        pg_store.add(
+            ids=["A:1:0"],
+            embeddings=[[0.0] * 4096],
+            documents=["a"],
+            metadatas=[{"attachment_key": "A"}],
+        )
+    assert pg_store.count() == 0
