@@ -16,7 +16,7 @@ from langchain_core.messages import AIMessage, BaseMessage
 from zotero_rag.snapshot import CollectionSnapshot
 from zotero_rag_core.errors import CollectionNotFoundError
 from zotero_rag_core.querying import NO_CONTEXT_ANSWER, answer_question
-from zotero_rag_core.retrieval import KeywordIndex, retrieve
+from zotero_rag_core.retrieval import BM25Searcher, retrieve
 from zotero_rag_core.store import Filters, StoredChunk, passes
 from zotero_rag_core.stores.chroma import ChromaStore, scope_where
 from zotero_rag_core.zotero_api import CollectionNode
@@ -135,23 +135,23 @@ def test_an_empty_scope_returns_nothing(store: ChromaStore) -> None:
 
 
 def test_bm25_keeps_only_in_scope_matches(store: ChromaStore) -> None:
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
     assert attachments(index.search("ECMP", 10)) == {"A", "B", "D"}
     assert attachments(index.search("ECMP", 10, folders("K2"))) == {"B"}
 
 
 def test_bm25_fills_its_limit_from_the_scope(store: ChromaStore) -> None:
     """Filtering after the cut would leave a narrow folder with nothing."""
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
     assert attachments(index.search("ECMP", 1, folders("K2"))) == {"B"}
 
 
 def test_bm25_with_an_empty_scope_returns_nothing(store: ChromaStore) -> None:
-    assert KeywordIndex.from_store(store).search("ECMP", 10, folders()) == []
+    assert BM25Searcher.from_store(store).search("ECMP", 10, folders()) == []
 
 
 def test_hybrid_never_fuses_in_an_out_of_scope_chunk(store: ChromaStore) -> None:
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
     hits = retrieve(store, [1.0, 0.0, 0.0], "ECMP", 10, "hybrid", index, filters=folders("K1"))
     assert attachments(hits) == {"A", "C"}
 

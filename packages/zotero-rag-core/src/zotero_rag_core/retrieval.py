@@ -17,7 +17,7 @@ import logging
 import re
 import unicodedata
 from collections.abc import Sequence
-from typing import Literal
+from typing import Literal, Protocol
 
 from rank_bm25 import BM25Okapi
 
@@ -67,8 +67,22 @@ def tokenize(text: str) -> list[str]:
     return _TOKEN.findall(unaccented.casefold())
 
 
-class KeywordIndex:
-    """BM25 over the text of every stored chunk.
+class KeywordSearcher(Protocol):
+    """The keyword half of hybrid retrieval.
+
+    `BM25Searcher` ranks in memory; a database can rank with its own full-text
+    search instead. Either way the contract is `BM25Searcher.search`'s: only chunks
+    sharing a token with the question (as `tokenize` splits it), filtered before
+    the cut, best first.
+    """
+
+    def search(
+        self, question: str, limit: int, filters: Filters | None = None
+    ) -> list[StoredChunk]: ...
+
+
+class BM25Searcher:
+    """BM25 over the text of every stored chunk; a `KeywordSearcher`.
 
     Built in memory from the store rather than persisted: the whole corpus is
     already on disk in Chroma, and a second copy would be one more thing to keep in
@@ -88,7 +102,7 @@ class KeywordIndex:
         logger.info("keyword index built over %d chunk(s)", len(self._chunks))
 
     @classmethod
-    def from_store(cls, store: ChunkStore) -> KeywordIndex:
+    def from_store(cls, store: ChunkStore) -> BM25Searcher:
         return cls(store.all_chunks())
 
     def __len__(self) -> int:
@@ -170,7 +184,7 @@ def retrieve(
     question: str,
     top_k: int,
     mode: RetrievalMode = "vector",
-    keyword_index: KeywordIndex | None = None,
+    keyword_index: KeywordSearcher | None = None,
     filters: Filters | None = None,
 ) -> list[StoredChunk]:
     """The `top_k` chunks for a question that pass `filters`, by the configured strategy.

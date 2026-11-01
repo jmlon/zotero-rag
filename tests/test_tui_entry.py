@@ -25,7 +25,7 @@ from zotero_rag.tui.history import HISTORY_FILENAME
 from zotero_rag.tui.session import Phase, QuerySession, QuerySettings, open_session
 from zotero_rag_core.fingerprint import StoreFingerprint
 from zotero_rag_core.querying import answer_question
-from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
 from zotero_rag_core.stores.chroma import ChromaStore
 from zotero_rag_core.zotero_api import CollectionNode
 
@@ -307,7 +307,7 @@ def test_the_root_scope_gives_the_same_sources_as_query(
         top_k=2,
         window=window,
         mode=mode,
-        keyword_index=KeywordIndex.from_store(store) if mode == "hybrid" else None,
+        keyword_index=BM25Searcher.from_store(store) if mode == "hybrid" else None,
     )
 
     assert from_ui.sources == from_query.sources

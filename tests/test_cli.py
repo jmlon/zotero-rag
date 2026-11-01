@@ -1095,13 +1095,13 @@ def test_hybrid_builds_the_keyword_index_once_per_eval_run(
     _stub_seams(monkeypatch)
     builds: list[int] = []
 
-    real = cli.KeywordIndex.from_store
+    real = cli.BM25Searcher.from_store
 
     def counted(store: object) -> object:
         builds.append(1)
         return real(store)  # type: ignore[arg-type]
 
-    monkeypatch.setattr(cli.KeywordIndex, "from_store", staticmethod(counted))
+    monkeypatch.setattr(cli.BM25Searcher, "from_store", staticmethod(counted))
 
     result = runner.invoke(cli.app, ["eval", "--retrieval", "hybrid", "--json"])
 
@@ -1120,7 +1120,7 @@ def test_vector_mode_builds_no_keyword_index(
     def must_not_build(store: object) -> object:
         raise AssertionError("vector retrieval built a keyword index")
 
-    monkeypatch.setattr(cli.KeywordIndex, "from_store", staticmethod(must_not_build))
+    monkeypatch.setattr(cli.BM25Searcher, "from_store", staticmethod(must_not_build))
 
     assert runner.invoke(cli.app, ["eval", "--retrieval", "vector"]).exit_code == 0
 

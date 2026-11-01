@@ -32,7 +32,7 @@ from zotero_rag_core.llm import (
     usage_from_message,
 )
 from zotero_rag_core.reranking import RerankFn, apply_rerank, candidate_count
-from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode, retrieve
+from zotero_rag_core.retrieval import KeywordSearcher, RetrievalMode, retrieve
 from zotero_rag_core.store import ChunkStore, Filters, StoredChunk
 
 logger = logging.getLogger(__name__)
@@ -325,7 +325,7 @@ def _prepare(
     top_k: int,
     window: int,
     mode: RetrievalMode,
-    keyword_index: KeywordIndex | None,
+    keyword_index: KeywordSearcher | None,
     rerank: RerankFn | None,
     rerank_fanout: int,
     filters: Filters | None,
@@ -394,7 +394,7 @@ def answer_question(
     top_k: int,
     window: int = 0,
     mode: RetrievalMode = "vector",
-    keyword_index: KeywordIndex | None = None,
+    keyword_index: KeywordSearcher | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
     filters: Filters | None = None,
@@ -469,7 +469,7 @@ def stream_answer_question(
     top_k: int,
     window: int = 0,
     mode: RetrievalMode = "vector",
-    keyword_index: KeywordIndex | None = None,
+    keyword_index: KeywordSearcher | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
     filters: Filters | None = None,

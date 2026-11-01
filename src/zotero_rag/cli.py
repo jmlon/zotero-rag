@@ -162,7 +162,7 @@ from zotero_rag_core.planning import (
     item_membership,
 )
 from zotero_rag_core.querying import QueryResult, answer_question
-from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
 from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
 from zotero_rag_core.zotero_api import (
     CollectionNode,
@@ -869,7 +869,7 @@ RerankerOption = Annotated[
 ]
 
 
-def _build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> KeywordIndex | None:
+def _build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> BM25Searcher | None:
     """`build_keyword_index` behind a spinner, since it can take a moment."""
     if mode != "hybrid":
         return None

@@ -29,7 +29,7 @@ from zotero_rag_core.querying import (
     stream_answer_question,
 )
 from zotero_rag_core.reranking import RerankFn
-from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
 from zotero_rag_core.store import Filters
 from zotero_rag_core.stores.chroma import ChromaStore
 
@@ -91,7 +91,7 @@ class QuerySession:
         self._embed_query = embed_query
         self._stream = stream
         self._rerank = rerank
-        self._keyword_index: KeywordIndex | None = None
+        self._keyword_index: BM25Searcher | None = None
         self._keyword_error: Exception | None = None
         self._keyword_ready = threading.Event()
         if not self.needs_keyword_index:

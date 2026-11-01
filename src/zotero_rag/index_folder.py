@@ -22,7 +22,7 @@ from zotero_rag_core.errors import (
 )
 from zotero_rag_core.fingerprint import StoreFingerprint, advisory, blocking
 from zotero_rag_core.reranking import RerankFn, build_reranker
-from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
+from zotero_rag_core.retrieval import BM25Searcher, RetrievalMode
 from zotero_rag_core.stores.chroma import CHROMA_DIRNAME, ChromaStore
 
 REINDEX_REMEDY = (
@@ -116,7 +116,7 @@ def resolve_reranker(config: Config, override: str | None) -> tuple[RerankFn | N
     return build_reranker(config, name), name
 
 
-def build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> KeywordIndex | None:
+def build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> BM25Searcher | None:
     """The BM25 index, built once, or `None` for plain vector retrieval.
 
     Built by the caller rather than inside the query so a run over many questions
@@ -124,4 +124,4 @@ def build_keyword_index(store: ChromaStore, mode: RetrievalMode) -> KeywordIndex
     """
     if mode != "hybrid":
         return None
-    return KeywordIndex.from_store(store)
+    return BM25Searcher.from_store(store)

@@ -15,13 +15,14 @@ from zotero_rag_core.retrieval import (
     CANDIDATE_MULTIPLIER,
     MIN_CANDIDATES,
     RRF_K,
-    KeywordIndex,
+    BM25Searcher,
+    KeywordSearcher,
     candidate_depth,
     reciprocal_rank_fusion,
     retrieve,
     tokenize,
 )
-from zotero_rag_core.store import StoredChunk
+from zotero_rag_core.store import Filters, StoredChunk
 from zotero_rag_core.stores.chroma import ChromaStore
 
 
@@ -74,45 +75,45 @@ CORPUS = [
 
 
 def test_a_keyword_search_finds_the_chunk_holding_the_term() -> None:
-    index = KeywordIndex(CORPUS)
+    index = BM25Searcher(CORPUS)
     assert [c.id for c in index.search("Ee-Routing elephant flows", limit=1)] == ["C:1:0"]
 
 
 def test_a_keyword_search_finds_an_acronym_a_vector_might_miss() -> None:
-    index = KeywordIndex(CORPUS)
+    index = BM25Searcher(CORPUS)
     assert index.search("ECMP", limit=3)[0].id == "B:1:0"
 
 
 def test_chunks_matching_nothing_are_not_padded_in() -> None:
     """Ranking a chunk that holds no query term would be a lie to the fusion step."""
-    index = KeywordIndex(CORPUS)
+    index = BM25Searcher(CORPUS)
     hits = index.search("Jellyfish", limit=4)
     assert [c.id for c in hits] == ["B:1:0"]
 
 
 def test_a_query_with_no_corpus_term_returns_nothing() -> None:
-    index = KeywordIndex(CORPUS)
+    index = BM25Searcher(CORPUS)
     assert index.search("quantum entanglement", limit=5) == []
 
 
 def test_a_query_of_pure_punctuation_returns_nothing() -> None:
-    assert KeywordIndex(CORPUS).search("¿...?", limit=5) == []
+    assert BM25Searcher(CORPUS).search("¿...?", limit=5) == []
 
 
 def test_an_empty_corpus_does_not_raise() -> None:
     """BM25 divides by the average document length, so this is a real edge case."""
-    index = KeywordIndex([])
+    index = BM25Searcher([])
     assert len(index) == 0
     assert index.search("anything", limit=5) == []
 
 
 def test_blank_chunks_are_excluded_from_the_statistics() -> None:
-    index = KeywordIndex([*CORPUS, chunk("E:1:0", "   ")])
+    index = BM25Searcher([*CORPUS, chunk("E:1:0", "   ")])
     assert len(index) == len(CORPUS)
 
 
 def test_a_limit_of_zero_short_circuits() -> None:
-    assert KeywordIndex(CORPUS).search("CFR-RL", limit=0) == []
+    assert BM25Searcher(CORPUS).search("CFR-RL", limit=0) == []
 
 
 def test_the_keyword_index_reads_the_whole_store(tmp_path: Path) -> None:
@@ -124,7 +125,7 @@ def test_the_keyword_index_reads_the_whole_store(tmp_path: Path) -> None:
         metadatas=[{"attachment_key": "A", "page": 1}, {"attachment_key": "B", "page": 1}],
     )
 
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
 
     assert len(index) == 2
     assert index.search("fog", limit=1)[0].id == "A:1:0"
@@ -212,7 +213,7 @@ def hybrid_store(tmp_path: Path) -> ChromaStore:
 
 
 def test_vector_mode_ignores_the_keyword_index(hybrid_store: ChromaStore) -> None:
-    index = KeywordIndex.from_store(hybrid_store)
+    index = BM25Searcher.from_store(hybrid_store)
     hits = retrieve(
         hybrid_store, [1.0, 0.0, 0.0], "ECMP", top_k=2, mode="vector", keyword_index=index
     )
@@ -221,7 +222,7 @@ def test_vector_mode_ignores_the_keyword_index(hybrid_store: ChromaStore) -> Non
 
 def test_hybrid_surfaces_a_chunk_the_vectors_ranked_last(hybrid_store: ChromaStore) -> None:
     """The case §11.4 predicted: the term is in C, but C is the furthest vector."""
-    index = KeywordIndex.from_store(hybrid_store)
+    index = BM25Searcher.from_store(hybrid_store)
 
     hits = retrieve(
         hybrid_store, [1.0, 0.0, 0.0], "ECMP", top_k=2, mode="hybrid", keyword_index=index
@@ -237,7 +238,7 @@ def test_hybrid_without_an_index_falls_back_to_vectors(hybrid_store: ChromaStore
 
 def test_hybrid_falls_back_when_bm25_matches_nothing(hybrid_store: ChromaStore) -> None:
     """A question sharing no token with the corpus must not return an empty list."""
-    index = KeywordIndex.from_store(hybrid_store)
+    index = BM25Searcher.from_store(hybrid_store)
 
     hits = retrieve(
         hybrid_store,
@@ -251,8 +252,43 @@ def test_hybrid_falls_back_when_bm25_matches_nothing(hybrid_store: ChromaStore) 
     assert [c.id for c in hits] == ["A:1:0", "B:1:0"]
 
 
+class ScriptedSearcher:
+    """A keyword searcher that is not BM25, as a database's full-text search is not."""
+
+    def __init__(self, hits: list[StoredChunk]) -> None:
+        self.hits = hits
+        self.calls: list[tuple[str, int, Filters | None]] = []
+
+    def search(
+        self, question: str, limit: int, filters: Filters | None = None
+    ) -> list[StoredChunk]:
+        self.calls.append((question, limit, filters))
+        return self.hits[:limit]
+
+
+def test_hybrid_fuses_any_keyword_searcher(hybrid_store: ChromaStore) -> None:
+    """`retrieve` depends on the `KeywordSearcher` contract, not on BM25."""
+    searcher: KeywordSearcher = ScriptedSearcher(hybrid_store.get_by_ids(["C:1:0"]))
+    filters = Filters(year_min=2000)
+    hits = retrieve(
+        hybrid_store,
+        [1.0, 0.0, 0.0],
+        "ECMP",
+        top_k=2,
+        mode="hybrid",
+        keyword_index=searcher,
+        filters=Filters(),
+    )
+    assert "C:1:0" in [c.id for c in hits]
+
+    retrieve(hybrid_store, [1.0, 0.0, 0.0], "ECMP", 2, "hybrid", searcher, filters)
+    assert isinstance(searcher, ScriptedSearcher)
+    # Asked as deep as the vector side, with the same filters, before fusion.
+    assert searcher.calls[-1] == ("ECMP", candidate_depth(2), filters)
+
+
 def test_hybrid_returns_at_most_top_k(hybrid_store: ChromaStore) -> None:
-    index = KeywordIndex.from_store(hybrid_store)
+    index = BM25Searcher.from_store(hybrid_store)
     hits = retrieve(
         hybrid_store, [1.0, 0.0, 0.0], "balancing ECMP", top_k=2, mode="hybrid", keyword_index=index
     )
@@ -271,7 +307,7 @@ def test_hybrid_composes_with_windowing(tmp_path: Path) -> None:
         documents=["before the term", "the term is rEDKSP here", "after the term"],
         metadatas=[{"attachment_key": "A", "page": 1, "chunk_index": index} for index in range(3)],
     )
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
     seen: list[str] = []
 
     def answer(messages: list) -> object:  # type: ignore[type-arg]
@@ -304,7 +340,7 @@ def test_a_match_scoring_zero_is_still_a_match() -> None:
     most of them.
     """
     corpus = [chunk("A:1:0", "fog computing"), chunk("B:1:0", "cloud routing")]
-    index = KeywordIndex(corpus)
+    index = BM25Searcher(corpus)
 
     hits = index.search("fog", limit=2)
 

@@ -16,7 +16,7 @@ import pytest
 
 from zotero_rag_core.metadata import item_tags, year_number
 from zotero_rag_core.planning import PlannedAttachment
-from zotero_rag_core.retrieval import KeywordIndex
+from zotero_rag_core.retrieval import BM25Searcher
 from zotero_rag_core.store import YEAR_UNKNOWN, Filters, passes
 from zotero_rag_core.stores.chroma import ChromaStore, filters_where
 
@@ -136,7 +136,7 @@ def test_chroma_returns_exactly_what_the_rule_accepts(store: ChromaStore, filter
 def test_keyword_search_returns_exactly_what_the_rule_accepts(
     store: ChromaStore, filters: Filters
 ) -> None:
-    index = KeywordIndex.from_store(store)
+    index = BM25Searcher.from_store(store)
     assert found(index.search("retrieval", len(LIBRARY), filters)) == expected(filters)
 
 
