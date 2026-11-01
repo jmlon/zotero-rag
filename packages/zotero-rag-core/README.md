@@ -12,3 +12,14 @@ environment variables.
 Extras:
 
 - `chroma` — the persistent Chroma store an index folder keeps (`zotero_rag_core.stores.chroma.ChromaStore`), one implementation of `zotero_rag_core.store.ChunkStore`.
+- `pgvector` — a shared PostgreSQL store with the pgvector extension
+  (`zotero_rag_core.stores.pg.PgStore`), and Postgres full-text search as the
+  keyword half of hybrid retrieval (`PgFullTextSearcher`). The tables it expects
+  are in `stores/pg_schema.sql`; `PgStore.from_url(url, create=True)` creates them.
+
+## Tests
+
+The PostgreSQL tests start a disposable `pgvector/pgvector:pg17` container through
+Docker, or use the database in `ZOTERO_RAG_TEST_PG_URL` (which they empty). Without
+either they are skipped; set `ZOTERO_RAG_REQUIRE_PG=1` to make that a failure, as CI
+should.

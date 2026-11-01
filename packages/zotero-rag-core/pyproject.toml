@@ -22,6 +22,8 @@ dependencies = [
 [project.optional-dependencies]
 # The persistent Chroma store the CLI keeps in each index folder.
 chroma = ["chromadb>=1.5.9"]
+# A shared PostgreSQL store with pgvector, for a hosted deployment.
+pgvector = ["psycopg[binary]>=3.2", "psycopg-pool>=3.2"]
 
 [build-system]
 requires = ["hatchling"]

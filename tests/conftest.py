@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import io
+import os
 import zipfile
+from collections.abc import Iterator
 from html import escape
 from pathlib import Path
 
 import pytest
 from pypdf import PdfWriter
 from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+from zotero_rag_core.stores.pg import PgStore
 
 
 def make_pdf_bytes(pages_text: list[str]) -> bytes:
@@ -151,3 +155,53 @@ def _no_price_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
         "zotero_rag.cli.fetch_price",
         lambda endpoint, model: ModelPrice(prompt=1.5e-07, completion=6e-07),
     )
+
+
+# --- PostgreSQL ------------------------------------------------------------------
+
+#: Point at an existing database (it is emptied!) instead of starting a container.
+PG_URL_ENV = "ZOTERO_RAG_TEST_PG_URL"
+#: Set in CI so that a missing database fails the run instead of skipping its tests.
+PG_REQUIRED_ENV = "ZOTERO_RAG_REQUIRE_PG"
+PG_IMAGE = "pgvector/pgvector:pg17"
+
+
+@pytest.fixture(scope="session")
+def pg_url() -> Iterator[str]:
+    """A PostgreSQL with pgvector: from `ZOTERO_RAG_TEST_PG_URL`, else a container.
+
+    Tests needing it are skipped, not failed, where neither is available, so the
+    suite still runs on a machine without Docker.
+    """
+    configured = os.environ.get(PG_URL_ENV)
+    if configured:
+        yield configured
+        return
+    try:
+        from testcontainers.postgres import PostgresContainer
+
+        container = PostgresContainer(PG_IMAGE, driver=None)
+        container.start()
+    except Exception as exc:  # noqa: BLE001 - no Docker, no image, no permission...
+        reason = f"no PostgreSQL for tests (set {PG_URL_ENV} or start Docker): {exc}"
+        if os.environ.get(PG_REQUIRED_ENV):
+            pytest.fail(reason)
+        pytest.skip(reason)
+    try:
+        yield container.get_connection_url()
+    finally:
+        container.stop()
+
+
+@pytest.fixture
+def pg_store(pg_url: str) -> Iterator[PgStore]:
+    """An empty `PgStore`: its tables are dropped and recreated for every test."""
+    import psycopg
+
+    with psycopg.connect(pg_url, autocommit=True) as conn:
+        conn.execute("DROP TABLE IF EXISTS chunks, attachments, items, chunk_store CASCADE")
+    store = PgStore.from_url(pg_url, create=True)
+    try:
+        yield store
+    finally:
+        store.close()

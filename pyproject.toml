@@ -6,8 +6,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    # The indexing and query pipeline, with the Chroma store kept in index folders.
-    "zotero-rag-core[chroma]",
+    # The indexing and query pipeline: Chroma for index folders, pgvector for a
+    # shared PostgreSQL store.
+    "zotero-rag-core[chroma,pgvector]",
     # Markdown transcripts. Capped below the next minor: the API is pre-1.0.
     "firecrawl-anydoc>=0.2.4,<0.3",
     # Imported directly to catch transport errors pyzotero lets through.
@@ -37,6 +38,7 @@ dev = [
     "plotly>=7.1.0",
     "pytest>=9.1.1",
     "ruff>=0.16.0",
+    "testcontainers[postgres]>=4.8",
     "types-pyyaml>=6.0.12",
 ]
 

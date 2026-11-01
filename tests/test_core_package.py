@@ -1,8 +1,9 @@
 """The core package stands alone: no CLI, no terminal UI, and Chroma only on request.
 
-`zotero-rag-web` installs `zotero-rag-core` without the `chroma` extra, so any core
-module importing chromadb (or the CLI's own dependencies) at import time would
-break it, while every test here would still pass with everything installed.
+`zotero-rag-web` installs `zotero-rag-core` without the `chroma` extra, and the CLI
+could be installed without `pgvector`, so a core module importing either (or the
+CLI's own dependencies) at import time would break an install, while every test
+here would still pass with everything installed.
 """
 
 from __future__ import annotations
@@ -17,10 +18,19 @@ from zotero_rag_core.store import ChunkStore
 from zotero_rag_core.stores.chroma import ChromaStore
 
 #: Modules that may only be needed by the CLI, or by an optional extra.
-FORBIDDEN = ("chromadb", "zotero_rag", "typer", "textual", "dotenv", "firecrawl_anydoc")
+FORBIDDEN = (
+    "chromadb",
+    "psycopg",
+    "psycopg_pool",
+    "zotero_rag",
+    "typer",
+    "textual",
+    "dotenv",
+    "firecrawl_anydoc",
+)
 
 #: Core modules that are allowed to need an extra.
-NEEDS_EXTRA = {"zotero_rag_core.stores.chroma"}
+NEEDS_EXTRA = {"zotero_rag_core.stores.chroma", "zotero_rag_core.stores.pg"}
 
 
 def _core_modules() -> list[str]:
