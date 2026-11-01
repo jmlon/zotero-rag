@@ -66,6 +66,16 @@ uv tool install .          # puts `zotero-rag` and `zotero-rag-ui` in ~/.local/b
 If the tool was installed before, add `--reinstall` so uv rebuilds it instead of
 reusing the cached build.
 
+**Upgrading from 0.4.x?** The pipeline now lives in a second package,
+`zotero-rag-core` (see [Development](#development)). An install made before that,
+even an `--editable` one, does not have it and fails with
+`ModuleNotFoundError: No module named 'zotero_rag_core'`. Install once more from
+the checkout to fix it:
+
+```bash
+uv tool install --editable . --reinstall
+```
+
 That copies the current source, so re-run it after pulling or editing the code —
 or install with `uv tool install --editable .` to have the command track your
 checkout. To go back to running from the source tree, prefix the commands below
