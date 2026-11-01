@@ -13,7 +13,7 @@ global:
         llm_model: openai/gpt-6-luna
         embedding_model: openai/text-embedding-3-small
         vector_db: chroma
-        reranker: null
+        reranker: voyageai/rerank-3-lite
         judge_model: google/gemini-3.5-flash-lite
 
 index:
