@@ -13,7 +13,7 @@ from __future__ import annotations
 from collections.abc import Collection, Mapping
 from typing import Any, Protocol
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from zotero_rag_core.errors import ZoteroRagError
 from zotero_rag_core.fingerprint import StoreFingerprint
@@ -49,21 +49,82 @@ def reading_order_key(chunk: StoredChunk) -> tuple[str, int, int]:
     return str(chunk.metadata.get("attachment_key") or ""), number("page"), number("chunk_index")
 
 
-#: Collection keys a search is limited to; `None` searches the whole store.
-Scope = Collection[str] | None
+#: `year_int` of a chunk whose item has no parseable year. Chroma rejects `None`.
+YEAR_UNKNOWN = 0
 
 
-def in_scope(metadata: Mapping[str, Any], scope: Scope) -> bool:
-    """Whether a chunk belongs to `scope`.
+class Filters(BaseModel):
+    """What a search is limited to. Every condition given must hold (AND).
 
-    A chunk with no `collection_keys` (written before they existed) is outside every
-    scope, but inside an unscoped search. A store filtering in its own query
-    language must agree with this rule.
+    `None` means "no condition". An *empty* set is a condition nothing satisfies,
+    so a folder with no subfolders that nobody filed anything in returns nothing,
+    rather than silently widening to the whole library.
+
+    Chunks carry `collection_keys`, `year_int` and `tags` in their metadata
+    (`planning.PlannedAttachment.chunk_metadata`). A chunk written before a field
+    existed fails every condition on that field, and passes searches without one.
+    A store filtering in its own query language must agree with `matches`.
     """
-    if scope is None:
+
+    model_config = ConfigDict(frozen=True)
+
+    #: The chunk's item is filed in any of these collections.
+    collection_keys: frozenset[str] | None = None
+    #: Inclusive bounds on the item's publication year.
+    year_min: int | None = None
+    year_max: int | None = None
+    #: With a year bound, also keep items that have no year.
+    include_undated: bool = True
+    #: The chunk's item carries any of these tags.
+    tags: frozenset[str] | None = None
+
+    @model_validator(mode="after")
+    def _ordered_years(self) -> Filters:
+        low, high = self.year_min, self.year_max
+        if low is not None and high is not None and low > high:
+            raise ValueError(f"year_min ({low}) is after year_max ({high})")
+        return self
+
+    @classmethod
+    def in_collections(cls, keys: Collection[str] | None) -> Filters | None:
+        """A folder filter, or `None` (no filter at all) for `keys=None`."""
+        return None if keys is None else cls(collection_keys=frozenset(keys))
+
+    @property
+    def limits_year(self) -> bool:
+        return self.year_min is not None or self.year_max is not None
+
+    @property
+    def selects_nothing(self) -> bool:
+        """True when no chunk can match, so a store need not be asked at all."""
+        return self.collection_keys == frozenset() or self.tags == frozenset()
+
+    def matches(self, metadata: Mapping[str, Any]) -> bool:
+        """Whether a chunk with this metadata passes every condition."""
+        if self.collection_keys is not None:
+            keys = metadata.get("collection_keys")
+            if not isinstance(keys, list) or self.collection_keys.isdisjoint(keys):
+                return False
+        if self.tags is not None:
+            tags = metadata.get("tags")
+            if not isinstance(tags, list) or self.tags.isdisjoint(tags):
+                return False
+        if self.limits_year:
+            year = metadata.get("year_int")
+            if not isinstance(year, int):
+                return False
+            if year == YEAR_UNKNOWN:
+                return self.include_undated
+            if self.year_min is not None and year < self.year_min:
+                return False
+            if self.year_max is not None and year > self.year_max:
+                return False
         return True
-    keys = metadata.get("collection_keys")
-    return isinstance(keys, list) and not set(scope).isdisjoint(keys)
+
+
+def passes(metadata: Mapping[str, Any], filters: Filters | None) -> bool:
+    """`filters.matches`, with `None` meaning no filter."""
+    return filters is None or filters.matches(metadata)
 
 
 class ChunkStore(Protocol):
@@ -113,11 +174,13 @@ class ChunkStore(Protocol):
 
     # --- reading -----------------------------------------------------------
 
-    def query(self, embedding: list[float], top_k: int, scope: Scope = None) -> list[StoredChunk]:
-        """The `top_k` nearest chunks to an embedded question, within `scope`, nearest first.
+    def query(
+        self, embedding: list[float], top_k: int, filters: Filters | None = None
+    ) -> list[StoredChunk]:
+        """The `top_k` nearest chunks to an embedded question that pass `filters`, nearest first.
 
-        Fewer come back when the scope holds fewer chunks; an empty scope matches
-        nothing. `StoredChunk.distance` is the cosine distance.
+        The filters apply before the cut, so a narrow filter still fills `top_k`
+        when it holds that many chunks. `StoredChunk.distance` is the cosine distance.
         """
         ...
 

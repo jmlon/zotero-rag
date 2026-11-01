@@ -16,7 +16,13 @@ import chromadb
 from chromadb.config import Settings
 
 from zotero_rag_core.fingerprint import StoreFingerprint
-from zotero_rag_core.store import Scope, StoredChunk, VectorStoreError, reading_order_key
+from zotero_rag_core.store import (
+    YEAR_UNKNOWN,
+    Filters,
+    StoredChunk,
+    VectorStoreError,
+    reading_order_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,18 +31,61 @@ COLLECTION_NAME = "zotero_rag"
 
 
 def scope_where(scope: Collection[str]) -> dict[str, Any]:
-    """The Chroma filter for chunks held by any collection in `scope`.
+    """The Chroma filter for chunks held by any collection in `scope`."""
+    return _any_of("collection_keys", scope)
+
+
+def _any_of(field: str, values: Collection[str]) -> dict[str, Any]:
+    """Chunks whose list metadata `field` holds any of `values`.
 
     Verified against chromadb 1.5.9 (PRD-CursesUI §4.3.1): only `$contains` matches
     inside a list value. `$in` and plain equality silently match nothing, and `$or`
-    refuses fewer than two clauses, so a single key needs the bare form. Keys are
-    sorted so that one scope always yields one filter.
+    refuses fewer than two clauses, so a single value needs the bare form. Values
+    are sorted so that one filter always yields one clause.
     """
-    keys = sorted(set(scope))
-    if not keys:
-        raise ValueError("An empty scope selects nothing; check for it before filtering")
-    clauses = [{"collection_keys": {"$contains": key}} for key in keys]
+    ordered = sorted(set(values))
+    if not ordered:
+        raise ValueError(f"An empty {field} filter selects nothing; check for it before filtering")
+    clauses = [{field: {"$contains": value}} for value in ordered]
     return clauses[0] if len(clauses) == 1 else {"$or": clauses}
+
+
+def _all_of(clauses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """`$and` refuses fewer than two clauses too."""
+    if not clauses:
+        return None
+    return clauses[0] if len(clauses) == 1 else {"$and": clauses}
+
+
+def _year_where(filters: Filters) -> dict[str, Any]:
+    """The year bounds, as `Filters.matches` applies them.
+
+    Dated chunks carry a `year_int` above `YEAR_UNKNOWN`, so the bounds exclude the
+    sentinel explicitly: a bare `$lte` would let every undated chunk through.
+    A chunk with no `year_int` at all matches neither branch.
+    """
+    bounds: list[dict[str, Any]] = [{"year_int": {"$gt": YEAR_UNKNOWN}}]
+    if filters.year_min is not None:
+        bounds.append({"year_int": {"$gte": filters.year_min}})
+    if filters.year_max is not None:
+        bounds.append({"year_int": {"$lte": filters.year_max}})
+    dated = _all_of(bounds)
+    assert dated is not None
+    if not filters.include_undated:
+        return dated
+    return {"$or": [dated, {"year_int": YEAR_UNKNOWN}]}
+
+
+def filters_where(filters: Filters) -> dict[str, Any] | None:
+    """The Chroma `where` clause for `filters`, or `None` when nothing is filtered."""
+    clauses: list[dict[str, Any]] = []
+    if filters.collection_keys is not None:
+        clauses.append(scope_where(filters.collection_keys))
+    if filters.tags is not None:
+        clauses.append(_any_of("tags", filters.tags))
+    if filters.limits_year:
+        clauses.append(_year_where(filters))
+    return _all_of(clauses)
 
 
 class ChromaStore:
@@ -96,16 +145,19 @@ class ChromaStore:
         found = self._collection.get(where={"attachment_key": attachment_key})
         return sorted(self._to_chunks(found), key=reading_order_key)
 
-    def query(self, embedding: list[float], top_k: int, scope: Scope = None) -> list[StoredChunk]:
-        """The `top_k` nearest chunks to an embedded question, within `scope`.
+    def query(
+        self, embedding: list[float], top_k: int, filters: Filters | None = None
+    ) -> list[StoredChunk]:
+        """The `top_k` nearest chunks to an embedded question that pass `filters`.
 
-        Fewer come back when the scope holds fewer chunks. An empty scope matches
-        nothing and makes no call at all.
+        Fewer come back when the filters hold fewer chunks. Filters that select
+        nothing make no call at all.
         """
-        if scope is not None and not scope:
+        if filters is not None and filters.selects_nothing:
             return []
-        # Passed only when scoped, so an unscoped query is exactly the call it was.
-        where = {"where": cast(Any, scope_where(scope))} if scope is not None else {}
+        # Passed only when filtering, so an unfiltered query is exactly the call it was.
+        clause = filters_where(filters) if filters is not None else None
+        where = {"where": cast(Any, clause)} if clause is not None else {}
         try:
             result = self._collection.query(
                 query_embeddings=cast(Any, [embedding]),

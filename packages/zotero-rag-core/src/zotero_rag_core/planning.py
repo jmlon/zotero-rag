@@ -21,7 +21,13 @@ from pydantic import BaseModel, Field
 
 from zotero_rag_core import html_text, provenance
 from zotero_rag_core.documents import DocumentFormat, LocatorKind, format_for
-from zotero_rag_core.metadata import authors_str, parse_year, zotero_url
+from zotero_rag_core.metadata import (
+    authors_str,
+    item_tags,
+    parse_year,
+    year_number,
+    zotero_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +86,8 @@ class PlannedAttachment(BaseModel):
     # to a subtree (PRD-CursesUI §4.3). Empty only for plans built without
     # membership, such as in tests; such chunks are simply left out of a scoped search.
     collection_keys: list[str] = Field(default_factory=list)
+    #: The parent item's tags, sorted, for filtering by tag.
+    tags: list[str] = Field(default_factory=list)
     zotero_url: str = ""
     # Zotero's own version counter, bumped whenever the file or its metadata
     # changes. Compared against the stored copy to decide whether an
@@ -105,8 +113,11 @@ class PlannedAttachment(BaseModel):
         """Per-chunk metadata for the vector store (PRD §7.2).
 
         Chroma rejects `None`, so every value is a string or an int, except
-        `collection_keys`, a list of strings. Chroma also rejects an empty list, so
-        that key is left out rather than written empty.
+        `collection_keys` and `tags`, lists of strings. Chroma also rejects an empty
+        list, so those keys are left out rather than written empty.
+
+        `year_int` is the year as a number, for range filters (`store.Filters`), and
+        `store.YEAR_UNKNOWN` when the item has none. `year` stays the string cited.
 
         `page` keeps its name for the locator ordinal: chunks written before M5 are
         all pages, and renaming the key would strand them. `locator_kind` says what
@@ -118,6 +129,7 @@ class PlannedAttachment(BaseModel):
             "title": self.title,
             "authors": self.authors,
             "year": self.year,
+            "year_int": year_number(self.year),
             "doi": self.doi,
             "zotero_url": self.zotero_url,
             "collection_name": self.collection_name,
@@ -131,6 +143,8 @@ class PlannedAttachment(BaseModel):
         }
         if self.collection_keys:
             metadata["collection_keys"] = list(self.collection_keys)
+        if self.tags:
+            metadata["tags"] = list(self.tags)
         return metadata
 
 
@@ -581,6 +595,7 @@ def _planned(
         doi=parent_data.get("DOI") or "",
         collection_name=candidate.collection_name,
         collection_keys=list(membership.get(parent_key, [])),
+        tags=item_tags(parent_data),
         zotero_url=zotero_url(username, parent_key, parent_data.get("collections")),
         version=_version(candidate.data),
         content_type=candidate.content_type,
@@ -639,6 +654,7 @@ def _plan_notes(
                 doi=parent_data.get("DOI") or "",
                 collection_name=collection_name,
                 collection_keys=list(membership.get(str(parent_key), [])),
+                tags=item_tags(parent_data),
                 zotero_url=zotero_url(username, str(parent_key), parent_data.get("collections")),
                 version=_version(data),
                 content_type="note",

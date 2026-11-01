@@ -88,3 +88,23 @@ def zotero_url(username: str, item_key: str, collections: list[str] | None) -> s
             f"/items/{item_key}/collection"
         )
     return f"https://www.zotero.org/{username}/items/{item_key}"
+
+
+def year_number(year: str) -> int:
+    """`parse_year`'s result as a number; `store.YEAR_UNKNOWN` (0) when there is none."""
+    return int(year) if year.isdigit() else 0
+
+
+def item_tags(data: dict[str, Any]) -> list[str]:
+    """An item's tags, sorted and de-duplicated.
+
+    Zotero sends `tags` as `[{"tag": "RAG", "type": 1}, ...]`: type 0 is a tag the
+    user added, 1 one imported automatically. Both count, as in Zotero's own tag
+    selector.
+    """
+    names = {
+        str(entry.get("tag")).strip()
+        for entry in data.get("tags") or []
+        if isinstance(entry, dict) and str(entry.get("tag") or "").strip()
+    }
+    return sorted(names)

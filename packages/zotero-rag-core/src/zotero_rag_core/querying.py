@@ -33,7 +33,7 @@ from zotero_rag_core.llm import (
 )
 from zotero_rag_core.reranking import RerankFn, apply_rerank, candidate_count
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode, retrieve
-from zotero_rag_core.store import ChunkStore, Scope, StoredChunk
+from zotero_rag_core.store import ChunkStore, Filters, StoredChunk
 
 logger = logging.getLogger(__name__)
 
@@ -328,14 +328,14 @@ def _prepare(
     keyword_index: KeywordIndex | None,
     rerank: RerankFn | None,
     rerank_fanout: int,
-    scope: Scope,
+    filters: Filters | None,
 ) -> _Prepared:
     """Retrieve wide → rerank → window → number the sources → build the prompt."""
     start = time.perf_counter()
 
     embedding = embed_query(question)
     depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
-    candidates = retrieve(store, embedding, question, depth, mode, keyword_index, scope)
+    candidates = retrieve(store, embedding, question, depth, mode, keyword_index, filters)
     hits, reranked, rerank_cost = apply_rerank(candidates, question, top_k, rerank)
     chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
@@ -397,7 +397,7 @@ def answer_question(
     keyword_index: KeywordIndex | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
-    scope: Scope = None,
+    filters: Filters | None = None,
 ) -> QueryResult:
     """Retrieve `top_k` chunks for the question and have the LLM answer from them.
 
@@ -417,9 +417,9 @@ def answer_question(
     candidates, and reranking before the cut is what lets it discard rather than
     merely reorder.
 
-    With a `scope`, only chunks held by those collection keys are retrieved, so the
-    reranker chooses among them and windowing then stays inside their attachments
-    (PRD-CursesUI §4.3.1). `None`, the default, searches the whole store.
+    With `filters`, only chunks that pass them are retrieved (by folder, year or
+    tag), so the reranker chooses among them and windowing then stays inside their
+    attachments (PRD-CursesUI §4.3.1). `None`, the default, searches the whole store.
 
     With nothing retrieved, no LLM call is made: an empty context can only
     produce "I don't know", and saying so costs nothing.
@@ -434,7 +434,7 @@ def answer_question(
         keyword_index=keyword_index,
         rerank=rerank,
         rerank_fanout=rerank_fanout,
-        scope=scope,
+        filters=filters,
     )
     if prepared.messages is None:
         return _no_context(prepared)
@@ -472,7 +472,7 @@ def stream_answer_question(
     keyword_index: KeywordIndex | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
-    scope: Scope = None,
+    filters: Filters | None = None,
 ) -> QueryResult:
     """`answer_question`, with the answer's text sent to `on_token` as it arrives.
 
@@ -501,7 +501,7 @@ def stream_answer_question(
         keyword_index=keyword_index,
         rerank=rerank,
         rerank_fanout=rerank_fanout,
-        scope=scope,
+        filters=filters,
     )
     if prepared.messages is None:
         on_token(NO_CONTEXT_ANSWER)

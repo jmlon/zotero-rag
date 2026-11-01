@@ -17,7 +17,7 @@ from zotero_rag.snapshot import CollectionSnapshot
 from zotero_rag_core.errors import CollectionNotFoundError
 from zotero_rag_core.querying import NO_CONTEXT_ANSWER, answer_question
 from zotero_rag_core.retrieval import KeywordIndex, retrieve
-from zotero_rag_core.store import StoredChunk, in_scope
+from zotero_rag_core.store import Filters, StoredChunk, passes
 from zotero_rag_core.stores.chroma import ChromaStore, scope_where
 from zotero_rag_core.zotero_api import CollectionNode
 
@@ -55,6 +55,11 @@ def store(tmp_path: Path) -> ChromaStore:
     return store
 
 
+def folders(*keys: str) -> Filters:
+    """A filter on these collection keys; none at all selects nothing."""
+    return Filters(collection_keys=frozenset(keys))
+
+
 def attachments(chunks: list[StoredChunk]) -> set[str]:
     return {chunk.metadata["attachment_key"] for chunk in chunks}
 
@@ -81,11 +86,11 @@ def test_an_empty_scope_is_refused_rather_than_sent() -> None:
         scope_where(set())
 
 
-def test_in_scope_applies_the_same_rule_in_python() -> None:
-    assert in_scope({"collection_keys": ["K1", "K3"]}, {"K3"})
-    assert not in_scope({"collection_keys": ["K1"]}, {"K2"})
-    assert not in_scope({}, {"K1"})  # predates the field: outside every scope
-    assert in_scope({}, None)  # ...but inside an unscoped search
+def test_filters_apply_the_same_rule_in_python() -> None:
+    assert passes({"collection_keys": ["K1", "K3"]}, folders("K3"))
+    assert not passes({"collection_keys": ["K1"]}, folders("K2"))
+    assert not passes({}, folders("K1"))  # predates the field: outside every scope
+    assert passes({}, None)  # ...but inside an unscoped search
 
 
 def test_in_is_the_trap_this_module_avoids(store: ChromaStore) -> None:
@@ -106,24 +111,24 @@ def test_an_unscoped_query_sees_the_whole_store(store: ChromaStore) -> None:
 
 
 def test_a_scoped_query_returns_only_chunks_in_the_scope(store: ChromaStore) -> None:
-    assert attachments(store.query([1.0, 0.0, 0.0], 10, {"K1"})) == {"A", "C"}
+    assert attachments(store.query([1.0, 0.0, 0.0], 10, folders("K1"))) == {"A", "C"}
 
 
 def test_a_multi_key_scope_is_the_union(store: ChromaStore) -> None:
-    assert attachments(store.query([1.0, 0.0, 0.0], 10, {"K2", "K3"})) == {"B", "C"}
+    assert attachments(store.query([1.0, 0.0, 0.0], 10, folders("K2", "K3"))) == {"B", "C"}
 
 
 def test_the_scope_applies_before_the_cut(store: ChromaStore) -> None:
     """B ranks below A and D overall; scoped to K2 it must still be returned."""
-    assert attachments(store.query([1.0, 0.0, 0.0], 1, {"K2"})) == {"B"}
+    assert attachments(store.query([1.0, 0.0, 0.0], 1, folders("K2"))) == {"B"}
 
 
 def test_a_scope_nobody_holds_returns_nothing(store: ChromaStore) -> None:
-    assert store.query([1.0, 0.0, 0.0], 10, {"NOPE"}) == []
+    assert store.query([1.0, 0.0, 0.0], 10, folders("NOPE")) == []
 
 
 def test_an_empty_scope_returns_nothing(store: ChromaStore) -> None:
-    assert store.query([1.0, 0.0, 0.0], 10, set()) == []
+    assert store.query([1.0, 0.0, 0.0], 10, folders()) == []
 
 
 # --- keyword search and hybrid ------------------------------------------------
@@ -132,22 +137,22 @@ def test_an_empty_scope_returns_nothing(store: ChromaStore) -> None:
 def test_bm25_keeps_only_in_scope_matches(store: ChromaStore) -> None:
     index = KeywordIndex.from_store(store)
     assert attachments(index.search("ECMP", 10)) == {"A", "B", "D"}
-    assert attachments(index.search("ECMP", 10, {"K2"})) == {"B"}
+    assert attachments(index.search("ECMP", 10, folders("K2"))) == {"B"}
 
 
 def test_bm25_fills_its_limit_from_the_scope(store: ChromaStore) -> None:
     """Filtering after the cut would leave a narrow folder with nothing."""
     index = KeywordIndex.from_store(store)
-    assert attachments(index.search("ECMP", 1, {"K2"})) == {"B"}
+    assert attachments(index.search("ECMP", 1, folders("K2"))) == {"B"}
 
 
 def test_bm25_with_an_empty_scope_returns_nothing(store: ChromaStore) -> None:
-    assert KeywordIndex.from_store(store).search("ECMP", 10, set()) == []
+    assert KeywordIndex.from_store(store).search("ECMP", 10, folders()) == []
 
 
 def test_hybrid_never_fuses_in_an_out_of_scope_chunk(store: ChromaStore) -> None:
     index = KeywordIndex.from_store(store)
-    hits = retrieve(store, [1.0, 0.0, 0.0], "ECMP", 10, "hybrid", index, scope={"K1"})
+    hits = retrieve(store, [1.0, 0.0, 0.0], "ECMP", 10, "hybrid", index, filters=folders("K1"))
     assert attachments(hits) == {"A", "C"}
 
 
@@ -178,14 +183,14 @@ def ask(store: ChromaStore, model: Model, **kwargs: Any) -> Any:
 
 def test_a_scoped_answer_draws_only_on_the_scope(store: ChromaStore) -> None:
     model = Model()
-    result = ask(store, model, scope={"K2"})
+    result = ask(store, model, filters=folders("K2"))
     assert {source.attachment_key for source in result.sources} == {"B"}
     assert "Paper A" not in model.prompts[0] and "Paper B" in model.prompts[0]
 
 
 def test_a_scope_with_nothing_in_it_skips_the_model(store: ChromaStore) -> None:
     model = Model()
-    result = ask(store, model, scope={"NOPE"})
+    result = ask(store, model, filters=folders("NOPE"))
     assert result.answer == NO_CONTEXT_ANSWER
     assert model.prompts == []
 
@@ -197,14 +202,14 @@ def test_the_reranker_only_chooses_among_in_scope_candidates(store: ChromaStore)
         seen.extend(documents)
         return [(index, 1.0) for index in range(min(top_n, len(documents)))]
 
-    ask(store, Model(), scope={"K1"}, rerank=rerank)
+    ask(store, Model(), filters=folders("K1"), rerank=rerank)
     assert seen and all(text in (LIBRARY["A"][1], LIBRARY["C"][1]) for text in seen)
 
 
 def test_no_scope_is_the_unscoped_query(store: ChromaStore) -> None:
     """The default must leave `query` and `eval` exactly as they were."""
     unscoped = ask(store, Model())
-    assert ask(store, Model(), scope=None).sources == unscoped.sources
+    assert ask(store, Model(), filters=None).sources == unscoped.sources
     assert {source.attachment_key for source in unscoped.sources} == {"A", "B", "C", "D"}
 
 
@@ -247,5 +252,5 @@ def test_selecting_a_parent_folder_finds_items_filed_only_below_it(
     store: ChromaStore, snapshot: CollectionSnapshot
 ) -> None:
     """C is filed in QUIC (K3), not in Transport (K2) itself, yet Transport finds it."""
-    hits = store.query([0.0, 1.0, 0.0], 10, snapshot.subtree_keys("K2"))
+    hits = store.query([0.0, 1.0, 0.0], 10, Filters.in_collections(snapshot.subtree_keys("K2")))
     assert attachments(hits) == {"B", "C"}

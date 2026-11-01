@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Collection, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
@@ -30,7 +30,7 @@ from zotero_rag_core.querying import (
 )
 from zotero_rag_core.reranking import RerankFn
 from zotero_rag_core.retrieval import KeywordIndex, RetrievalMode
-from zotero_rag_core.store import Scope
+from zotero_rag_core.store import Filters
 from zotero_rag_core.stores.chroma import ChromaStore
 
 logger = logging.getLogger(__name__)
@@ -118,9 +118,17 @@ class QuerySession:
             self._keyword_ready.set()
 
     def ask(
-        self, question: str, scope: Scope, on_token: TokenSink, on_phase: PhaseFn
+        self,
+        question: str,
+        scope: Collection[str] | None,
+        on_token: TokenSink,
+        on_phase: PhaseFn,
     ) -> QueryResult:
-        """Answer one question (blocking), streaming its text to `on_token`."""
+        """Answer one question (blocking), streaming its text to `on_token`.
+
+        `scope` holds the collection keys of the selected folder and everything
+        below it; `None` searches the whole collection.
+        """
         if not self._keyword_ready.is_set():
             on_phase("waiting")
             self._keyword_ready.wait()
@@ -147,7 +155,7 @@ class QuerySession:
             keyword_index=self._keyword_index,
             rerank=self._rerank,
             rerank_fanout=settings.rerank_fanout,
-            scope=scope,
+            filters=Filters.in_collections(scope),
         )
 
 
