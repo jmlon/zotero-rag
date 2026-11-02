@@ -4928,7 +4928,7 @@ dev = [
 
 [[package]]
 name = "zotero-rag-core"
-version = "0.5.1"
+version = "0.5.2"
 source = { editable = "packages/zotero-rag-core" }
 dependencies = [
     { name = "httpx" },

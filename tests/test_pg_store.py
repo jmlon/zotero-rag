@@ -330,3 +330,29 @@ def test_vectors_too_wide_to_index_are_refused_with_a_clear_message(pg_store: Pg
             metadatas=[{"attachment_key": "A"}],
         )
     assert pg_store.count() == 0
+
+
+def test_nul_characters_are_removed_before_postgresql_sees_them(pg_store: PgStore) -> None:
+    """pypdf can return NULs, which PostgreSQL refuses in text and JSON columns."""
+    pg_store.add(
+        ids=["A:1:0"],
+        embeddings=[[1.0, 0.0, 0.0]],
+        documents=["F\x00o\x00g nodes"],
+        metadatas=[
+            {
+                "attachment_key": "A",
+                "title": "A \x00title",
+                "page": 1,
+                "chunk_index": 0,
+                "section": "x\x00y",  # not a column: goes to the JSON column
+                "tags": ["t\x00ag"],
+            }
+        ],
+    )
+    [chunk] = pg_store.get_by_ids(["A:1:0"])
+    assert chunk.text == "Fog nodes"
+    assert chunk.metadata["title"] == "A title"
+    assert chunk.metadata["section"] == "xy"
+    assert "\x00" not in repr(chunk.metadata)
+    pg_store.refresh_keyword_stats()
+    assert [c.id for c in PgFullTextSearcher(pg_store).search("fog", 5)] == ["A:1:0"]

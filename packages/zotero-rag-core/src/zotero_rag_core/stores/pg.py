@@ -155,6 +155,22 @@ def _chunk(row: dict[str, Any]) -> StoredChunk:
     )
 
 
+def without_nul(value: Any) -> Any:
+    """`value` with every NUL character removed from its strings, however nested.
+
+    PDF text extraction sometimes leaves NULs (often from text stored as UTF-16), and
+    PostgreSQL refuses them in text and JSON columns. Chroma keeps them; removing them
+    here leaves the CLI's Chroma indexes as they are.
+    """
+    if isinstance(value, str):
+        return value.replace("\x00", "")
+    if isinstance(value, dict):
+        return {without_nul(key): without_nul(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return type(value)(without_nul(item) for item in value)
+    return value
+
+
 class PgStore:
     """Chunks in PostgreSQL, searched with pgvector. Thread-safe through its pool."""
 
@@ -234,6 +250,7 @@ class PgStore:
         for identifier, embedding, text, metadata in zip(
             ids, embeddings, documents, metadatas, strict=True
         ):
+            text, metadata = without_nul(text), without_nul(metadata)
             attachment_key = str(metadata.get("attachment_key") or "")
             if not attachment_key:
                 raise ValueError(f"chunk {identifier!r} has no attachment_key")
