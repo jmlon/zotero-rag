@@ -48,12 +48,17 @@ class QuerySettings:
     reranker: str | None
     rerank_fanout: int
     model: str
+    #: Most hits per Zotero item (§11.4); 0 is uncapped. Last, with a default, so
+    #: settings built before it existed still construct.
+    max_per_document: int = 0
 
     def summary(self) -> str:
         """The status-bar form: `hybrid · top_k 10 · window 1 · rerank cohere · model`."""
         parts = [self.mode, f"top_k {self.top_k}"]
         if self.window:
             parts.append(f"window {self.window}")
+        if self.max_per_document:
+            parts.append(f"≤{self.max_per_document} per document")
         if self.reranker:
             parts.append(f"rerank {self.reranker}")
         parts.append(self.model)
@@ -154,6 +159,7 @@ class QuerySession:
             keyword_index=self._keyword_index,
             rerank=self._rerank,
             rerank_fanout=settings.rerank_fanout,
+            max_per_document=settings.max_per_document,
             filters=Filters.in_collections(scope),
         )
 
@@ -184,6 +190,7 @@ def open_session(
         reranker=rerank_name,
         rerank_fanout=config.index.reranker_fanout,
         model=config.llm_model,
+        max_per_document=config.index.max_per_document,
     )
     index_dir = config.source_dir
     return QuerySession(

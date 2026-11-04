@@ -32,7 +32,13 @@ from zotero_rag_core.llm import (
     usage_from_message,
 )
 from zotero_rag_core.reranking import RerankFn, apply_rerank, candidate_count
-from zotero_rag_core.retrieval import KeywordSearcher, RetrievalMode, retrieve
+from zotero_rag_core.retrieval import (
+    KeywordSearcher,
+    RetrievalMode,
+    candidate_depth,
+    cap_per_document,
+    retrieve,
+)
 from zotero_rag_core.store import ChunkStore, Filters, StoredChunk
 
 logger = logging.getLogger(__name__)
@@ -184,8 +190,8 @@ class QueryResult(BaseModel):
     #: Passages actually put in front of the model. Larger than `chunks_retrieved`
     #: when windowed retrieval pulled in neighbours (§11.4).
     chunks_in_context: int = 0
-    #: Candidates retrieved before reranking cut them down (§11.4.3); equal to
-    #: `chunks_retrieved` when no reranker ran.
+    #: Candidates retrieved before reranking and the per-document cap cut them
+    #: down (§11.4.3, §11.4); equal to `chunks_retrieved` when neither ran.
     candidates_considered: int = 0
     #: Whether reranking actually applied. False after a transient provider failure,
     #: so a silently un-reranked run cannot pass for a reranked one.
@@ -428,11 +434,16 @@ def _prepare(
     keyword_index: KeywordSearcher | None,
     rerank: RerankFn | None,
     rerank_fanout: int,
+    max_per_document: int,
     filters: Filters | None,
     history: Sequence[Turn],
     condensed: Condensed | None,
 ) -> _Prepared:
-    """Retrieve wide → rerank → window → number the sources → build the prompt.
+    """Retrieve wide → rerank → cap per document → window → number → prompt.
+
+    With a per-document cap, retrieval runs as deep as hybrid's candidate lists and
+    the reranker orders every candidate rather than cutting to `top_k`, so the cap
+    has passages from other documents to promote.
 
     Retrieval and reranking search for the condensed question when there is one;
     the model is still asked the question as the user put it.
@@ -441,9 +452,17 @@ def _prepare(
     searched = condensed.question if condensed is not None else question
 
     embedding = embed_query(searched)
-    depth = candidate_count(top_k, rerank_fanout) if rerank is not None else top_k
+    capped = max_per_document > 0
+    if rerank is not None:
+        depth = candidate_count(top_k, rerank_fanout)
+    elif capped:
+        depth = candidate_depth(top_k)
+    else:
+        depth = top_k
     candidates = retrieve(store, embedding, searched, depth, mode, keyword_index, filters)
-    hits, reranked, rerank_cost = apply_rerank(candidates, searched, top_k, rerank)
+    keep = len(candidates) if capped else top_k
+    ranked, reranked, rerank_cost = apply_rerank(candidates, searched, keep, rerank)
+    hits = cap_per_document(ranked, top_k, max_per_document)
     chunks = expand_window(store, hits, window)
     sources, numbers = collect_sources(chunks)
     usage = Usage(embedding_tokens=count_tokens([searched]), rerank_cost=rerank_cost)
@@ -521,6 +540,7 @@ def answer_question(
     keyword_index: KeywordSearcher | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
+    max_per_document: int = 0,
     filters: Filters | None = None,
     history: Sequence[Turn] = (),
     condensed: Condensed | None = None,
@@ -542,6 +562,11 @@ def answer_question(
     keeps a hit's neighbours as context rather than letting them compete as
     candidates, and reranking before the cut is what lets it discard rather than
     merely reorder.
+
+    With `max_per_document` above zero, no one Zotero item may supply more than that
+    many of the `top_k` hits, unless too few items compete to fill them (§11.4). It
+    applies after reranking, so the reranker's judgement decides *which* passages of
+    a document survive, and before windowing, so neighbours never count against it.
 
     With `filters`, only chunks that pass them are retrieved (by folder, year or
     tag), so the reranker chooses among them and windowing then stays inside their
@@ -565,6 +590,7 @@ def answer_question(
         keyword_index=keyword_index,
         rerank=rerank,
         rerank_fanout=rerank_fanout,
+        max_per_document=max_per_document,
         filters=filters,
         history=history,
         condensed=condensed,
@@ -605,6 +631,7 @@ def stream_answer_question(
     keyword_index: KeywordSearcher | None = None,
     rerank: RerankFn | None = None,
     rerank_fanout: int = 4,
+    max_per_document: int = 0,
     filters: Filters | None = None,
     history: Sequence[Turn] = (),
     condensed: Condensed | None = None,
@@ -636,6 +663,7 @@ def stream_answer_question(
         keyword_index=keyword_index,
         rerank=rerank,
         rerank_fanout=rerank_fanout,
+        max_per_document=max_per_document,
         filters=filters,
         history=history,
         condensed=condensed,

@@ -242,6 +242,7 @@ class ComparisonSettings(BaseModel):
     top_k: int = 0
     retrieval: str = "vector"
     retrieval_window: int = 0
+    max_per_document: int = 0
     reranker: str | None = None
     questions_file: str = ""
     questions: int = 0

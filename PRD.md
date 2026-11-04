@@ -1,10 +1,11 @@
 # RAG CLI interface for Zotero
 
-**Status:** PoC complete — `list-collections`, `init`, `index`, `query` and `eval`
-are all built and verified against the live library; every acceptance criterion in
-§12 passes. See **§14 Implementation status** for what was built and
-**§11 Roadmap** for the sequenced milestones that follow.
-**Version:** 0.4.0
+**Status:** PoC complete and milestones 4–6 delivered; M7 (retrieval quality) is
+mostly delivered, with retrieval diversity and CLI metadata filters still open.
+Every acceptance criterion in §12 passes. See **§14 Implementation status** for what
+was built and **§11 Roadmap** for what remains.
+**Version:** CLI `zotero-rag` 0.4.5 · shared pipeline `zotero-rag-core` 0.5.2 (§14.13)
+**Last reviewed against the code:** 2026-11-04
 
 ## 1. Goal
 
@@ -19,9 +20,14 @@ passages, with citations back to the Zotero items.
 The following are explicitly **out of scope** for this version and recorded as
 future milestones (§11):
 
-- Group libraries (user library only).
+- Group libraries (user library only). *(Plumbed through the core in 0.5.0 but not
+  yet verified against a live group library, so the CLI still documents them as
+  unsupported; §11.7.)*
 - Vector stores other than Chroma (Pinecone is a planned milestone).
+  *(PostgreSQL + pgvector delivered in core 0.5.0, §14.13. Pinecone remains open.)*
 - Rerankers, hybrid / BM25 retrieval, windowed retrieval, agentic or multi-step RAG.
+  *(Rerankers and hybrid delivered and adopted, windowing built and rejected as a
+  default, all in M7, §11.4. Agentic / multi-step RAG remains unscheduled.)*
 - OCR of scanned PDFs. *(Still open; see the deferral note in §11.2.)*
 - Ingestion of HTML snapshots, EPUBs, linked URLs, and Zotero notes.
   *(Snapshots, EPUBs and notes delivered in M5, §11.2 — plus text/Markdown/CSV,
@@ -30,9 +36,15 @@ future milestones (§11):
 - Detecting items updated or removed in Zotero after indexing.
   *(Delivered in M4, §11.1.)*
 - Custom system prompt from file.
-- Cost estimation and pricing tables.
-- Batched / concurrent embedding calls.
-- Interactive REPL, streaming output, web UI, MCP server.
+- Cost estimation and pricing tables. *(Pricing tables and per-run costs delivered
+  for `query`, `eval`, `compare-embeddings` and `generate-questions`; the `index`
+  cost estimate remains open, §11.5.)*
+- Batched / concurrent embedding calls. *(Delivered: batched requests and
+  `index --jobs`, §11.5.)*
+- Interactive REPL, streaming output, web UI, MCP server. *(The terminal UI streams
+  answers, §3.4.1. The core answers follow-up questions with the conversation in
+  view, §14.13, for the separate `zotero-rag-web` project; neither the CLI nor the
+  terminal UI uses that yet. A CLI REPL, `query` streaming and MCP remain open.)*
 
 ## 2. Definitions
 
@@ -90,7 +102,8 @@ zotero-rag init [PATH]
 
 ```
 zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
-                 [--force [--refetch]] [--repair] [--prune] [-v]
+                 [--force [--refetch]] [--repair] [--prune] [--jobs N]
+                 [--store URL] [-v]
 ```
 
 - **First run** pins the target collection into `config.yaml`
@@ -117,12 +130,20 @@ zotero-rag index [--collection PATH | --collection-key KEY] [--dry-run] [--yes]
   the chunks a superseded model wrote, reusing their stored text — no downloads and
   no re-chunking. `--prune` deletes chunks whose attachment has left the
   collection; without it those are reported but kept.
+- `--jobs N` (default 4) downloads, extracts and embeds that many attachments in
+  parallel, keeping per-attachment failure isolation (§10). Embedding requests
+  carry 100 texts each, or a model's own `batch_size` from `embedding_models`.
+- `--store URL` (or `ZOTERO_RAG_STORE`) keeps the chunks in a PostgreSQL + pgvector
+  database instead of the folder's `chroma/` (§14.13). The folder still supplies
+  `config.yaml`. Only `index` creates tables, so a query never alters a database.
+  `query`, `eval` and `generate-questions` accept the same option.
 
 ### 3.4 `query`
 
 ```
 zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
-                            [--reranker none|cohere] [--show-sources] [--json] [-v]
+                            [--reranker none|cohere|ID] [--max-per-document N]
+                            [--show-sources] [--json] [--store URL] [-v]
 ```
 
 - One-shot query. Retrieves `top_k` chunks, calls the LLM, prints the answer
@@ -144,6 +165,19 @@ zotero-rag query "QUESTION" [--top-k N] [--window N] [--retrieval MODE]
   `--reranker none` disables a configured one. Off by default because it needs
   `COHERE_API_KEY`; recommended where that key exists, since `top_k: 5` with
   reranking beat `top_k: 10` without it on half the context.
+- `--max-per-document N` lets no one Zotero item supply more than N of the `top_k`
+  hits (§11.4). Defaults to `max_per_document`, which is `0` (off) until `eval`
+  says otherwise. The cap is soft: with too few items competing, the skipped
+  passages still fill `top_k`. It applies after reranking and before windowing.
+- `--reranker ID` takes any reranker OpenRouter lists, e.g.
+  `cohere/rerank-4-fast` or `voyageai/rerank-3-lite`, on the OpenRouter key every
+  other call already uses. The `rerankers` catalogue in the packaged `config.yaml`
+  lists them with prices. `cohere` still means Cohere's own API and its own key. The
+  README's second study (12 knowledge-graph papers, 36 questions) measured
+  `voyageai/rerank-3-lite` as the best reranker found.
+- `-v` and `--json` report costs as well as tokens: embedding cost from the
+  `embedding_models` catalogue, answer cost from OpenRouter's `/models` prices, and
+  the rerank cost when the provider reports it.
 
 ### 3.4.1 `zotero-rag-ui`
 
@@ -161,8 +195,9 @@ Specified in `PRD-CursesUI.md`.
 
 ```
 zotero-rag eval [--questions FILE] [--top-k N] [--window N] [--retrieval MODE]
-                [--reranker none|cohere] [--only ID]... [--assess-context]
-                [--json] [-v]
+                [--reranker none|cohere|ID] [--max-per-document N] [--only ID]...
+                [--assess-context]
+                [--jobs N] [--json] [--no-record] [--store URL] [-v]
 ```
 
 - Runs a golden set of questions (§11.3) against the index and scores it: a table
@@ -179,6 +214,11 @@ zotero-rag eval [--questions FILE] [--top-k N] [--window N] [--retrieval MODE]
   answer at all, which separates a retrieval failure from a generation one.
 - `--json` emits the whole report (`settings`, `aggregate`, `results[]`) on
   stdout, with progress diverted to stderr.
+- `--jobs N` grades questions in parallel. Each run also reports its cost (queries
+  at list price and as charged, plus grading).
+- Every scored run is appended to an experiment log under `reports/`
+  (`experiments.py`), so runs can be compared across sessions; `--no-record` skips
+  it for quick checks.
 
 ### 3.6 `generate-questions`
 
@@ -233,10 +273,48 @@ zotero-rag convert [--collection PATH | --collection-key KEY] [--dry-run] [--yes
   verdict and reasons, images, empty pages, and OCR'd pages. The file is JSON or
   CSV, chosen by the suffix.
 
+### 3.8 `compare-embeddings`
+
+```
+zotero-rag compare-embeddings [--model ID]... [--chunk-size N]... [--chunk-overlap N]...
+                              [--questions FILE] [--top-k N] [--only ID]... [--no-build]
+                              [--workers N] [--eval-workers N] [--dry-run] [--yes]
+                              [--json] [--no-record] [-v]
+```
+
+- Builds one store per embedding model and chunking under
+  `embeddings/<model>/<chunk_size>/` and scores each with the same question set,
+  answering model and judge as `eval`. The configured model and chunking are the
+  baseline, read from `chroma/` as-is and never rebuilt.
+- Models default to the `embedding_models` catalogue in the packaged `config.yaml`,
+  whose prices turn token counts into the cost column. `--dry-run` shows the
+  variants and the estimated cost.
+- Each table is saved to `reports/` as text and JSON and appended to the experiment
+  log. The measurements behind the current defaults are in `parameter_sweep.md` and
+  the README's "What the measurements actually said".
+
+### 3.9 `shrink-storage` (PRD-markdown.md)
+
+```
+zotero-rag shrink-storage [--max-size SIZE] [--collection PATH | --collection-key KEY]
+                          [--dry-run] [--yes] [--no-backup] [--jobs N] [--report PATH] [-v]
+```
+
+- **Writes to the library:** moves a stored file larger than `--max-size` to the
+  Zotero trash, but only when its transcript is current and passed the quality
+  check, it has no annotations, and the same item has a Link-to-URI attachment
+  serving a byte-identical-size file of the same type. Anything less certain is
+  listed under "Check manually" and kept.
+- Copies each moved file to `shrink-backup/` unless `--no-backup`. The README's
+  "Freeing Zotero storage" section is the user-facing specification.
+
 ## 4. Zotero access
 
 - Online Zotero Web API via `pyzotero`, authenticated with an API token.
-- `library_type` is `user` for the PoC.
+- `library_type` is `user` for the PoC. *(Core 0.5.0 reads a whole library, user
+  or group, and builds group citation URLs from each item's `links.alternate`. It
+  is untested against a live group library, so the CLI still documents user
+  libraries only; §11.7.)*
 - Collection path resolution: split the path on `/` and walk the hierarchy from
   the top-level collections. If any segment matches more than one collection at
   its level, report an error listing the candidate keys and exit; the user then
@@ -284,7 +362,13 @@ enabled (§11.4.3). It is asserted when the reranker is built, so a folder that 
 not use reranking never demands it — and one that does fails immediately rather than
 part-way through a run. Cohere is a second provider because OpenRouter proxies chat
 completions and embeddings but not reranking; every other credential still routes
-through OpenRouter as §5.1 intends.
+through OpenRouter as §5.1 intends. *(OpenRouter has since added `/rerank`, so an
+OpenRouter reranker id such as `cohere/rerank-4-fast` needs no extra key; only
+`reranker: cohere` does.)*
+
+**Optional:** `ZOTERO_RAG_STORE`, a PostgreSQL URL selecting the pgvector store
+(§3.3). It lives in the environment because it carries a password, and `--help`
+never prints it.
 
 ### 5.3 Schema
 
@@ -316,6 +400,7 @@ index:
   chunk_overlap: 200      # characters
   top_k: 10               # 5 before 0.4.4; raised on M7's evidence (§11.4.1)
   retrieval_window: 0     # neighbours either side of each hit (M7, §11.4.1)
+  max_per_document: 0     # most hits per Zotero item; 0 = off (M7, §11.4)
   retrieval: hybrid       # vector | hybrid (BM25 fused with vectors, §11.4.2)
   reranker: null          # null => inherit global.defaults.reranker (§11.4.3)
   reranker_model: rerank-v4.0-fast
@@ -347,6 +432,12 @@ eval:                       # M6, §11.3
 Multilingual corpora are supported by overriding `embedding_model` with a
 multilingual OpenRouter slug. No local embedding models (see §9).
 
+The packaged `config.yaml` also carries two **catalogues** that are reference data
+rather than settings: `embedding_models` (id, dimensions, context window, price, and
+an optional `batch_size`), used by `compare-embeddings` and for embedding costs, and
+`rerankers` (OpenRouter reranker ids with prices). It also carries the transcript
+quality thresholds used by `convert` (PRD-markdown.md).
+
 ## 6. Index folder layout
 
 ```
@@ -359,6 +450,9 @@ multilingual OpenRouter slug. No local embedding models (see §9).
   cache/             # downloaded attachments, <attachment-key>.<pdf|html|docx|…>
   collections.json   # the indexed collection tree, written by every `index` run
                      # once membership is current (PRD-CursesUI §4.1)
+  embeddings/        # stores built by `compare-embeddings`, per model and chunking
+  reports/           # compare-embeddings tables and the experiment log (§3.5)
+  shrink-backup/     # copies of files `shrink-storage` moved to the Zotero trash
   .zotero-rag-ui/    # zotero-rag-ui state: `history` (one JSON string per line,
                      # last 1000 prompts) and `ui.log` under -v (PRD-CursesUI §7, §8)
 ```
@@ -470,6 +564,12 @@ Stored per chunk, used for citation and for the terminal UI's folder filter:
 | `document_format` | `pdf` \| `html` \| `txt` \| `docx` \| `odt` \| `epub` \| `note` (M5) |
 | `embedding_model` | the model that produced this vector (M4) |
 | `attachment_version` | the attachment's Zotero version when embedded (M4) |
+| `item_type` | the parent item's Zotero type (core 0.5.0) |
+| `year_int` | `year` as an integer for range filters (core 0.5.0) |
+| `tags` | the parent item's tags, as a list (core 0.5.0) |
+
+Chunks indexed before core 0.5.0 lack `year_int` and `tags`, so they fail year and
+tag filters until re-indexed. Folder filtering is unaffected.
 
 Chroma document id: `<attachment_key>:<page>:<chunk_index>`.
 
@@ -565,17 +665,25 @@ meta-package is not installed.
 
 `pyproject.toml` changes: remove `chroma` (an unrelated color library — the
 vector DB is `chromadb`); keep `pinecone` as a planned future milestone.
+*(`pinecone` is still declared but no code imports it; build M10's Pinecone store
+or drop the dependency.)*
+
+Since the core split (§14.13), `chromadb` is the core package's `chroma` extra,
+which the CLI installs, and PostgreSQL support is the `pgvector` extra (`psycopg` 3
+and `psycopg-pool`). The core's base install needs neither.
 
 ## 10. Non-functional requirements
 
 - **Scale (PoC):** tens to ~100 PDFs per collection. Serial embedding calls are
-  acceptable; batching and concurrency are a future milestone.
+  acceptable; batching and concurrency are a future milestone. *(Both now exist:
+  `index --jobs`, batched embedding requests.)*
 - **Failure policy:** any single item, attachment, download, or extraction
   failure logs a `WARNING` and processing continues. The run ends with a summary:
   items seen, attachments indexed, chunks written, skipped (by reason), failed.
 - **Logging:** standard `logging`; `-v/--verbose` reports elapsed time and token
   usage (embedding tokens for `index`, prompt/completion tokens for `query`).
-  Cost estimation is out of scope. `-v` is accepted both before the subcommand and
+  Cost estimation is out of scope. *(Superseded: `query`, `eval` and the estimating
+  commands now report costs, §3.4; `index` still reports tokens only.)* `-v` is accepted both before the subcommand and
   on `index`/`query` themselves.
   Third-party recovery chatter is suppressed below `ERROR` unless `-v` is given:
   `pypdf` logs a warning for each quirk in a malformed file and then extracts the
@@ -586,7 +694,11 @@ vector DB is `chromadb`); keep `pinecone` as a planned future milestone.
   (`uv run ruff check . && uv run mypy`). Wiring them into CI is a future
   milestone (§11) — there is no CI pipeline in the PoC.
 - **Python:** ≥ 3.12, `src` layout, package `zotero_rag`, entry point
-  `zotero-rag = "zotero_rag.cli:app"`.
+  `zotero-rag = "zotero_rag.cli:app"`. Since the core split (after 0.4.5, with no
+  CLI version bump) the pipeline lives in a uv
+  workspace package, `packages/zotero-rag-core` (import `zotero_rag_core`), which
+  must not import the CLI, the TUI or `chromadb`; `tests/test_core_package.py`
+  enforces that (§14.13).
 - **Tests:** no `pyzotero` mocks. Unit tests cover config loading and precedence,
   collection-path resolution, chunking, metadata construction, and citation
   formatting. The end-to-end path is validated by the manual smoke test in §12
@@ -628,11 +740,15 @@ Sizes are rough: **S** ≈ a day or less, **M** ≈ a few days, **L** ≈ longer
 | 4 | Store integrity and true reindexing | correctness | 0.2.0 | ✅ **done** |
 | 5 | Cover more of the library (HTML, text, DOCX/ODT) | coverage | 0.3.0 | ✅ **done** |
 | 6 | Measurement before tuning | evaluation | 0.4.0 | ✅ **done** |
-| 7 | Retrieval quality | tuning | 0.5.0 | 🚧 windowing done (§11.4.1); rest M |
-| 8 | Scale and cost | performance | 0.6.0 | S–M |
-| 9 | Daily use | ergonomics | 0.7.0 | M |
-| 10 | Reach: group libraries, other stores, MCP | breadth | 0.8.0 | M |
-| 11 | Engineering hygiene | infrastructure | any time | S |
+| 7 | Retrieval quality | tuning | 0.5.0 | 🚧 windowing, hybrid, reranking, `top_k` done; diversity cap built, not measured; CLI filters open (S) |
+| 8 | Scale and cost | performance | 0.6.0 | 🚧 concurrency and pricing done; `index` cost estimate and ETA open (S) |
+| 9 | Daily use | ergonomics | 0.7.0 | ⏳ not started (M) |
+| 10 | Reach: group libraries, other stores, MCP | breadth | 0.8.0 | 🚧 group plumbing and PostgreSQL done; live group check, Pinecone, MCP open |
+| 11 | Engineering hygiene | infrastructure | any time | 🚧 core tags only; CI, changelog, config migration open (S) |
+
+*Status column updated 2026-11-04 against the code. Several items were delivered by
+core 0.5.x for the `zotero-rag-web` project rather than as numbered milestones;
+§14.13 records them.*
 
 The cheapest items worth doing first, regardless of milestone: the store
 fingerprint (§11.1), naming *what* was skipped (§11.2), windowed retrieval and
@@ -1010,15 +1126,32 @@ grows; today a second run replaces the file. Worth having, not worth blocking on
   numbers say not to switch it on. §11.4.1 has the frontier and the reasoning. This
   is the first hypothesis this section put to `eval`, and the answer was no — which
   is what §11.3 was built for.
-- **Retrieval diversity (S) — surfaced by §11.4.1, not in the original list.** A
+- **Retrieval diversity (S) — ✅ built, ⏳ awaiting measurement; surfaced by §11.4.1, not in the original list.** A
   per-document cap, or maximal-marginal-relevance over the candidates. At `top_k:
   30` one question came back with all thirty chunks from a single document, while
   the paper it was actually about never appeared at any `top_k`. Nothing else on
   this list addresses that, and it is the cheapest item here.
-- **Query-time metadata filters (S).** `--year`, `--author`, `--collection`,
+  *Built 2026-11-04 as a soft per-document cap: `max_per_document` /
+  `--max-per-document` (`retrieval.cap_per_document`). A document is the Zotero
+  item, so a PDF and a snapshot of one paper share a quota. The cap runs after
+  reranking and before windowing. With it on, retrieval goes `candidate_depth`
+  deep and the reranker orders every candidate, so there are other documents to
+  promote; when too few items compete, skipped passages refill `top_k`. Off by
+  default. It is recorded in `eval` settings and the experiment log, and the
+  terminal UI and `compare-embeddings` take it from config. **Not yet measured:**
+  run `eval` on `Networking` at caps 0, 1, 2 and 3 (with and without a reranker)
+  before choosing a default. MMR was not built; it needs chunk embeddings at
+  query time, which neither store returns today.*
+- **Query-time metadata filters (S) — 🚧 core done, CLI open.** `--year`, `--author`, `--collection`,
   `--doi` mapped to Chroma `where` clauses. The metadata is already stored (§7.2);
   `year` needs an integer companion field for range comparisons. §11.4.1's
   persistent miss is a candidate: `--author ALzaid` would have found it.
+  *Core 0.5.0 added `store.Filters`: collection keys, an inclusive year range with
+  an include-undated switch, and tags (any of), combined with AND. Chroma, BM25 and
+  PostgreSQL all honour them, and `year_int` / `tags` are now written per chunk.
+  What remains: `query` and `eval` options that build a `Filters`, plus author and
+  DOI conditions, which `Filters` does not have yet. The terminal UI uses only the
+  folder condition.*
 - **Hybrid retrieval — ✅ built, ✅ accepted, and now the default.** BM25 via
   `rank_bm25` fused with the vector hits by reciprocal rank fusion, behind
   `retrieval: vector|hybrid` (§3.4). It measured better on two independent question
@@ -1030,8 +1163,8 @@ grows; today a second run replaces the file. Worth having, not worth blocking on
   retrieving `top_k × fanout` candidates first. It is the best result M7 has produced
   and it **reduces** token spend; the switch stays off only because it needs a
   credential most users will not have. §11.4.3 has the numbers.
-- **Revisit the default `top_k` — M6 has now answered this, and the answer is
-  yes.** On the 21-question `Networking` set every metric improves monotonically
+- **Revisit the default `top_k` — ✅ done: raised to 10 in 0.4.4. M6 answered
+  this, and the answer was yes.** On the 21-question `Networking` set every metric improves monotonically
   with `top_k`, and the step from 5 to 10 is larger than the noise floor by an
   order of magnitude:
 
@@ -1361,20 +1494,30 @@ strongest evidence in the PRD for the "under-specified question" failure mode.
 
 ### 11.5 Milestone 8 — Scale and cost (0.6.0)
 
-- **Batched and concurrent embedding.** Embedding is serial per attachment today.
+- **Batched and concurrent embedding — ✅ done.** Embedding is serial per attachment today.
   Batch chunks per request and run a bounded worker pool across attachments, while
   keeping the per-attachment failure isolation of §10.
-- **Cost estimation.** A pricing table in config (per 1M tokens, mirroring
+  *Built as `index --jobs` (default 4) over a thread pool, with 100 texts per
+  embedding request. The acceptance timing below has not been recorded.*
+- **Cost estimation — 🚧 partly done.** A pricing table in config (per 1M tokens, mirroring
   `ragbench`), surfaced under `-v` and in `--json` usage — and, most useful,
   `index --dry-run` estimating the spend *before* it happens.
-- **Progress that scales.** ETA plus running token and cost counters, for runs
-  much larger than the 13-PDF `Networking` case.
+  *Done: the `embedding_models` and `rerankers` catalogues, answer prices from
+  OpenRouter's `/models`, and costs in `query`, `eval`, `compare-embeddings --dry-run`
+  and `generate-questions --dry-run`. Open: `index --dry-run` lists the plan but
+  estimates nothing, and `index -v` reports tokens without a cost.*
+- **Progress that scales — ⏳ open.** ETA plus running token and cost counters, for runs
+  much larger than the 13-PDF `Networking` case. *The `index` progress bar shows a
+  count and percentage only.*
 
 **Acceptance:** a `--force` re-index of `Networking` from cache is materially
 faster in wall-clock than the serial path, and the dry-run estimate lands within
 ~10% of the tokens actually spent.
 
 ### 11.6 Milestone 9 — Daily use (0.7.0)
+
+*Status 2026-11-04: nothing below is built in the CLI. The core's follow-up support
+(`querying.Turn`, `condense_question`, §14.13) is the groundwork for `chat`.*
 
 - **`zotero-rag status` (S).** Pinned collection, attachment and chunk counts, the
   models and fingerprint behind the store, cache size, library version, and when
@@ -1395,14 +1538,24 @@ faster in wall-clock than the serial path, and the dry-run estimate lands within
 
 ### 11.7 Milestone 10 — Reach (0.8.0)
 
-- **Group libraries.** `zotero_library_type: group` is already in the schema and
+- **Group libraries — 🚧 plumbed, unverified.** `zotero_library_type: group` is already in the schema and
   entirely unused: plumb it through `build_client`, take a group id, and fix the
   citation URL builder (group item URLs differ from user ones). Cheaper than it
   looks.
-- **Pinecone and other stores.** `vectorstore.py` is the only chromadb
+  *Core 0.5.0 reads whole libraries, user or group, and cites group items by their
+  `links.alternate` URL. The CLI fetches a username only for user libraries, so it
+  no longer builds wrong group URLs, and the write-access check used by `convert`
+  understands group rights. Open: verify against a live group library, then drop the
+  README's "your own library only" limitation.*
+- **Pinecone and other stores — 🚧 protocol and PostgreSQL done, Pinecone open.** `vectorstore.py` is the only chromadb
   touchpoint, so this is a `VectorStore` protocol plus one new implementation,
   selected by `vector_db: chroma|pinecone`.
-- **MCP server** exposing `query` as a tool, making an index usable from Claude
+  *Built as the `ChunkStore` protocol (`zotero_rag_core.store`) with `ChromaStore`
+  and `PgStore`, and a `KeywordSearcher` protocol with `BM25Searcher` and
+  `PgFullTextSearcher`. The store is chosen by `--store URL`, not by `vector_db`,
+  which is still unused. A `pinecone` store would also need a keyword searcher or
+  fall back to `retrieval: vector`.*
+- **MCP server — ⏳ open** exposing `query` as a tool, making an index usable from Claude
   Code and other MCP clients — plausibly the highest-leverage integration here,
   since it puts the citations where the writing happens.
 - **Multiple collections per index folder** (a list of pinned collections),
@@ -1411,11 +1564,15 @@ faster in wall-clock than the serial path, and the dry-run estimate lands within
 
 ### 11.8 Milestone 11 — Engineering hygiene (any time)
 
-- **CI** running pytest, `ruff`, and `mypy` on push and pull request — deliberately
-  deferred for now (§10), but the cost of adding it only rises.
-- **Release process:** tag, changelog, `uv tool install` from a tag, and a version
-  bump policy tied to these milestones.
-- **Config schema version and migration**, so settings introduced by later
+- **CI — ⏳ open** running pytest, `ruff`, and `mypy` on push and pull request — deliberately
+  deferred for now (§10), but the cost of adding it only rises. *There are now
+  PostgreSQL tests too, which use a disposable container or
+  `ZOTERO_RAG_TEST_PG_URL`; `ZOTERO_RAG_REQUIRE_PG` makes a skip a failure, which
+  CI should set.*
+- **Release process — 🚧 partial:** tag, changelog, `uv tool install` from a tag, and a version
+  bump policy tied to these milestones. *The core is tagged `core-v0.5.0`…`0.5.2`;
+  the CLI has no tags and there is no changelog.*
+- **Config schema version and migration — ⏳ open**, so settings introduced by later
   milestones do not break folders created by earlier ones.
 
 ### 11.9 Where every deferred item landed
@@ -1424,31 +1581,31 @@ From §1.1 and the original §11 list:
 
 | Deferred item | Milestone |
 |---|---|
-| `--force` clean-slate reindex | M4 |
-| Version-aware incremental indexing | M4 |
-| Deletion sync | M4 |
+| `--force` clean-slate reindex | M4 ✅ |
+| Version-aware incremental indexing | M4 ✅ |
+| Deletion sync | M4 ✅ |
 | OCR of scanned PDFs | M5 — **deferred**, §11.2.1 |
 | HTML snapshot / EPUB / notes ingestion | M5 ✅ |
-| Metadata filters at query time (year, author, tag) | M7 |
+| Metadata filters at query time (year, author, tag) | M7 🚧 — year, tag and folder in the core; no CLI options, no author/DOI |
 | Rerankers | M7 ✅ §11.4.3 |
-| Hybrid / BM25 retrieval | M7 |
-| Windowed retrieval | M7 |
-| Cost estimation and pricing tables | M8 — also covers the `eval` cost column deferred from M6 |
-| Batched / concurrent embedding | M8 |
-| Custom system prompt from file | M9 |
-| Interactive REPL with history | M9 |
-| Streaming output | M9 |
-| Group libraries | M10 |
-| Pinecone and other vector stores | M10 |
-| MCP server | M10 |
-| CI (tests, `ruff`, `mypy`) | M11 |
+| Hybrid / BM25 retrieval | M7 ✅ §11.4.2 |
+| Windowed retrieval | M7 ✅ built, rejected as a default, §11.4.1 |
+| Cost estimation and pricing tables | M8 🚧 — pricing and `eval` costs done; `index` estimate open |
+| Batched / concurrent embedding | M8 ✅ `index --jobs` |
+| Custom system prompt from file | M9 ⏳ |
+| Interactive REPL with history | M9 ⏳ — core follow-up support exists |
+| Streaming output | M9 ⏳ — terminal UI streams; `query` does not |
+| Group libraries | M10 🚧 — plumbed, not verified live |
+| Pinecone and other vector stores | M10 🚧 — PostgreSQL ✅, Pinecone ⏳ |
+| MCP server | M10 ⏳ |
+| CI (tests, `ruff`, `mypy`) | M11 ⏳ |
 
 Surfaced while building the PoC, not in the original list:
 
 | Item | Milestone | Why |
 |---|---|---|
-| Store fingerprint / model-change guard | M4 | a changed `embedding_model` currently corrupts retrieval silently |
-| `--prune` for items moved out of a collection | M4 | not a deletion, so `deleted()` never reports it |
+| Store fingerprint / model-change guard | M4 ✅ | a changed `embedding_model` currently corrupts retrieval silently |
+| `--prune` for items moved out of a collection | M4 ✅ | not a deletion, so `deleted()` never reports it |
 | Name the skipped content types | M5 ✅ | `10 unsupported content type` is not actionable |
 | Plain-text / Markdown / CSV ingestion | M5 ✅ | free: read and split, no parser |
 | DOCX and ODT ingestion | M5 ✅ | ZIP + XML, ~30 lines each with the stdlib |
@@ -1456,15 +1613,21 @@ Surfaced while building the PoC, not in the original list:
 | `page` generalised to a locator | M5 ✅ | HTML, Markdown, DOCX and notes have no pages |
 | Linked-URL ingestion | **deferred**, §11.2.1 | makes the tool a web client; wants its own milestone |
 | Wrap httpx transport errors | M5 ✅ | a Zotero timeout printed a traceback (§14.7) |
-| Per-chunk embedding-model tag, `index --repair` | M4 | repair the stale chunks instead of rebuilding the store |
+| Per-chunk embedding-model tag, `index --repair` | M4 ✅ | repair the stale chunks instead of rebuilding the store |
 | Evaluation harness | M6 ✅ | §12.1 defines a golden set that nothing executes |
 | Per-question source provenance in a golden set | M6 ✅ | one article per question is what makes hit rate discriminating (§12.2) |
 | `generate-questions` | M6 ✅ §11.3.2 | measurement was bounded by how many questions a user will hand-write |
 | `--merge` for incremental question sets | **deferred**, §11.3.2 | a second run replaces the file; adding only uncovered documents is the incremental form |
-| `status` command | M9 | no way to inspect a folder's index |
-| Stray-positional error message | M9 | `index Networking` fails opaquely |
-| Cache size reporting and pruning | M9 | the cache only ever grows |
-| Config schema version and migration | M11 | later settings must not break existing folders — and, per §11.4.1, an improved *default* never reaches a folder that pinned the old value |
+| `status` command | M9 ⏳ | no way to inspect a folder's index |
+| Stray-positional error message | M9 ⏳ | `index Networking` fails opaquely |
+| Cache size reporting and pruning | M9 ⏳ | the cache only ever grows |
+| Config schema version and migration | M11 ⏳ | later settings must not break existing folders — and, per §11.4.1, an improved *default* never reaches a folder that pinned the old value |
+| Retrieval diversity (per-document cap or MMR) | M7 🚧 cap built, not yet measured | §11.4.1: one document filled all 30 slots |
+| Shared core package, `ChunkStore` / `KeywordSearcher` protocols | ✅ core 0.5.0, §14.13 | lets `zotero-rag-web` reuse the pipeline |
+| PostgreSQL + pgvector store, BM25 in SQL | ✅ core 0.5.0–0.5.2, §14.13 | a shared, hosted store graded by the same `eval` |
+| Follow-up questions with conversation history | ✅ core 0.5.0, §14.13 | groundwork for M9's `chat` |
+| `compare-embeddings`, experiment log | ✅ after 0.4.5 (no version bump), §3.8 | choose model and chunking by measurement |
+| `shrink-storage` | ✅ after 0.4.5 (no version bump), §3.9 | free Zotero storage once a transcript is trusted |
 
 **Not scheduled** — deferred because their value for *this* corpus is unproven,
 not because they are uninteresting: agentic / multi-step RAG, hierarchical
@@ -1593,7 +1756,12 @@ Example code that may be reused:
 
 ## 14. Implementation status
 
-Last updated: 2026-07-28. **470 tests passing; `ruff`, `ruff format` and `mypy` clean.**
+Last updated: 2026-11-04. **1,271 tests passing**, PostgreSQL tests included.
+`ruff check` is clean on `src`, `packages` and `tests`. Three known blemishes:
+`ruff check .` fails only on `analysis.ipynb`, `ruff format --check .` flags only
+`analysis.ipynb` and a code block in `README.md`, and `mypy` reports one error in
+`tests/test_evaluation.py:411`, a test judge stub with three arguments where
+`evaluate_question` now expects four.
 
 ### 14.1 Done
 
@@ -1611,12 +1779,20 @@ Last updated: 2026-07-28. **470 tests passing; `ruff`, `ruff format` and `mypy` 
 | 7a | Windowed retrieval — built and measured; **rejected as a default** (§11.4.1) | ✅ verified live |
 | 7b | Hybrid BM25 + vector retrieval — **accepted, now the default** (§11.4.2) | ✅ verified live |
 | 7c | Cohere reranking — **accepted, recommended, off by default** (needs a key) (§11.4.3) | ✅ verified live |
+| 7d | OpenRouter rerankers (`--reranker ID`), second study on `kg-v3` (README) | ✅ measured |
+| — | `convert`: Markdown transcripts attached to Zotero items (§3.7) | ✅ see PRD-markdown.md |
+| — | `compare-embeddings` and the experiment log (§3.8) | ✅ defaults chosen from it |
+| — | `shrink-storage` (§3.9) | ✅ see README |
+| — | `index --jobs`, batched embedding requests (M8) | ✅ built; M8's timing acceptance not recorded |
+| core 0.5.0 | Core package split; `ChunkStore` / `KeywordSearcher`; `Filters`; whole-library and group reading; follow-up questions (§14.13) | ✅ tested; group not verified live |
+| core 0.5.0–0.5.2 | PostgreSQL + pgvector store, BM25 computed in SQL, NUL stripping (§14.13) | ✅ tested against a real database |
 
 **All eight acceptance criteria (§12) are verified against the real library**, as
 are M4 (§14.6), M5 (§14.7), M6 (§14.8), §11.3.2 (§14.9), §11.4.1 (§14.10) and
-§11.4.2 (§14.11). M7 continues with **retrieval diversity**, which §11.4.1 turned up
-as the cheapest remaining win and which hybrid did not address, then metadata
-filters and reranking — each accepted or rejected the same way.
+§11.4.2 (§14.11). **Still open in M7:** measuring retrieval diversity, which
+§11.4.1 turned up as the cheapest remaining win and which neither hybrid nor
+reranking addressed (the cap is built, §11.4), and CLI options for the metadata filters the core already supports (§11.4). Each
+should be accepted or rejected by `eval`, as the others were.
 
 **The scoreboard so far**, all on the 21-question `Networking` set:
 
@@ -1660,38 +1836,53 @@ Folders created before 0.4.4 keep `top_k: 5` until edited; see the end of §11.4
 ### 14.3 Module map
 
 ```
-src/zotero_rag/
-  cli.py           typer app: list-collections, init, index, query, eval,
-                   generate-questions, convert
-  config.py        pydantic models, layered loading, pin_collection()
-  scaffold.py      init: config.yaml + .env + .gitignore
-  zotero_api.py    client, collection tree, path/key resolution, item fetch,
-                   FileDownloader (any content type), attachment writes and trash
+packages/zotero-rag-core/src/zotero_rag_core/    the pipeline (§14.13); no CLI, TUI or chromadb imports
+  config.py        pydantic models, embedding_models / rerankers catalogues
+  errors.py        expected, user-facing errors
+  zotero_api.py    client, collection tree, path/key resolution, item fetch, whole-library
+                   and incremental reads, removed keys, FileDownloader, attachment writes
+  planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata(),
+                   library_membership(); collect_candidates()/choose_preferred()
   provenance.py    the note on a Markdown transcript: source, md5s, converter, quality
-  conversion.py    build_conversion_plan(): which attachments need a transcript, and why
-  converter_run.py run_conversion(): download, convert, assess, upload; report rows
-  planning.py      build_plan(): §7.1 selection, preference, notes, chunk_metadata();
-                   collect_candidates()/choose_preferred() shared with conversion.py
-  retrieval.py     BM25 keyword index, reciprocal rank fusion, retrieve() (M7)
-  reranking.py     Cohere cross-encoder reranking of candidates (M7, §11.4.3)
-  evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
-  generation.py    generate-questions: reassemble documents, write a set (§11.3.2)
   documents.py     formats, content-type mapping, locator kinds
-  html_text.py     stdlib HTML → sections (snapshots and notes)
-  office.py        DOCX / ODT / EPUB via zipfile + xml.etree
-  metadata.py      authors_str(), parse_year(), zotero_url()
   download.py      cache + multipart-envelope repair
   extraction.py    segment extraction, dispatched by format
-  markdown.py      Markdown transcripts: anydoc page by page for PDFs, html_text for
-                   snapshots, optional hosted OCR, front matter (PRD-markdown)
-  quality.py       transcript vs. source text: recall, glued words, garbage → verdict
+  pdf_text.py      a PDF page's text layer minus what is not prose
+  html_text.py     stdlib HTML → sections (snapshots and notes)
+  office.py        DOCX / ODT / EPUB via zipfile + xml.etree
+  markdown.py      reading Markdown transcripts (producing them stays in the CLI)
+  metadata.py      authors_str(), parse_year(), year_number(), zotero_url()
   chunking.py      RecursiveCharacterTextSplitter per segment
-  embedding.py     OpenRouter embeddings + tiktoken counting
-  vectorstore.py   chromadb wrapper, StoredChunk
-  indexer.py       orchestration, IndexStats, failure isolation, repair, prune
+  embedding.py     OpenRouter embeddings, batching, tiktoken counting
   fingerprint.py   StoreFingerprint, intent-vs-fact comparison, severities
-  llm.py           OpenRouter ChatOpenAI + usage extraction
-  querying.py      retrieval, citation numbering, prompt, QueryResult
+  store.py         ChunkStore protocol, StoredChunk, Filters, passes()
+  stores/chroma.py ChromaStore: the index folder's chroma/
+  stores/pg.py     PgStore and PgFullTextSearcher (BM25 in SQL); pg_schema.sql beside it
+  indexer.py       orchestration, worker pool, IndexStats, failure isolation, repair, prune
+  retrieval.py     KeywordSearcher protocol, BM25Searcher, reciprocal rank fusion, retrieve()
+  reranking.py     Cohere and OpenRouter rerankers (§11.4.3)
+  llm.py           OpenRouter ChatOpenAI, usage and cost extraction, fetch_price()
+  querying.py      answer_question / stream_answer_question, follow-ups (Turn,
+                   condense_question), citation numbering, prompt, QueryResult
+  evaluation.py    golden-set loading, LLM judge, metrics, EvalReport (M6)
+  generation.py    generate-questions: reassemble documents, write a set (§11.3.2)
+
+src/zotero_rag/                                  the CLI and terminal UI
+  cli.py           typer app: list-collections, init, index, query, eval,
+                   generate-questions, convert, compare-embeddings, shrink-storage
+  config.py        YAML layering, .env loading, pin_collection(); re-exports core models
+  scaffold.py      init: config.yaml + .env + .gitignore
+  index_folder.py  opening an index folder and its store (Chroma or --store), shared with the TUI
+  snapshot.py      collections.json, the indexed collection tree
+  conversion.py    build_conversion_plan(): which attachments need a transcript, and why
+  converter_run.py run_conversion(): download, convert, assess, upload; report rows
+  markdown.py      producing Markdown transcripts with firecrawl-anydoc (PRD-markdown)
+  quality.py       transcript vs. source text: recall, glued words, garbage → verdict
+  shrink.py        which stored files shrink-storage may trash
+  shrink_run.py    shrink-storage I/O: download, probe, back up, trash
+  embedding_comparison.py  compare-embeddings: variants, stores, scoring, cost
+  experiments.py   the cumulative experiment log under reports/
+  tui/             zotero-rag-ui (PRD-CursesUI.md)
   data/config.yaml packaged defaults (copied by init)
 ```
 
@@ -2067,3 +2258,27 @@ reranking over 40 candidates. A question that names nothing from its own paper c
 be retrieved, however much retrieval is thrown at it. That is now the best-evidenced
 finding in §11.4, and it points at metadata filters rather than at anything ranking can
 do.
+
+### 14.13 The shared core and its stores (core 0.5.0–0.5.2)
+
+Built 2026-11-01/02 as steps M0.1–M0.9 of the separate `zotero-rag-web` plan, so a
+hosted app can reuse this pipeline. None of it changed the CLI's behaviour unless
+`--store` is given; the existing tests passed unchanged across the split. **This
+section records them in this PRD for the first time;** the commit messages carry the
+full detail.
+
+| Change | What it is | Verified by |
+|---|---|---|
+| Core package | `packages/zotero-rag-core` (`zotero_rag_core`), a uv workspace member. Pydantic config models, Zotero access, planning, extraction, chunking, embedding, stores, retrieval, querying, evaluation and generation moved there with history; YAML layering, `.env`, pinning, transcript *production*, the CLI and the TUI stayed. `-v` raises both packages' loggers | `tests/test_core_package.py` imports every core module with `chromadb` and the CLI's dependencies blocked |
+| `ChunkStore` protocol | `store.py`: exactly the methods the pipeline calls. `vectorstore.py` became `stores/chroma.py` (`ChromaStore`); only the CLI constructs a store | `tests/test_store_contract.py` runs one suite against Chroma and PostgreSQL |
+| `Filters` | Replaces `Scope`: collection keys, inclusive year range with an include-undated switch, tags (any of), combined with AND. Chroma translates them to `where`; dated chunks are bounded above `YEAR_UNKNOWN` so "up to 2018" cannot admit undated ones. Indexing writes `year_int` and `tags` (§7.2) | `tests/test_filters.py`: every combination against Chroma and BM25 |
+| `KeywordSearcher` protocol | `retrieval.py`; `KeywordIndex` renamed `BM25Searcher` | a scripted non-BM25 searcher fused through `retrieve` |
+| Whole library and groups | `fetch_library_items` (optionally `since` a version), `fetch_items_by_key`, `fetch_removed_item_keys` (asks `/deleted` and the trash). Group citations use `links.alternate` | `tests/test_library.py`; **not** run against a live group library (README still lists groups as unsupported) |
+| Follow-up questions | `querying.Turn`, `condense_question` (one model call, skipped with no history). Retrieval uses the condensed question; the model answers the question as asked, with earlier turns' `[n]` markers stripped. With no history the prompt is byte-identical to before (pinned by a test) | `tests/test_querying.py`; not yet used by the CLI or TUI |
+| PostgreSQL store | `PgStore`, behind the `pgvector` extra. Items, attachments and chunks normalised and rebuilt on read; an HNSW index on `embedding::vector(N)` created once N is known; iterative scan so a filtered search still fills `top_k`; vectors over 2,000 dimensions refused with a clear message. `--store` / `ZOTERO_RAG_STORE` on `index`, `query`, `eval`, `generate-questions` | `tests/test_pg_store.py`, `tests/test_cli_store.py` against a real database |
+| BM25 in SQL (0.5.1) | `PgFullTextSearcher` computes `BM25Okapi` from the `tsvector` column and a `term_df` table, because `ts_rank_cd` (no IDF) put the answering passage in the fused top 7 for 18/33 `kg-v3` questions, against 29 with BM25. Statistics refresh after `index` and lazily before a search | 100% overlap with `BM25Searcher` at 7, 28 and 112 on the kg library |
+| NUL stripping (0.5.2) | `PgStore` removes `\x00` from chunk text and metadata, which PostgreSQL refuses and pypdf can emit. Chroma keeps them, so existing indexes are unchanged | a web sync that previously failed |
+
+**What this leaves open for this PRD's roadmap:** `query`/`eval` options that
+build a `Filters` (§11.4), a `chat` command on top of `condense_question` (§11.6),
+and a live group-library check (§11.7).

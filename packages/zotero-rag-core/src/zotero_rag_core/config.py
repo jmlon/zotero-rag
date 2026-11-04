@@ -132,6 +132,10 @@ class IndexConfig(BaseModel):
     #: Neighbouring chunks fetched either side of each hit (M7, §11.4). 0 disables
     #: windowing, which is the pre-M7 behaviour.
     retrieval_window: int = Field(default=0, ge=0)
+    #: Most hits any one Zotero item may supply (M7, §11.4): retrieval diversity.
+    #: A soft cap — other items' passages are promoted, but when too few items
+    #: compete the skipped ones still fill `top_k`. 0 disables it.
+    max_per_document: int = Field(default=0, ge=0)
     #: `hybrid` fuses BM25 keyword hits with the vector hits (M7, §11.4.2). It is a
     #: query-time choice only — no re-indexing, and the store is untouched. The
     #: default because it measured better on two independent question sets at no

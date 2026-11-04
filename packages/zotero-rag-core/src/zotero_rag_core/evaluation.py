@@ -1051,6 +1051,8 @@ class RunSettings(BaseModel):
     top_k: int = 0
     #: Neighbours fetched either side of each hit (§11.4). 0 is plain retrieval.
     retrieval_window: int = 0
+    #: Most hits per Zotero item (§11.4). 0 is uncapped, as runs before it were.
+    max_per_document: int = 0
     chunk_size: int = 0
     chunk_overlap: int = 0
     temperature: float = 0.0
@@ -1077,6 +1079,7 @@ def run_settings(
     window: int = 0,
     mode: str = "vector",
     reranker: str | None = None,
+    max_per_document: int = 0,
 ) -> RunSettings:
     """Snapshot the settings behind a run."""
     return RunSettings(
@@ -1087,6 +1090,7 @@ def run_settings(
         judge_model=config.judge_model,
         top_k=top_k,
         retrieval_window=window,
+        max_per_document=max_per_document,
         retrieval=mode,
         chunk_size=config.index.chunk_size,
         chunk_overlap=config.index.chunk_overlap,

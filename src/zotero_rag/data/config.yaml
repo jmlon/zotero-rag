@@ -43,6 +43,10 @@ index:
     # claim arrives with the sentences that give it meaning. 0 disables it. Raising
     # it multiplies the passages sent to the model, so measure with `eval` first.
     retrieval_window: 0
+    # Most passages any one Zotero item may supply, so a paper that matches well
+    # everywhere cannot crowd out the one that answers. 0 disables it. Soft: when
+    # too few items compete, their extra passages still fill top_k. Query-time only.
+    max_per_document: 0
     # vector = embeddings only. hybrid also runs a BM25 keyword search and fuses the
     # two rankings, which helps where embeddings are weakest: acronyms, author names
     # and exact phrases. Query-time only — switching it needs no re-indexing.

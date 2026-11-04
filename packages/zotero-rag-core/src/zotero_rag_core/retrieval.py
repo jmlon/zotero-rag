@@ -185,6 +185,71 @@ def reciprocal_rank_fusion(
     return [best[identifier] for identifier in order[:limit]]
 
 
+def document_key(chunk: StoredChunk) -> str:
+    """The document a chunk belongs to, for `cap_per_document`.
+
+    The Zotero *item*, not the attachment: a PDF and a snapshot of the same paper
+    are one document to a reader, so they share one quota. Chunks without an item
+    key fall back to their attachment, then to their own id, so a chunk with no
+    metadata is never capped together with an unrelated one.
+    """
+    for key in ("item_key", "attachment_key"):
+        value = chunk.metadata.get(key)
+        if value:
+            return str(value)
+    return chunk.id
+
+
+def cap_per_document(
+    ranked: Sequence[StoredChunk], limit: int, max_per_document: int
+) -> list[StoredChunk]:
+    """The best `limit` chunks, taking at most `max_per_document` from any one document.
+
+    Retrieval diversity (§11.4). At `top_k: 30` one question came back with every
+    chunk from a single document while the paper it was about never appeared, so a
+    document that matches well everywhere can crowd out the one that answers.
+
+    The cap is **soft**: when too few documents compete to fill `limit` (a folder
+    holding one paper, say), the chunks it skipped fill the remaining slots, best
+    first. A cap that left the model with less context than `top_k` would trade a
+    crowding problem for a starvation one.
+
+    The result keeps `ranked`'s order. `max_per_document <= 0` disables the cap and
+    is exactly `ranked[:limit]`.
+    """
+    if max_per_document <= 0:
+        return list(ranked[:limit])
+
+    chosen: set[str] = set()
+    taken: dict[str, int] = {}
+    for chunk in ranked:
+        if len(chosen) == limit:
+            break
+        document = document_key(chunk)
+        if taken.get(document, 0) < max_per_document:
+            taken[document] = taken.get(document, 0) + 1
+            chosen.add(chunk.id)
+
+    refilled = 0
+    for chunk in ranked:
+        if len(chosen) >= limit:
+            break
+        if chunk.id not in chosen:
+            chosen.add(chunk.id)
+            refilled += 1
+    if refilled:
+        logger.info("diversity: %d slot(s) refilled past the per-document cap", refilled)
+
+    kept = [chunk for chunk in ranked if chunk.id in chosen]
+    logger.info(
+        "diversity: %d chunk(s) from %d document(s), at most %d per document",
+        len(kept),
+        len({document_key(chunk) for chunk in kept}),
+        max_per_document,
+    )
+    return kept
+
+
 def retrieve(
     store: ChunkStore,
     embedding: list[float],

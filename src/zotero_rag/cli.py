@@ -876,6 +876,17 @@ RetrievalOption = Annotated[
 ]
 
 
+MaxPerDocumentOption = Annotated[
+    int | None,
+    typer.Option(
+        "--max-per-document",
+        help="At most N of the retrieved passages from any one Zotero item, so one "
+        "paper cannot crowd out the rest; 0 turns the cap off.",
+        min=0,
+    ),
+]
+
+
 StoreOption = Annotated[
     str | None,
     typer.Option(
@@ -1602,6 +1613,7 @@ def query(
     ] = None,
     retrieval: RetrievalOption = None,
     reranker: RerankerOption = None,
+    max_per_document: MaxPerDocumentOption = None,
     show_sources: Annotated[
         bool,
         typer.Option("--show-sources", help="Also print the full text of each retrieved chunk."),
@@ -1644,6 +1656,11 @@ def query(
                 keyword_index=keyword_index,
                 rerank=rerank,
                 rerank_fanout=config.index.reranker_fanout,
+                max_per_document=(
+                    max_per_document
+                    if max_per_document is not None
+                    else config.index.max_per_document
+                ),
             )
     except ZoteroRagError as exc:
         _fail(exc)
@@ -1837,6 +1854,7 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
 
     settings = report.settings
     windowing = f" ±{settings.retrieval_window}" if settings.retrieval_window else ""
+    capping = f" · ≤{settings.max_per_document} per document" if settings.max_per_document else ""
     reranking = (
         f" · reranked by {settings.reranker_model} (×{settings.reranker_fanout})"
         if settings.reranker
@@ -1847,7 +1865,7 @@ def _print_eval_report(report: EvalReport, verbose: bool) -> None:
         f"{settings.embedding_model} embedding · top_k {settings.top_k} · "
         f"chunks {settings.chunk_size}/{settings.chunk_overlap} · "
         f"temperature {settings.temperature} · {settings.retrieval}{windowing} retrieval"
-        f"{reranking} · {_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
+        f"{capping}{reranking} · {_plural(settings.store_chunks, 'chunk')} in the store[/dim]"
     )
 
     # A configured reranker that quietly did not run on every question would make two
@@ -1922,6 +1940,7 @@ def eval_command(
     ] = None,
     retrieval: RetrievalOption = None,
     reranker: RerankerOption = None,
+    max_per_document: MaxPerDocumentOption = None,
     only: Annotated[
         list[str] | None,
         typer.Option("--only", help="Run just this question id; repeatable."),
@@ -1966,6 +1985,9 @@ def eval_command(
 
         chosen_top_k = top_k if top_k is not None else config.index.top_k
         chosen_window = window if window is not None else config.index.retrieval_window
+        chosen_cap = (
+            max_per_document if max_per_document is not None else config.index.max_per_document
+        )
         mode = retrieval if retrieval is not None else config.index.retrieval
         rerank, rerank_name = resolve_reranker(config, reranker)
         keyword_index = _build_keyword_index(store, mode)
@@ -1990,6 +2012,7 @@ def eval_command(
                 keyword_index=keyword_index,
                 rerank=rerank,
                 rerank_fanout=config.index.reranker_fanout,
+                max_per_document=chosen_cap,
             )
             return _price_query(result, config, answer_price)
 
@@ -2020,6 +2043,7 @@ def eval_command(
                 window=chosen_window,
                 mode=mode,
                 reranker=rerank_name,
+                max_per_document=chosen_cap,
             ),
             aggregate=aggregate(outcomes, elapsed),
             results=outcomes,
@@ -2624,6 +2648,7 @@ def compare_embeddings_command(
         chosen_top_k = top_k if top_k is not None else config.index.top_k
         mode = retrieval if retrieval is not None else config.index.retrieval
         window = config.index.retrieval_window
+        cap = config.index.max_per_document
         # Resolved before the prompt, so a bad reranker name fails before any work.
         rerank, rerank_name = resolve_reranker(config, reranker)
 
@@ -2705,6 +2730,7 @@ def compare_embeddings_command(
                             keyword_index=keyword_index,
                             rerank=rerank,
                             rerank_fanout=config.index.reranker_fanout,
+                            max_per_document=cap,
                         )
                         return _price_query(result, settings, answer_price)
 
@@ -2749,6 +2775,7 @@ def compare_embeddings_command(
                 top_k=chosen_top_k,
                 retrieval=mode,
                 retrieval_window=window,
+                max_per_document=cap,
                 reranker=rerank_name,
                 questions_file=str(questions_path),
                 questions=len(questions),
@@ -2803,6 +2830,7 @@ def _variant_settings(
         judge_model=shared.judge_model,
         top_k=shared.top_k,
         retrieval_window=shared.retrieval_window,
+        max_per_document=shared.max_per_document,
         chunk_size=variant.chunk_size,
         chunk_overlap=variant.chunk_overlap,
         temperature=config.index.temperature,

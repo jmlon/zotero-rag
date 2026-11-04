@@ -11,6 +11,7 @@ import logging
 from collections.abc import Iterator
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 import pytest
 from langchain_core.messages import AIMessage
@@ -1040,6 +1041,82 @@ def test_eval_settings_line_shows_the_window(
 
 def test_a_negative_window_is_rejected() -> None:
     result = runner.invoke(cli.app, ["query", "anything", "--window", "-1"])
+    assert result.exit_code != 0
+
+
+# --- retrieval diversity through the CLI (M7, §11.4) ---------------------
+
+
+def test_query_and_eval_help_document_the_cap() -> None:
+    for command in ("query", "eval"):
+        result = runner.invoke(cli.app, [command, "--help"])
+        assert "--max-per-document" in result.output
+
+
+def test_the_cap_defaults_to_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  max_per_document: 2\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    payload = json.loads(runner.invoke(cli.app, ["eval", "--json"]).stdout)
+
+    assert payload["settings"]["max_per_document"] == 2
+
+
+def test_the_cap_flag_overrides_the_configured_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run's cap has to reach the report, or two runs are not comparable."""
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    (tmp_path / "config.yaml").write_text(
+        "index:\n  top_k: 3\n  max_per_document: 2\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--max-per-document", "0", "--json"])
+
+    assert json.loads(result.stdout)["settings"]["max_per_document"] == 0
+
+
+def test_eval_settings_line_shows_the_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+
+    result = runner.invoke(cli.app, ["eval", "--max-per-document", "1"])
+
+    assert "≤1 per document" in result.output
+
+
+def test_query_passes_the_cap_to_the_pipeline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _eval_index_folder(tmp_path, ONE_QUESTION)
+    monkeypatch.chdir(tmp_path)
+    _stub_seams(monkeypatch)
+    seen: list[int] = []
+    real = cli.answer_question
+
+    def spy(*args: Any, **kwargs: Any) -> QueryResult:
+        seen.append(kwargs["max_per_document"])
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "answer_question", spy)
+
+    result = runner.invoke(cli.app, ["query", "anything", "--max-per-document", "3"])
+
+    assert result.exit_code == 0, result.output
+    assert seen == [3]
+
+
+def test_a_negative_cap_is_rejected() -> None:
+    result = runner.invoke(cli.app, ["query", "anything", "--max-per-document", "-1"])
     assert result.exit_code != 0
 
 

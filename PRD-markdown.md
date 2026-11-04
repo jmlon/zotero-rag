@@ -4,17 +4,21 @@ LLMs usually perform better when the input is in plan text format.
 For this reason we want to create and store markdown (MD) copies of the papers in the Zotero library.
 
 In order to avoid possible information loss, we plan to follow this protocol:
+
 1. The paper entry has an up-to-date MD? If yes, do nothing.
 2. The paper entry has a document (PDF, Word, HTML, etc), but not a Markdown: Create the markdown version of the document, upload and attach to the paper in the Zotero library.
 3. Optional: Clean big attachments to reduce online storage costs. Add an optional flag `--shrink-storage MAX_FILESIZE`. When the option is present, check if the attached document (excluding MD) is larger than MAX_FILESIZE. If so, check if there is an attached Web Link that resolves to and the link header response returns the correct mime-type. If we have the markdown transcript and the web link to the original file, we can ask confirmation to the user and delete the file attachment. In any other case, preserve the attached file. Produce a report at the end.
 
 For converting source files (PDF, docx, odt, pptx, etc) we can use a document parsing library.
 The proposed solution is to use anydoc:
+
 ```sh
 npx @firecrawl/anydoc report.docx               # Markdown to stdout
 npx @firecrawl/anydoc slides.pptx -o slides.md  # or to a file
 ```
+
 The python version is used as follows (has not been tested)
+
 ```python
 # pip install firecrawl-anydoc
 
@@ -39,9 +43,6 @@ We need if it can be invoked from a python application.
 Other alternatives (more limited) are MarkItDown.
 We want to avoid GPU-based conversion (such as Docling or MinerU) as these have extra hardware requirements.
 
-
-
-
 ## Phase 0 findings — anydoc spike (2026-10-29)
 
 Scripts and how to rerun them: `spike/anydoc/` (papers and outputs stay local, git-ignored).
@@ -56,7 +57,7 @@ Python 3.14. The API is as documented. The exceptions are typed, and
 `NeedsOcrError.pages` lists the pages that need OCR.
 
 | | Result |
-|---|---|
+| --- | --- |
 | Success | 25/29. Every PDF, docx and odt converted except one PDF (`NeedsOcrError`). All 3 HTML snapshots: `UnsupportedError`, as expected. |
 | Speed | median **0.08 s** per paper, max 0.27 s; ~190 pages/s. Not a bottleneck. |
 | Memory | ~116 MB peak per process (most of it the interpreter). 307 MB for a 37 MB HTML file. |
@@ -122,7 +123,7 @@ the Markdown isn't. Recall now counts a baseline word as present when it occurs 
 Markdown text. With that change all three metrics agree with every grade:
 
 | | Good (22) | `FL9A5KC7` (bad) | `3TZZFT63` (bad) |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | recall | ≥ 0.872 | 1.0 | **0.846** |
 | worst page | ≥ 0.821 | 1.0 | **0.789** |
 | glued words | ≤ 0.005 | **0.168** | **0.191** |
@@ -144,7 +145,7 @@ Firecrawl, not the whole paper.
 All 13 checks passed:
 
 | Check | Result |
-|---|---|
+| --- | --- |
 | `key_info()` reports write and file access | ✓ `access.user.write`, `.files` |
 | Create a child Markdown attachment with `contentType: text/markdown`, a tag and a provenance `note` in one `upload_attachments` call | ✓ all kept; md5 matches |
 | Download it with `zot.file` | ✓ returns bytes |
@@ -177,3 +178,44 @@ Every exit criterion is met:
 - anydoc converts every non-scanned sample. The quality gate matches the human grades.
 - D2 is decided.
 - The write calls behave as the plan assumed.
+
+---
+
+# ePub conversion
+
+Converting text-heavy PDFs to EPUB is highly convenient for reading comfort, but it rarely reduces your library's storage footprint.
+
+⚖️ The Trade-offs of Converting PDF to EPUB
+
+Before converting your entire library, consider how the formatting will change:
+• Size vs. Space: EPUB files are slightly smaller than text-based PDFs because they strip away rigid positioning data. However, if your library is huge because of scanned image PDFs, converting them to EPUB without running OCR text recognition will actually make the files larger or completely unreadable. If your only goal is saving hard drive space, you are better off compressing your PDFs using a command-line utility like Ghostscript. [1] (<https://www.youtube.com/watch?v=NisUrhrh5GA&t=27>), [2] (<https://www.youtube.com/watch?v=nFFf3Q5acCg>)
+• The Big Advantage (Reflowable Text): EPUBs completely outclass PDFs when it comes to readability. They allow you to change font sizes, margins, and background colors dynamically on your phone, tablet, or e-reader. [1] (<https://www.youtube.com/watch?v=NisUrhrh5GA&t=27>)
+• The Disadvantage (Layout Breakage): Textbooks, programming manuals, magazines, or any PDFs with multi-column layouts, heavy charts, and code blocks do not convert well. The text will "reflow" randomly, completely ruining the structure. [1] (<https://www.youtube.com/watch?v=NisUrhrh5GA&t=27>)
+
+💻 How to Convert via Linux Command Line
+
+The absolute best tool for this is Calibre, a powerful, open-source e-book manager. It includes a highly efficient command-line utility called ebook-convert. [1] (<https://askubuntu.com/questions/169618/is-there-a-way-to-convert-a-pdf-file-to-epub-format-without-using-calibre>), [2] (<https://www.addictivetips.com/ubuntu-linux-tips/convert-ebooks-pdf-to-epub/>), [3] (<https://www.youtube.com/watch?v=v7SmkarsD4M>), [4] (<https://softhints.com/how-to-convert-pdf-to-epub-with-linux/>)
+
+1. Install Calibre
+
+Open your terminal and install Calibre using your specific package manager: [1] (<https://ostechnix.com/convert-pdf-to-epub-in-linux/>), [2] (<https://www.addictivetips.com/ubuntu-linux-tips/convert-ebooks-pdf-to-epub/>)
+• Ubuntu / Debian / Mint: sudo apt install calibre
+• Fedora / RHEL: sudo dnf install calibre
+• Arch Linux: sudo pacman -S calibre [1] (<https://ostechnix.com/convert-pdf-to-epub-in-linux/>), [2] (<https://softhints.com/how-to-convert-pdf-to-epub-with-linux/>)
+
+1. Convert a Single Book
+
+To convert a single PDF, use the ebook-convert tool. It is highly recommended to append the --enable-heuristics flag, which automatically scans the document to repair broken line wraps, hyphenations, and common PDF artifacts: [1] (<https://ostechnix.com/convert-pdf-to-epub-in-linux/>), [2] (<https://softhints.com/how-to-convert-pdf-to-epub-with-linux/>)
+bash
+ebook-convert input.pdf output.epub --enable-heuristics
+Use code with caution.
+
+1. Batch Convert Your Whole Library
+
+If you want to automate the process and convert every PDF in your current directory, use a simple find loop: [1] (<https://softhints.com/how-to-convert-pdf-to-epub-with-linux/>)
+bash
+find . -maxdepth 1 -name "*.pdf" | while read -r file; do
+    ebook-convert "$file" "${file%.pdf}.epub" --enable-heuristics
+done
+Use code with caution.
+Are your PDFs mostly plain text novels, or do they contain complex layouts, images, and programming code? Knowing this can help determine if a batch conversion will yield clean results or if compressing the PDFs instead is the better path forward.
